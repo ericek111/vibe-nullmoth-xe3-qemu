@@ -1,0 +1,324 @@
+From db849475238423a577e1623129acdafb177db377 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 09:17:53 +0200
+Subject: [PATCH 27/50] debug.nmxgpu_dump: on-demand xe state dump; build
+ stamp; build fails when fork_xe.py does
+
+- xnu/nmx_diag.cpp: a real xnu sysctl; writing 1 runs the hook xe registers at probe
+- override/xe/nmx_xe_debug.c: GuC CT, every exec queue with its scheduler entity and the fence it waits on,
+  the GuC queue print, per-engine pending hw fences, the memirq source page
+- NullMoth GPU: driving ... (build <stamp>), the stamp written by vm/tools/cycle.sh
+- build-guest.sh: a step that stops before compiling (fork_xe.py anchor mismatch) is a failure, not stale objects
+- temporary per-event job prints removed
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ .gitignore                         |   1 +
+ bsdcompat/include/nmx_xnu.h        |   3 +
+ bsdcompat/include/nmxxnu/nmx_xnu.h |   3 +
+ build-guest.sh                     |  11 ++-
+ fork_xe.py                         |   4 +
+ override/xe/nmx_xe_debug.c         | 120 +++++++++++++++++++++++++++++
+ xnu/nmx_diag.cpp                   |  53 +++++++++++++
+ xnu/nmx_kext.cpp                   |  10 ++-
+ 8 files changed, 199 insertions(+), 6 deletions(-)
+ create mode 100644 .gitignore
+ create mode 100644 override/xe/nmx_xe_debug.c
+ create mode 100644 xnu/nmx_diag.cpp
+
+diff --git a/gpu-port/xkpi/.gitignore b/gpu-port/xkpi/.gitignore
+new file mode 100644
+index 0000000..de2737d
+--- /dev/null
++++ b/gpu-port/xkpi/.gitignore
+@@ -0,0 +1 @@
++xnu/nmx_buildstamp.h
+diff --git a/gpu-port/xkpi/bsdcompat/include/nmx_xnu.h b/gpu-port/xkpi/bsdcompat/include/nmx_xnu.h
+index 3cb6756..a9bdcfa 100644
+--- a/gpu-port/xkpi/bsdcompat/include/nmx_xnu.h
++++ b/gpu-port/xkpi/bsdcompat/include/nmx_xnu.h
+@@ -77,6 +77,9 @@ void *nmx_xnu_pci_map_bar(void *pci, int bar_reg, int cache, uint64_t *phys, uin
+ int nmx_xnu_pci_bar_info(void *pci, int bar_reg, uint64_t *phys, uint64_t *size, int *is_io);
+ /* message-signalled interrupts: number available, and handler registration (handler runs on a work loop thread) */
+ int nmx_xnu_pci_msi_count(void *pci);
++/* debug.nmxgpu_dump (xnu/nmx_diag.cpp): the function a write of 1 runs */
++void nmx_xnu_set_dump_hook(void (*fn)(void));
++void nmx_xnu_diag_fini(void);
+ int nmx_xnu_pci_irq_setup(void *pci, int vector, void (*handler)(void *), void *arg, void **cookie);
+ void nmx_xnu_pci_irq_teardown(void *cookie);
+ /* returns once a handler running on this source has finished */
+diff --git a/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_xnu.h b/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_xnu.h
+index 7d414f7..41fdb1f 100644
+--- a/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_xnu.h
++++ b/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_xnu.h
+@@ -77,6 +77,9 @@ void *nmx_xnu_pci_map_bar(void *pci, int bar_reg, int cache, uint64_t *phys, uin
+ int nmx_xnu_pci_bar_info(void *pci, int bar_reg, uint64_t *phys, uint64_t *size, int *is_io);
+ /* message-signalled interrupts: number available, and handler registration (handler runs on a work loop thread) */
+ int nmx_xnu_pci_msi_count(void *pci);
++/* debug.nmxgpu_dump (xnu/nmx_diag.cpp): the function a write of 1 runs */
++void nmx_xnu_set_dump_hook(void (*fn)(void));
++void nmx_xnu_diag_fini(void);
+ int nmx_xnu_pci_irq_setup(void *pci, int vector, void (*handler)(void *), void *arg, void **cookie);
+ void nmx_xnu_pci_irq_teardown(void *cookie);
+ /* returns once a handler running on this source has finished */
+diff --git a/gpu-port/xkpi/build-guest.sh b/gpu-port/xkpi/build-guest.sh
+index 736b7ea..66892e9 100755
+--- a/gpu-port/xkpi/build-guest.sh
++++ b/gpu-port/xkpi/build-guest.sh
+@@ -20,17 +20,20 @@ mkdir -p fbroot fbroot/contrib
+ [ -e ../linux-6.14/include/uapi/uapi ] || ln -s . ../linux-6.14/include/uapi/uapi
+ [ -f amd.flags ] || /opt/homebrew/bin/python3 gen_flags.py ../kpi/drm-kmod amd.flags || exit 1
+ t0=$(date +%s)
++# a step that stops before compiling (all-xe.sh exits 1 when fork_xe.py's anchors no longer match) leaves no .failed
++# file behind, only stale objects: it counts as a failure too
++stepfail=0
+ case "$WHAT" in
+-    all)  ./all.sh 25; ./all-i915.sh 25; ./all-xe.sh 25; ./rt.sh | tee rt.out ;;
+-    xe)   ./all-xe.sh 25 ;;
++    all)  ./all.sh 25; ./all-i915.sh 25; ./all-xe.sh 25 || stepfail=1; ./rt.sh | tee rt.out ;;
++    xe)   ./all-xe.sh 25 || stepfail=1 ;;
+     rt)   ./rt.sh | tee rt.out ;;
+-    xert) ./all-xe.sh 25; ./rt.sh | tee rt.out ;;
++    xert) ./all-xe.sh 25 || stepfail=1; ./rt.sh | tee rt.out ;;
+     link) ;;
+     *) echo "usage: $0 [all|xe|rt|xert|link] <out>"; exit 2 ;;
+ esac
+ # the runtime (rt.sh) reports its failures as "LK FAIL x" / "SRC FAIL x" lines, not .failed files
+ rtfail=0; case "$WHAT" in rt|xert|all) rtfail=$(grep -c -E '^(LK|SRC|XNU) FAIL' rt.out) ;; esac
+-fail=$(( rtfail + $(ls logs/*.failed 2>/dev/null | wc -l) + $(ls logs-i915/*.failed 2>/dev/null | wc -l) + $(find logs-xe -name '*.failed' | wc -l) ))
++fail=$(( stepfail + rtfail + $(ls logs/*.failed 2>/dev/null | wc -l) + $(ls logs-i915/*.failed 2>/dev/null | wc -l) + $(find logs-xe -name '*.failed' | wc -l) ))
+ echo "compile failures: $fail ($(( $(date +%s) - t0 )) s)"
+ # never link stale objects over a failed compile
+ if [ "$fail" != 0 ]; then
+diff --git a/gpu-port/xkpi/fork_xe.py b/gpu-port/xkpi/fork_xe.py
+index 5e4db0b..95a0d65 100644
+--- a/gpu-port/xkpi/fork_xe.py
++++ b/gpu-port/xkpi/fork_xe.py
+@@ -132,3 +132,7 @@ edit("xe_guc_ct.c", [("\t\txe_gt_err(gt, \"Timed out wait for G2H, fence %u, act
+     "\t\t\t\t  ct->ctbs.h2g.info.tail, ct->ctbs.g2h.info.head, xe_bo_ggtt_addr(ct->bo), nmx_vf_irq_count,\n"
+     "\t\t\t\t  atomic_read(&nxe->irq.enabled), xe_device_uses_memirq(nxe));\n\t\t}\n", 1)])
+ print("xe fork applied")
++
++# debug.nmxgpu_dump (override/xe/nmx_xe_debug.c): the probed device prints its GuC, queue and fence state on demand
++edit("xe_pci.c", [("\terr = xe_device_probe(xe);\n\tif (err)\n\t\treturn err;\n",
++     "\terr = xe_device_probe(xe);\n\tif (err)\n\t\treturn err;\n\t{ void nmx_xe_debug_register(struct xe_device *); nmx_xe_debug_register(xe); }\n", 1)])
+diff --git a/gpu-port/xkpi/override/xe/nmx_xe_debug.c b/gpu-port/xkpi/override/xe/nmx_xe_debug.c
+new file mode 100644
+index 0000000..6ed9243
+--- /dev/null
++++ b/gpu-port/xkpi/override/xe/nmx_xe_debug.c
+@@ -0,0 +1,120 @@
++// SPDX-License-Identifier: MIT
++/*
++ * The xe half of debug.nmxgpu_dump (xnu/nmx_diag.cpp): prints what Linux would show in debugfs - GuC CT state, every
++ * exec queue with its scheduler entity (queued jobs, the fence it waits on), the GuC's own queue print, each engine's
++ * pending hardware fences and the memory-based interrupt page - to the kernel log, on demand.
++ */
++#include <linux/xarray.h>
++#include <drm/drm_print.h>
++#include <drm/gpu_scheduler.h>
++#include <drm/spsc_queue.h>
++
++#include "xe_device.h"
++#include "xe_exec_queue_types.h"
++#include "xe_gt.h"
++#include "xe_guc_ct.h"
++#include "xe_guc_exec_queue_types.h"
++#include "xe_guc_submit.h"
++#include "xe_hw_engine_types.h"
++#include "xe_hw_fence_types.h"
++#include "xe_lrc.h"
++#include "nmx_xnu.h"
++
++void nmx_xe_debug_register(struct xe_device *xe);
++
++static struct xe_device *nmx_xe;
++
++static void dump_fence(struct drm_printer *p, const char *what, struct dma_fence *f)
++{
++	if (f == NULL) {
++		drm_printf(p, "    %s: none\n", what);
++		return;
++	}
++	drm_printf(p, "    %s: %s/%s seqno %llu flags 0x%lx signaled %d error %d\n", what,
++		   f->ops->get_driver_name(f), f->ops->get_timeline_name(f), (unsigned long long)f->seqno,
++		   f->flags, dma_fence_is_signaled(f), f->error);
++}
++
++static void dump_queue(struct drm_printer *p, struct xe_exec_queue *q)
++{
++	struct drm_gpu_scheduler *s = &q->guc->sched.base;
++	struct drm_sched_entity *e = q->entity;
++	struct drm_sched_job *j;
++	int pending = 0;
++	struct xe_lrc *lrc = q->lrc[0];
++
++	list_for_each_entry(j, &s->pending_list, list)
++		pending++;
++	drm_printf(p, "  queue guc_id %u class %d flags 0x%lx state 0x%x | sched ready %d pause_submit %d credits %d/%u pending %d\n",
++		   q->guc->id, q->class, (unsigned long)q->flags, atomic_read(&q->guc->state), s->ready, s->pause_submit,
++		   atomic_read(&s->credit_count), s->credit_limit, pending);
++	drm_printf(p, "    entity: queued %d stopped %d | lrc seqno %d start %d head %u tail %u\n",
++		   spsc_queue_count(&e->job_queue), e->stopped, xe_lrc_seqno(lrc), xe_lrc_start_seqno(lrc),
++		   xe_lrc_ring_head(lrc), lrc->ring.tail);
++	dump_fence(p, "entity waits on", e->dependency);
++	dump_fence(p, "last fence", q->last_fence);
++}
++
++static void nmx_xe_dump(void)
++{
++	struct xe_device *xe = nmx_xe;
++	struct drm_printer p;
++	struct xe_gt *gt;
++	struct xe_tile *tile;
++	u8 id;
++
++	if (xe == NULL)
++		return;
++	p = drm_info_printer(xe->drm.dev);
++	for_each_tile(tile, xe, id) {
++		if (tile->memirq.bo != NULL) {
++			const u8 *src = tile->memirq.source.vaddr;
++			char buf[256];
++			int k = 0;
++
++			for (int i = 0; i < 64 && k < 230; i++)
++				if (src[i])
++					k += snprintf(buf + k, sizeof(buf) - k, " %d=%02x", i, src[i]);
++			buf[k] = 0;
++			drm_printf(&p, "tile %u memirq source:%s\n", id, k ? buf : " all zero");
++		}
++	}
++	for_each_gt(gt, xe, id) {
++		struct xe_guc *guc = &gt->uc.guc;
++		struct xe_hw_engine *hwe;
++		enum xe_hw_engine_id hid;
++		struct xe_exec_queue *q;
++		unsigned long index;
++
++		drm_printf(&p, "GT%u: irq enabled %d, submission stopped %d enabled %d\n", id,
++			   atomic_read(&xe->irq.enabled), atomic_read(&guc->submission_state.stopped),
++			   guc->submission_state.enabled);
++		xe_guc_ct_print(&guc->ct, &p, false);
++		mutex_lock(&guc->submission_state.lock);
++		xa_for_each(&guc->submission_state.exec_queue_lookup, index, q)
++			if (q->guc->id == index)
++				dump_queue(&p, q);
++		mutex_unlock(&guc->submission_state.lock);
++		xe_guc_submit_print(guc, &p);
++		for_each_hw_engine(hwe, gt, hid) {
++			struct xe_hw_fence_irq *irq = hwe->fence_irq;
++			struct list_head *l;
++			int n = 0;
++
++			if (irq == NULL)
++				continue;
++			spin_lock_irq(&irq->lock);
++			list_for_each(l, &irq->pending)
++				n++;
++			spin_unlock_irq(&irq->lock);
++			drm_printf(&p, "  engine %s: irq_offset %u, fence irq enabled %d, %d fences pending\n", hwe->name,
++				   hwe->irq_offset, irq->enabled, n);
++		}
++	}
++}
++
++void nmx_xe_debug_register(struct xe_device *xe)
++{
++	nmx_xe = xe;
++	nmx_xnu_set_dump_hook(nmx_xe_dump);
++}
+diff --git a/gpu-port/xkpi/xnu/nmx_diag.cpp b/gpu-port/xkpi/xnu/nmx_diag.cpp
+new file mode 100644
+index 0000000..0dba724
+--- /dev/null
++++ b/gpu-port/xkpi/xnu/nmx_diag.cpp
+@@ -0,0 +1,53 @@
++/*
++ * debug.nmxgpu_dump: writing 1 prints the driver's state to the kernel log (`sudo sysctl debug.nmxgpu_dump=1`, then
++ * `log show`). The xe side registers what it prints (override/xe/nmx_xe_debug.c), so a stuck submission can be looked
++ * at in the running system instead of through a rebuild and reboot per question.
++ */
++#include <sys/types.h>
++#include <sys/sysctl.h>
++#include <IOKit/IOLib.h>
++#include <libkern/OSAtomic.h>
++#include "nmx_xnu.h"
++#if __has_include("nmx_buildstamp.h")
++#include "nmx_buildstamp.h"      /* written by vm/tools/cycle.sh for each test build */
++#else
++#define NMX_BUILD_STAMP "unstamped"
++#endif
++
++static void (*volatile g_dump)(void);
++static bool g_registered;
++
++static int dump_handler(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
++{
++    int v = 0;
++    int err = sysctl_handle_int(oidp, &v, 0, req);
++    if (err != 0 || req->newptr == USER_ADDR_NULL)
++        return err;
++    void (*fn)(void) = g_dump;
++    IOLog("NullMoth GPU: state dump (build %s)%s\n", NMX_BUILD_STAMP, fn ? "" : " - nothing registered");
++    if (fn)
++        fn();
++    IOLog("NullMoth GPU: state dump end\n");
++    return 0;
++}
++
++SYSCTL_PROC(_debug, OID_AUTO, nmxgpu_dump, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, nullptr, 0,
++            dump_handler, "I", "write 1: print NMXGPU's driver state to the kernel log");
++
++extern "C" void nmx_xnu_set_dump_hook(void (*fn)(void))
++{
++    g_dump = fn;
++    if (fn && !g_registered) {
++        sysctl_register_oid(&sysctl__debug_nmxgpu_dump);
++        g_registered = true;
++    }
++}
++
++extern "C" void nmx_xnu_diag_fini(void)
++{
++    g_dump = nullptr;
++    if (g_registered) {
++        sysctl_unregister_oid(&sysctl__debug_nmxgpu_dump);
++        g_registered = false;
++    }
++}
+diff --git a/gpu-port/xkpi/xnu/nmx_kext.cpp b/gpu-port/xkpi/xnu/nmx_kext.cpp
+index 28922c2..a6c8dbf 100644
+--- a/gpu-port/xkpi/xnu/nmx_kext.cpp
++++ b/gpu-port/xkpi/xnu/nmx_kext.cpp
+@@ -23,6 +23,11 @@
+ #include <kern/thread.h>
+ #include "nmx_port.h"
+ #include "nmx_xnu.h"
++#if __has_include("nmx_buildstamp.h")
++#include "nmx_buildstamp.h"      /* written by vm/tools/cycle.sh for each test build */
++#else
++#define NMX_BUILD_STAMP "unstamped"
++#endif
+ 
+ #define AMD_VENDOR 0x1002
+ #define INTEL_VENDOR 0x8086
+@@ -248,14 +253,15 @@ void NMXGPU::attachNow()
+     /* light the outputs and hand them to macOS; without it the device still renders, with no screen of its own */
+     fb_ = nmx_fb_publish(this, dev_);
+     nmx_marker_write(false);
+-    IOLog("NullMoth GPU: driving %04x:%04x\n", pci_->configRead16(kIOPCIConfigVendorID),
+-          pci_->configRead16(kIOPCIConfigDeviceID));
++    IOLog("NullMoth GPU: driving %04x:%04x (build %s)\n", pci_->configRead16(kIOPCIConfigVendorID),
++          pci_->configRead16(kIOPCIConfigDeviceID), NMX_BUILD_STAMP);
+     OSSynchronizeIO();
+     attach_ = 1;
+ }
+ 
+ void NMXGPU::stop(IOService *provider)
+ {
++    nmx_xnu_diag_fini();
+     /* an attach still running on its thread finishes first (it holds a reference on this object meanwhile) */
+     for (int i = 0; attach_ == 0 && i < 6000; i++)
+         IOSleep(100);

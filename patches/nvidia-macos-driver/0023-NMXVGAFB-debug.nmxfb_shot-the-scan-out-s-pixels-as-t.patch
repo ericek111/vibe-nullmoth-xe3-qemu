@@ -1,0 +1,114 @@
+From 58f4365b90f94f7f597923d71b7a92a6ecbdad5a Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 03:30:06 +0200
+Subject: [PATCH 23/47] NMXVGAFB: debug.nmxfb_shot - the scan-out's pixels as
+ the host shows them
+
+A screenshot from inside the guest that needs no GUI session: screencapture over ssh is refused and the host's
+QEMU window capture is blank on a GL blob scan-out. Root reads a 16-byte header (NMXS, width, height, pitch) and the
+rows of whatever is on scanout 0, read under the scan-out lock. vm/guest/tools/nmxshot writes it as PPM (also bursts
+of crops, for catching transient glitches).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ kexts/NMXVGAFB/nmxvgafb.cpp | 50 +++++++++++++++++++++++++++++++++++--
+ 1 file changed, 48 insertions(+), 2 deletions(-)
+
+diff --git a/kexts/NMXVGAFB/nmxvgafb.cpp b/kexts/NMXVGAFB/nmxvgafb.cpp
+index 386ad3a..953d4ba 100644
+--- a/kexts/NMXVGAFB/nmxvgafb.cpp
++++ b/kexts/NMXVGAFB/nmxvgafb.cpp
+@@ -20,6 +20,7 @@
+ #include "nmx_scanout_abi.h"
+ #include <mach/mach_time.h>
+ #include <sys/sysctl.h>
++#include <sys/proc.h>
+ 
+ // IOLog and kprintf both: a hang during start leaves only the serial console
+ #define VFBLOG(fmt, ...) do { IOLog("NMXVGAFB: " fmt "\n", ##__VA_ARGS__); kprintf("NMXVGAFB: " fmt "\n", ##__VA_ARGS__); } while (0)
+@@ -65,6 +66,8 @@ public:
+     uint64_t fPresentHist[kHist] = {};
+     uint64_t fSwitchN = 0, fSwitchNs = 0, fSwitchMaxNs = 0;
+     NMXVirtioGPU &virtio() { return fVirtio; }
++    // a copy of what scanout 0 shows now (the host reads the same pages): header + rows of B G R X, for debug.nmxfb_shot
++    IOReturn snapshot(void *dst, size_t cap, size_t *len);
+ private:
+     bool fFlushing = true;
+     unsigned fIdleLogs = 0;
+@@ -288,6 +291,26 @@ static int nmxVtimingSysctl(struct sysctl_oid *, void *, int, struct sysctl_req
+ SYSCTL_PROC(_debug, OID_AUTO, nmxfb_vtiming, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, nmxVtimingSysctl, "A",
+             "NMXVGAFB: present gaps, scan-out switch and virtio-gpu command times");
+ 
++// debug.nmxfb_shot (root): the scan-out's pixels as the host sees them - a 16-byte header ('NMXS', width, height, pitch)
++// and the rows. A screenshot that needs neither a GUI session nor the host window (both fail on a blob scan-out).
++static int nmxShotSysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
++{
++    NMXVGAFB *f = gVtInst;
++    if (!f) return ENODEV;
++    if (proc_suser(req->p)) return EPERM;
++    const size_t cap = 16 + (size_t)4096 * 4 * 2304;
++    if (!req->oldptr) return SYSCTL_OUT(req, nullptr, 16 + (size_t)1920 * 4 * 1080 * 2);   // a size hint
++    void *buf = IOMallocData(cap);
++    if (!buf) return ENOMEM;
++    size_t len = 0;
++    IOReturn r = f->snapshot(buf, cap, &len);
++    int err = r == kIOReturnSuccess ? SYSCTL_OUT(req, buf, len) : EIO;
++    IOFreeData(buf, cap);
++    return err;
++}
++SYSCTL_PROC(_debug, OID_AUTO, nmxfb_shot, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, nmxShotSysctl, "S",
++            "NMXVGAFB: the scan-out's current pixels (header NMXS w h pitch, then rows)");
++
+ // Opt-in, as NMXGPU is: boot-arg nmxvgafb=1, or the one-shot NVRAM variable nullmoth-vgafb-once (consumed here, so a
+ // start that hangs is followed by one with the firmware framebuffer). Declining leaves the display to IONDRVFramebuffer.
+ static int g_opted = -1;      /* the decision, made once: the NVRAM variable is consumed by the first ask */
+@@ -405,8 +428,10 @@ bool NMXVGAFB::start(IOService *provider)
+                           fHeight + 8, fVT, fHz * 1000u, 1u, 1u };
+         if (OSData *k5d = OSData::withBytes(k5, sizeof k5)) { setProperty("NVRMTiming", k5d); k5d->release(); }
+     }
+-    if (fVirtioOn && OSCompareAndSwapPtr(nullptr, this, (void * volatile *)&gVtInst))
++    if (fVirtioOn && OSCompareAndSwapPtr(nullptr, this, (void * volatile *)&gVtInst)) {
+         sysctl_register_oid(&sysctl__debug_nmxfb_vtiming);
++        sysctl_register_oid(&sysctl__debug_nmxfb_shot);
++    }
+     fVblTimer = thread_call_allocate(vblFire, this);
+     if (fVblTimer) {
+         uint64_t d; clock_interval_to_deadline((uint32_t)(fFrameNs / 1000), kMicrosecondScale, &d);
+@@ -431,8 +456,10 @@ bool NMXVGAFB::start(IOService *provider)
+ void NMXVGAFB::stop(IOService *provider)
+ {
+     fStopping = true;
+-    if (OSCompareAndSwapPtr(this, nullptr, (void * volatile *)&gVtInst))
++    if (OSCompareAndSwapPtr(this, nullptr, (void * volatile *)&gVtInst)) {
+         sysctl_unregister_oid(&sysctl__debug_nmxfb_vtiming);
++        sysctl_unregister_oid(&sysctl__debug_nmxfb_shot);
++    }
+     if (fHoldCap) { thread_call_cancel(fHoldCap); while (!thread_call_free(fHoldCap)) { thread_call_cancel(fHoldCap); IOSleep(5); } fHoldCap = nullptr; }
+     releaseHold("stopping");
+     OSSafeReleaseNULL(fAccel);
+@@ -663,6 +690,25 @@ IOReturn NMXVGAFB::scanoutSurface(NMXScanoutSurface *r)
+     return ret;
+ }
+ 
++IOReturn NMXVGAFB::snapshot(void *dst, size_t cap, size_t *len)
++{
++    if (!fVirtioOn || !fScanLock) return kIOReturnNotReady;
++    IOLockLock(fScanLock);
++    IOMemoryDescriptor *md = fScanBuf;
++    uint32_t w = fWidth, h = fHeight, pitch = fRowBytes;
++    for (auto &b : fSurf) if (b.md && b.res == fCurRes) { md = b.md; w = b.w; h = b.h; pitch = b.pitch; }
++    const size_t bytes = (size_t)pitch * h;
++    IOReturn r = kIOReturnNoSpace;
++    if (md && 16 + bytes <= cap) {
++        const uint32_t hdr[4] = { 0x53584d4eu, w, h, pitch };
++        memcpy(dst, hdr, sizeof hdr);
++        r = md->readBytes(0, (uint8_t *)dst + 16, bytes) == bytes ? kIOReturnSuccess : kIOReturnIOError;
++        *len = 16 + bytes;
++    }
++    IOLockUnlock(fScanLock);
++    return r;
++}
++
+ // back to the framebuffer's own buffer (NMXAccel is about to copy a frame into it)
+ IOReturn NMXVGAFB::scanoutHome()
+ {

@@ -1,0 +1,134 @@
+From 1dc855ee67e1b248d14515018562bdd98f11e610 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 21:41:47 +0200
+Subject: [PATCH 44/50] bsdcompat: a thread record whose xnu thread id changed
+ belongs to an exited thread
+
+User threads keep their record and LinuxKPI task_struct after they exit
+(nmx_thread_enter/leave have no callers, and releasing the task_struct per
+call would drop the mm's user count to zero between calls, which xe's
+userptr revalidation reads as a dead process). xnu reuses thread_t
+pointers, so a relaunched WindowServer's thread took a killed one's record:
+its mm named the dead task, and the first userptr VM_BIND wired through the
+destroyed map - panic in vm_map_copy_extract (Invalid/destroyed RWLock).
+Records now carry thread_tid() and a mismatching one is unlinked.
+
+WindowServer killed three times in a row: each relaunch presents, no panic
+(two panics on the second kill before).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ bsdcompat/src/nmx_kernel.c | 46 +++++++++++++++++++++++++++++++++-----
+ 1 file changed, 41 insertions(+), 5 deletions(-)
+
+diff --git a/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c b/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c
+index 96a5ae6..5ecb777 100644
+--- a/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c
++++ b/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c
+@@ -78,6 +78,7 @@ struct nmx_thread_rec {
+     struct thread td;               /* first member: a struct thread * is a struct nmx_thread_rec * */
+     struct nmx_thread_rec *next;
+     int transient;                  /* created by a system-call entry; freed when that entry returns */
++    uint64_t xtid;                  /* xnu's thread id (thread_tid): unique, unlike the thread_t a later thread can reuse */
+ };
+ static struct nmx_thread_rec *nmx_threads[NMX_THREAD_BUCKETS];
+ static lck_spin_t *nmx_thread_lock;
+@@ -161,22 +162,47 @@ pid_t nmx_proc_pid(struct proc *p)
+     return p ? p->p_pid : 0;
+ }
+ 
+-static struct nmx_thread_rec *nmx_thread_find(thread_t xt)
++static struct nmx_thread_rec *nmx_thread_find(thread_t xt, uint64_t xtid)
+ {
+     unsigned b = bucket_of(xt, NMX_THREAD_BUCKETS);
+     for (struct nmx_thread_rec *r = nmx_threads[b]; r; r = r->next)
+-        if (r->td.td_xnu == xt)
++        if (r->td.td_xnu == xt && r->xtid == xtid)
+             return r;
+     return NULL;
+ }
+ 
++/*
++ * User threads keep their record (and LinuxKPI's task_struct, which holds the process's mm) after they exit: nothing
++ * releases it at system-call exit (nmx_thread_enter/leave have no callers - releasing the task_struct per call would
++ * let the mm's user count reach zero between calls, which xe's userptr revalidation treats as a dead process). xnu
++ * reuses a dead thread's thread_t for new threads, and a relaunched WindowServer's thread found the old one's record:
++ * its mm named the killed WindowServer's task, and wiring user pages through that task's destroyed map panicked in
++ * vm_map_copy_extract. A record whose xnu thread id differs belongs to a dead thread and is unlinked; it stays
++ * allocated, as such records always did, since its task_struct may still be referenced.
++ */
++static int nmx_thread_unlink_stale(thread_t xt, uint64_t xtid)
++{
++    int n = 0;
++    unsigned b = bucket_of(xt, NMX_THREAD_BUCKETS);
++    for (struct nmx_thread_rec **pp = &nmx_threads[b]; *pp; ) {
++        if ((*pp)->td.td_xnu == xt && (*pp)->xtid != xtid) {
++            *pp = (*pp)->next;
++            nmx_thread_count--;
++            n++;
++        } else
++            pp = &(*pp)->next;
++    }
++    return n;
++}
++
+ /* the record for the calling thread, created on first use; 'transient' marks one made by a system-call entry */
+ static struct thread *nmx_thread_get(int transient, int *created)
+ {
+     thread_t xt = current_thread();
++    const uint64_t xtid = thread_tid(xt);
+     *created = 0;
+     lck_spin_lock(nmx_thread_lock);
+-    struct nmx_thread_rec *r = nmx_thread_find(xt);
++    struct nmx_thread_rec *r = nmx_thread_find(xt, xtid);
+     lck_spin_unlock(nmx_thread_lock);
+     if (r)
+         return &r->td;
+@@ -185,15 +211,18 @@ static struct thread *nmx_thread_get(int transient, int *created)
+     if (nr == NULL)
+         panic("NullMoth xkpi: no memory for a thread record");
+     nr->td.td_xnu = xt;
++    nr->xtid = xtid;
+     nr->td.td_proc = nmx_curproc();
+     nr->td.td_tid = (int)(thread_tid(xt) & 0x7fffffff);
+     nr->td.td_priority = PZERO;
+     nr->td.td_base_pri = PZERO;
+     nr->transient = transient;
+ 
++    int stale = 0;
+     lck_spin_lock(nmx_thread_lock);
+-    r = nmx_thread_find(xt);
++    r = nmx_thread_find(xt, xtid);
+     if (r == NULL) {
++        stale = nmx_thread_unlink_stale(xt, xtid);
+         unsigned b = bucket_of(xt, NMX_THREAD_BUCKETS);
+         nr->next = nmx_threads[b];
+         nmx_threads[b] = nr;
+@@ -205,6 +234,12 @@ static struct thread *nmx_thread_get(int transient, int *created)
+     lck_spin_unlock(nmx_thread_lock);
+     if (nr)
+         IOFree(nr, sizeof(*nr));
++    if (stale) {
++        static int said;
++        if (__atomic_fetch_add(&said, 1, __ATOMIC_RELAXED) < 8)
++            printf("NullMoth xkpi: thread %llu of pid %d reuses an exited thread's record slot - a fresh record\n",
++                   (unsigned long long)xtid, nmx_proc_pid(r->td.td_proc));
++    }
+     return &r->td;
+ }
+ 
+@@ -220,11 +255,12 @@ struct thread *nmx_curthread(void)
+ static void nmx_thread_drop_current(void)
+ {
+     thread_t xt = current_thread();
++    const uint64_t xtid = thread_tid(xt);
+     unsigned b = bucket_of(xt, NMX_THREAD_BUCKETS);
+     struct nmx_thread_rec *found = NULL;
+     lck_spin_lock(nmx_thread_lock);
+     for (struct nmx_thread_rec **pp = &nmx_threads[b]; *pp; pp = &(*pp)->next) {
+-        if ((*pp)->td.td_xnu == xt) {
++        if ((*pp)->td.td_xnu == xt && (*pp)->xtid == xtid) {
+             found = *pp;
+             *pp = found->next;
+             nmx_thread_count--;

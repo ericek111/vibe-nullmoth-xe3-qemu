@@ -1,0 +1,76 @@
+From ca9f93c9909e198cae22110e9fee53d136485420 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 21:05:58 +0200
+Subject: [PATCH 13/47] NMXVGAFB: flush a presented surface only for 1 s after
+ its present
+
+The VBL timer flushed scanout 0 at 60 Hz even on an idle desktop, a host
+round trip (and a GL redraw) per frame. A presented surface has one late
+writer, the Metal plugin's copy-out after the GPU signals, so flushing for
+1 s after each present covers it. The own buffer (copy path, CPU desktop)
+keeps flushing every VBL: its writers give no notice.
+
+Idle desktop: QEMU main thread 4.8% -> 2.4% of a host core.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ kexts/NMXVGAFB/nmxvgafb.cpp | 22 +++++++++++++++++++---
+ 1 file changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/kexts/NMXVGAFB/nmxvgafb.cpp b/kexts/NMXVGAFB/nmxvgafb.cpp
+index 3551a3e..92e4863 100644
+--- a/kexts/NMXVGAFB/nmxvgafb.cpp
++++ b/kexts/NMXVGAFB/nmxvgafb.cpp
+@@ -55,6 +55,10 @@ class NMXVGAFB : public IOFramebuffer {
+     uint32_t fNextRes = 16;
+     volatile uint32_t fCurRes = 0;        // the resource on scanout 0 (kScanResource or a surface's)
+     uint32_t fCurW = 0, fCurH = 0;
++    uint64_t fLastPresent = 0;            // mach time of the last scanoutSurface (a present)
++    bool fFlushing = true;
++    unsigned fIdleLogs = 0;
++    static constexpr uint64_t kSurfFlushNs = 1000000000ull;
+     IOLock *fScanLock = nullptr;
+     unsigned fSwitchLogs = 0;
+     IOReturn scanoutSurface(NMXScanoutSurface *r);
+@@ -88,10 +92,21 @@ class NMXVGAFB : public IOFramebuffer {
+         NMXVGAFB *me = (NMXVGAFB *)p0;
+         if (me->fStopping) return;
+         // under the scan-out lock: QEMU refuses to flush a blob that is not on a scanout, which the one just
+-        // replaced is; only a lost device (a command timed out) ends the virtio scan-out
++        // replaced is; only a lost device (a command timed out) ends the virtio scan-out. The own buffer is flushed
++        // every VBL (its CPU writers give no notice); a presented surface only for kSurfFlushNs after its present,
++        // which covers the plugin's copy-out into it after the GPU signals - an idle desktop costs no flushes
++        uint64_t now = mach_absolute_time();
+         if (me->fVirtioOn && me->fScanLock) {
+             IOLockLock(me->fScanLock);
+-            me->fVirtio.flush(me->fCurRes, 0, 0, me->fCurW, me->fCurH);
++            uint64_t sinceNs = 0;
++            if (me->fCurRes != kScanResource) absolutetime_to_nanoseconds(now - me->fLastPresent, &sinceNs);
++            const bool flush = sinceNs < kSurfFlushNs;
++            if (flush) me->fVirtio.flush(me->fCurRes, 0, 0, me->fCurW, me->fCurH);
++            if (!flush && me->fFlushing && me->fIdleLogs < 3) {
++                me->fIdleLogs++;
++                VFBLOG("virtio-gpu: no present for 1 s - VBL flushes pause until the next one");
++            }
++            me->fFlushing = flush;
+             IOLockUnlock(me->fScanLock);
+             if (!me->fVirtio.ready()) {
+                 me->fVirtioOn = false;
+@@ -101,7 +116,7 @@ class NMXVGAFB : public IOFramebuffer {
+         }
+         if (me->fVbl.proc) me->fVbl.proc(me->fVbl.target, me->fVbl.ref);
+         uint64_t period; nanoseconds_to_absolutetime(kFrameNs, &period);
+-        uint64_t now = mach_absolute_time();
++        now = mach_absolute_time();
+         me->fVblNext = (me->fVblNext && me->fVblNext + period > now) ? me->fVblNext + period : now + period;
+         thread_call_enter_delayed(me->fVblTimer, me->fVblNext);
+     }
+@@ -579,6 +594,7 @@ IOReturn NMXVGAFB::scanoutSurface(NMXScanoutSurface *r)
+     } else if (!hit) ret = kIOReturnNoResources;
+     if (hit) {
+         hit->lastUse = t0;
++        fLastPresent = t0;
+         if (hit->res != fCurRes && !fVirtio.setScanoutBlob(hit->res, hit->w, hit->h, hit->pitch)) ret = kIOReturnIOError;
+         else { fCurRes = hit->res; fCurW = hit->w; fCurH = hit->h; fVirtio.flush(fCurRes, 0, 0, fCurW, fCurH); }
+     }

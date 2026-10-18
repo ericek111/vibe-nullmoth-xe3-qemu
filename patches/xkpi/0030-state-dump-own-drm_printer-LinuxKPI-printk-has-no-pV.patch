@@ -1,0 +1,49 @@
+From 192b56934bc813479decf729cca6e30cb5865256 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 09:33:24 +0200
+Subject: [PATCH 30/50] state dump: own drm_printer (LinuxKPI printk has no
+ %pV)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ override/xe/nmx_xe_debug.c | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/gpu-port/xkpi/override/xe/nmx_xe_debug.c b/gpu-port/xkpi/override/xe/nmx_xe_debug.c
+index 6ed9243..57f2b44 100644
+--- a/gpu-port/xkpi/override/xe/nmx_xe_debug.c
++++ b/gpu-port/xkpi/override/xe/nmx_xe_debug.c
+@@ -24,6 +24,23 @@ void nmx_xe_debug_register(struct xe_device *xe);
+ 
+ static struct xe_device *nmx_xe;
+ 
++/* drm_info_printer goes through dev_printk's "%pV", which LinuxKPI's printk does not expand: format here instead */
++static void dump_printfn(struct drm_printer *p, struct va_format *vaf)
++{
++	char buf[512];
++	va_list ap;
++
++	va_copy(ap, *vaf->va);
++	vsnprintf(buf, sizeof(buf), vaf->fmt, ap);
++	va_end(ap);
++	printf("xe dump: %s", buf);
++}
++
++static void dump_puts(struct drm_printer *p, const char *str)
++{
++	printf("xe dump: %s", str);
++}
++
+ static void dump_fence(struct drm_printer *p, const char *what, struct dma_fence *f)
+ {
+ 	if (f == NULL) {
+@@ -65,7 +82,7 @@ static void nmx_xe_dump(void)
+ 
+ 	if (xe == NULL)
+ 		return;
+-	p = drm_info_printer(xe->drm.dev);
++	p = (struct drm_printer){ .printfn = dump_printfn, .puts = dump_puts };
+ 	for_each_tile(tile, xe, id) {
+ 		if (tile->memirq.bo != NULL) {
+ 			const u8 *src = tile->memirq.source.vaddr;

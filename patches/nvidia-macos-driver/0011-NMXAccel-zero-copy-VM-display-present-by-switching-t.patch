@@ -1,0 +1,122 @@
+From cf9343b720e9c13fe62edcc1871a8248e8e39c8f Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 20:42:47 +0200
+Subject: [PATCH 11/47] NMXAccel: zero-copy VM display - present by switching
+ the scan-out to the surface
+
+On a VM display with a virtio scan-out (NMXVirtioScanout), performTransaction hands the surface to
+the framebuffer (nmxScanoutSurface) instead of copying it, and stops the front-buffer recopy (the
+host reads the surface itself; the framebuffer flushes every VBL). A refused surface is copied as
+before, after nvAccelIopHome switches the scan-out back. debug.nmxfb_blob (1) turns it off;
+counters debug.nmxfb_blob_flips / _refused. Measured at the login window: 860 of 860 presents
+flipped, no copies, switch 0.5-0.6 ms, WindowServer about 60% of a core (was 105-130%).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ kexts/NVRM/accel/nvrm-accel.cpp | 59 +++++++++++++++++++++++++++++++++
+ 1 file changed, 59 insertions(+)
+
+diff --git a/kexts/NVRM/accel/nvrm-accel.cpp b/kexts/NVRM/accel/nvrm-accel.cpp
+index 731b7c1..49ca5ac 100644
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -977,6 +977,10 @@ static int gNmxFrontHz = 60;
+ static unsigned gNmxFrontTicksLeft = 0;   // copies until the timer stops, refilled by each transaction
+ static bool gNmxFrontArmed = false;
+ static constexpr unsigned kNmxFrontMaxHz = 240;
++// zero-copy VM display (NMXVGAFB on virtio-gpu): the presented surface itself becomes the scan-out
++static int gNmxBlobScanout = 1;
++static SInt64 gCntNmxBlobFlips, gCntNmxBlobRefused;
++static unsigned gNmxBlobLogs = 0;
+ 
+ static void nmxFrontCopyLocked()
+ {
+@@ -1083,6 +1087,42 @@ bool NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
+ 
+ static void nvAccelSurfScanoutSync(IOSurface *s);
+ static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head);
++#ifdef NMX_ACCEL
++#include "../../NMXVGAFB/nmx_scanout_abi.h"
++/*
++ * A VM display on virtio-gpu (NMXVGAFB publishes NMXVirtioScanout) scans the presented surface out of the surface's
++ * own pages: the framebuffer makes them a blob the host shows as a dmabuf. 1 = on the panel, 2 = held (the surface's
++ * newest pixels are not in its memory yet: the previous frame stays, as the copy path does), 0 = not taken (copy).
++ */
++static int nmxIopBlobFlip(IOService *fb, unsigned head, IOSurface *s)
++{
++    if (!gNmxBlobScanout || !fb || !s || !fb->getProperty("NMXVirtioScanout")) return 0;
++    if (!nvAccelSurfCopyReady(s, head)) return 2;
++    IOMemoryDescriptor *md = s->getMemoryDescriptor();
++    if (!md) return 0;
++    struct NMXScanoutSurface q;
++    for (unsigned i = 0; i < sizeof q; i++) ((volatile unsigned char *)&q)[i] = 0;
++    q.version = NMX_SCANOUT_ABI_VERSION; q.surfaceId = s->getSurfaceID(); q.md = md;
++    q.width = (unsigned)s->getWidth(); q.height = (unsigned)s->getHeight(); q.pitch = (unsigned)s->getBytesPerRow();
++    q.format = s->getPixelFormat();
++    const OSSymbol *sym = OSSymbol::withCStringNoCopy(NMX_SCANOUT_FN_SURFACE);
++    IOReturn rr = sym ? fb->callPlatformFunction(sym, false, &q, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
++    OSSafeReleaseNULL(sym);
++    if (rr != kIOReturnSuccess) {
++        OSAddAtomic64(1, &gCntNmxBlobRefused);
++        if (gNmxBlobLogs < 8) { gNmxBlobLogs++; ALOG("iop: blob scan-out of surface 0x%x %ux%u pitch %u fmt 0x%08x refused (0x%x) -- copying",
++                                                     q.surfaceId, q.width, q.height, q.pitch, q.format, (unsigned)rr); }
++        return 0;
++    }
++    // nothing to copy again: the host reads the surface itself (NMXVGAFB flushes it every VBL)
++    gNmxFront.src = nullptr;
++    const SInt64 n = OSAddAtomic64(1, &gCntNmxBlobFlips);
++    if (n < 4 || n == 600)
++        ALOG("iop: blob scan-out #%lld: surface 0x%x %ux%u pitch %u on the panel in %llu us", (long long)n + 1, q.surfaceId,
++             q.width, q.height, q.pitch, q.ns / 1000);
++    return 1;
++}
++#endif
+ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe);
+ static void nvAccelIopHome(IOService *fb, unsigned head);
+ IOReturn NVDisplayPipe::performTransactionCopy(IOAccelDisplayPipeTransaction2 *txn)
+@@ -1121,6 +1161,11 @@ IOReturn NVDisplayPipe::performTransactionCopy(IOAccelDisplayPipeTransaction2 *t
+         if ((unsigned long long)pitch < 4ull * w) NVIOP_FAIL(kIOReturnBadArgument, "resource %ux%u: +0xb8 reads %u, which is not a row pitch (need >= %u) — not a surface buffer", w, h, pitch, 4u * w);
+         if ((unsigned long long)h * pitch > vm->fBytes) NVIOP_FAIL(kIOReturnOverrun, "resource %ux%u pitch %u exceeds its %llu bytes", w, h, pitch, (unsigned long long)vm->fBytes);
+         src = (const volatile unsigned int *)vm->fKva; fromRes = true;
++#ifdef NMX_ACCEL
++    } else if (int b = s ? nmxIopBlobFlip(fb, head, s) : 0) {
++        if (b == 1) { OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]); }
++        return kIOReturnSuccess;
++#endif
+     } else if (s && nvAccelIopFlip(fb, head, s, this)) {
+         OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
+         return kIOReturnSuccess;
+@@ -1311,11 +1356,17 @@ static bool gVmSysctlInstalled = false;
+ NVACCEL_CNT(nmxfb_front_copies, gCntNmxFrontCopies, "VM display: front-buffer copies onto the panel");
+ SYSCTL_INT(_debug, OID_AUTO, nmxfb_front_hz, CTLFLAG_RW | CTLFLAG_LOCKED, &gNmxFrontHz, 0,
+            "VM display: front-buffer copies per second for a second after each transaction (0 = only on transactions)");
++SYSCTL_INT(_debug, OID_AUTO, nmxfb_blob, CTLFLAG_RW | CTLFLAG_LOCKED, &gNmxBlobScanout, 0,
++           "VM display: 1 = scan presented surfaces out of their own memory (virtio-gpu blobs), 0 = copy every frame");
++NVACCEL_CNT(nmxfb_blob_flips, gCntNmxBlobFlips, "VM display: frames scanned out of their surface (no copy)");
++NVACCEL_CNT(nmxfb_blob_refused, gCntNmxBlobRefused, "VM display: surfaces the framebuffer would not scan out (copied instead)");
+ static void nmxInstallVmSysctls(void)
+ {
+     if (gVmSysctlInstalled) return;
+     gVmSysctlInstalled = true;
+     sysctl_register_oid(&sysctl__debug_nmxfb_front_copies);  sysctl_register_oid(&sysctl__debug_nmxfb_front_hz);
++    sysctl_register_oid(&sysctl__debug_nmxfb_blob);
++    sysctl_register_oid(&sysctl__debug_nmxfb_blob_flips);    sysctl_register_oid(&sysctl__debug_nmxfb_blob_refused);
+ #else
+     sysctl_register_oid(&sysctl__debug_nvaccel_headless);
+ #endif
+@@ -1857,6 +1908,14 @@ static int nvaccel_crc_sysctl SYSCTL_HANDLER_ARGS
+ }
+ static void nvAccelIopHome(IOService *fb, unsigned head)
+ {
++#ifdef NMX_ACCEL
++    // a VM display that scanned a surface out: back to its own buffer before a frame is copied into it
++    if (fb && fb->getProperty("NMXVirtioScanout")) {
++        const OSSymbol *sym = OSSymbol::withCStringNoCopy(NMX_SCANOUT_FN_HOME);
++        if (sym) { fb->callPlatformFunction(sym, false, nullptr, nullptr, nullptr, nullptr); sym->release(); }
++        return;
++    }
++#endif
+     if (!fb || head >= kNvMaxFB || !gIopFlipped[head] || !fb->metaCast("NVRMNVDAFramebuffer")) return;
+     struct NVRMFlipRequest f; nvSVZero(&f, sizeof f);
+     f.version = NVRM_FLIP_ABI_VERSION; f.flags = 1u;

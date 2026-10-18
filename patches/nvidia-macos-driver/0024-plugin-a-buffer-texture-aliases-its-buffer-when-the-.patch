@@ -1,0 +1,96 @@
+From 29dcd463d79ee0868c5c0bcdf05e53371a75f1db Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 03:30:30 +0200
+Subject: [PATCH 24/47] plugin: a buffer texture aliases its buffer when the
+ buffer's memory type suits the image
+
+nvmtl_vk_image_create_buffer_alias required the linear image to accept every memory type, which holds on NVK. ANV's
+linear images take 0x7 of 0x3f, so every buffer texture (newTextureWithDescriptor:offset:bytesPerRow:, which
+CoreAnimation uses) was refused and fell back to a copied texture or nil. nvk_buffer now records its memory type
+(memtype1, type + 1, 0 unknown; set by buffer creation, BAR1 and pool placements, host imports and family-VRAM
+imports), and the check asks for that type; an unknown type keeps the old all-types rule.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugin/nvmtl_vk.c | 18 ++++++++++--------
+ plugin/nvmtl_vk.h |  2 +-
+ 2 files changed, 11 insertions(+), 9 deletions(-)
+
+diff --git a/plugin/nvmtl_vk.c b/plugin/nvmtl_vk.c
+index eb3d6a0..f5c7611 100644
+--- a/plugin/nvmtl_vk.c
++++ b/plugin/nvmtl_vk.c
+@@ -1285,7 +1285,7 @@ static int nvmtl_vk_buffer_create_body(size_t size, int host_visible, nvk_buffer
+         VkResult r2 = r1 == VK_SUCCESS ? pvkMapMemory(g_dev, bm, 0, VK_WHOLE_SIZE, 0, &bp) : r1;
+         VkResult r3 = r2 == VK_SUCCESS ? pvkBindBufferMemory(g_dev, out->buf, bm, 0) : r2;
+         if (r3 == VK_SUCCESS) {
+-            out->mem = bm; out->map = bp; out->alloc = mr.size; out->bar1 = 1; g_alloc_bytes += mr.size; g_bar1_bytes += mr.size; g_buf_made++;
++            out->mem = bm; out->map = bp; out->alloc = mr.size; out->bar1 = 1; out->memtype1 = (uint32_t)bt + 1; g_alloc_bytes += mr.size; g_bar1_bytes += mr.size; g_buf_made++;
+             { static int said; if (!said++) nvlog("vk: shared buffer of %zu bytes placed in VRAM through BAR1 (type %d)", size, bt); }
+             return 0; }
+         if (bp) pvkUnmapMemory(g_dev, bm);
+@@ -1315,7 +1315,7 @@ static int nvmtl_vk_buffer_create_body(size_t size, int host_visible, nvk_buffer
+             return -1;
+         }
+     } else VKCK(nvmtl_opaque_AllocateMemory(g_dev, &mai, NULL, &out->mem), "vkAllocateMemory(buffer)");
+-    out->alloc = mr.size;
++    out->alloc = mr.size; out->memtype1 = (uint32_t)mt + 1;
+     if (!host_visible) nvmtl_vk_budget_charge(mr.size);
+     VKCK(pvkBindBufferMemory(g_dev, out->buf, out->mem, 0), "vkBindBufferMemory");
+     if (host_visible) { VkResult mr_ = pvkMapMemory(g_dev, out->mem, 0, VK_WHOLE_SIZE, 0, &out->map); if (mr_ != VK_SUCCESS) {
+@@ -1395,7 +1395,7 @@ int nvmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out)
+         nvlog("vk: vkBindBufferMemory refused the imported allocation");
+         pvkFreeMemory(g_dev, (VkDeviceMemory)out->mem, NULL); pvkDestroyBuffer(g_dev, (VkBuffer)out->buf, NULL);
+         out->buf = NULL; out->mem = NULL; return -1; }
+-    out->map = ptr; out->alloc = size; out->imported = 1;
++    out->map = ptr; out->alloc = size; out->imported = 1; out->memtype1 = (uint32_t)mt + 1;
+     g_alloc_bytes += size; g_buf_made++;
+     { static int said; if (!said++) nvlog("vk: imported the caller's pages as device memory — %zu bytes at %p, memory type %d", size, ptr, mt); }
+     return 0;
+@@ -1894,7 +1894,7 @@ int nvmtl_vk_surface_vram(uint32_t surfaceID, uint32_t plane, size_t need, nvk_b
+         nvlog("item 7: surface %u: a buffer over the imported VRAM was refused - private", surfaceID);
+         return -1;
+     }
+-    out->buf = b; out->mem = m; out->size = need; out->alloc = 0; out->imported = 1;
++    out->buf = b; out->mem = m; out->size = need; out->alloc = 0; out->imported = 1; out->memtype1 = (uint32_t)mt + 1;
+     g_buf_made++;
+     return 0;
+ }
+@@ -6886,10 +6886,12 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
+     VkMemoryRequirements mr; pvkGetImageMemoryRequirements(g_dev, (VkImage)out->img, &mr);
+     uint32_t all = g_memp.memoryTypeCount >= 32 ? 0xffffffffu : ((1u << g_memp.memoryTypeCount) - 1u);
+     size_t at = b->moff + offset;
+-    const char *why = (mr.memoryTypeBits & all) != all ? "memory types" : (mr.alignment && at % mr.alignment) ? "alignment" : NULL;
++    // the buffer's own memory type must suit the image; with it unknown, every type must (NVK's images take any)
++    const int typeOk = b->memtype1 ? ((mr.memoryTypeBits >> (b->memtype1 - 1)) & 1) != 0 : (mr.memoryTypeBits & all) == all;
++    const char *why = !typeOk ? "memory types" : (mr.alignment && at % mr.alignment) ? "alignment" : NULL;
+     if (why) {
+-        nvlog("buffer texture: refused on %s - image types 0x%x of 0x%x, bind at %zu (buffer %zu + %zu) vs alignment %llu",
+-              why, mr.memoryTypeBits, all, at, b->moff, offset, (unsigned long long)mr.alignment);
++        nvlog("buffer texture: refused on %s - image types 0x%x of 0x%x (buffer's type %d), bind at %zu (buffer %zu + %zu) vs alignment %llu",
++              why, mr.memoryTypeBits, all, (int)b->memtype1 - 1, at, b->moff, offset, (unsigned long long)mr.alignment);
+         pvkDestroyImage(g_dev, (VkImage)out->img, NULL); memset(out, 0, sizeof *out); return -1; }
+     if (mr.size > b->size - offset)
+         nvlog("buffer texture: image size %llu runs %llu B past the buffer's %zu at offset %zu (the tail of the last row, never addressed)",
+@@ -7022,7 +7024,7 @@ static int pool_buffer_create_in(int vram, size_t size, nvk_buffer *out)
+         pthread_mutex_lock(&g_pool_lock); blk->nlive--; g_pool_live--; g_pool_bytes -= len; pool_block_give(blk, off, len); pthread_mutex_unlock(&g_pool_lock);
+         return -1;
+     }
+-    *out = pb; out->pool = blk; out->poff = off; out->alloc = len; out->size = size;
++    *out = pb; out->pool = blk; out->poff = off; out->alloc = len; out->size = size; out->memtype1 = blk->heap.memtype + 1;
+     if (!out->map && blk->heap.map) out->map = (uint8_t *)blk->heap.map + off;
+     if ((g_buf_made & 0xFFF) == 0) nvlog("buffer census: %llu made, %llu gone, %llu live, %zu bytes allocated; pool %llu blocks, %llu pooled live, %llu bytes in ranges",
+         (unsigned long long)g_buf_made, (unsigned long long)g_buf_gone, (unsigned long long)(g_buf_made - g_buf_gone), g_alloc_bytes,
+diff --git a/plugin/nvmtl_vk.h b/plugin/nvmtl_vk.h
+index 4c2a186..d8cc2de 100644
+--- a/plugin/nvmtl_vk.h
++++ b/plugin/nvmtl_vk.h
+@@ -8,7 +8,7 @@
+ #include <stdint.h>
+ #include <stddef.h>
+ const char *nvmtl_image_ident(const void *addr, char *out, size_t n);
+-typedef struct { void *buf; void *mem; void *map; size_t size; size_t alloc; int placed; void *pool; size_t poff; int imported; int bar1; size_t moff; int sparse, sysmem; } nvk_buffer;
++typedef struct { void *buf; void *mem; void *map; size_t size; size_t alloc; int placed; void *pool; size_t poff; int imported; int bar1; size_t moff; int sparse, sysmem; uint32_t memtype1; /* memory type + 1, 0 unknown */ } nvk_buffer;
+ #include "nvmtl_sample_positions.h"
+ typedef struct { void *img; void *mem; void *view; uint32_t w, h; size_t alloc; uint32_t layout; uint32_t mips; uint32_t fmt, bpp; uint32_t storage, mtl_type, layers; int placed; uint32_t bw, bh; uint32_t samples; uint32_t sysmem; uint32_t vkflags, usage;  uint32_t vpair;  uint64_t up_token; } nvk_image;
+ #define NVMTL_NVAR 16

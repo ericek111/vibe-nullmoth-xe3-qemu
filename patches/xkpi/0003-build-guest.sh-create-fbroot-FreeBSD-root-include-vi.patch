@@ -1,0 +1,27 @@
+From f09847f8b4f4c7ebf2264b7610f1135426572f77 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 03:52:19 +0200
+Subject: [PATCH 03/50] build-guest.sh: create fbroot (FreeBSD root include
+ view)
+
+---
+ build-guest.sh | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/gpu-port/xkpi/build-guest.sh b/gpu-port/xkpi/build-guest.sh
+index acb78b8..540021c 100755
+--- a/gpu-port/xkpi/build-guest.sh
++++ b/gpu-port/xkpi/build-guest.sh
+@@ -10,6 +10,12 @@ X=/Volumes/MiniData/build/gpu-src/xkpi
+ WHAT=${1:-all}; OUT=${2:-$HOME/build/out}
+ cd "$X" || exit 1
+ mkdir -p fbroot obj obj-i915 obj-xe lkobj srcobj xnuobj logs logs-i915 logs-xe lklogs srclogs xnulogs "$OUT"
++# fbroot: a FreeBSD source-root view for includes like <compat/linuxkpi/...> and <contrib/dev/acpica/...>
++# (not in Nullmoth's repo; its NMXNPU source archive carries the same layout)
++mkdir -p fbroot fbroot/contrib
++[ -e fbroot/compat ] || ln -s ../../kpi/freebsd-src/sys/compat fbroot/compat
++[ -e fbroot/contrib/dev ] || ln -s ../../../kpi/freebsd-src/sys/contrib/dev fbroot/contrib/dev
++[ -e fbroot/contrib/ck ] || ln -s ../../../kpi/freebsd-src/sys/contrib/ck fbroot/contrib/ck
+ [ -f amd.flags ] || /opt/homebrew/bin/python3 gen_flags.py ../kpi/drm-kmod amd.flags || exit 1
+ t0=$(date +%s)
+ case "$WHAT" in

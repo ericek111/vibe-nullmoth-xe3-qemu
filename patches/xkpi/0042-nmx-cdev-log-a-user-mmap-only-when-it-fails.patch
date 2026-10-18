@@ -1,0 +1,57 @@
+From bba34e0e1c6f8141b8fccf8262d7f1796165c907 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 21:17:48 +0200
+Subject: [PATCH 42/50] nmx cdev: log a user mmap only when it fails
+
+The diagnostic printed every map; ANV mapped a BO per command batch, so the
+kernel log took ~60 lines/s while WindowServer animated.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ override/src/nmx_linux_cdev.c | 13 +++++++------
+ 1 file changed, 7 insertions(+), 6 deletions(-)
+
+diff --git a/gpu-port/xkpi/override/src/nmx_linux_cdev.c b/gpu-port/xkpi/override/src/nmx_linux_cdev.c
+index 99d8d70..e62c956 100644
+--- a/gpu-port/xkpi/override/src/nmx_linux_cdev.c
++++ b/gpu-port/xkpi/override/src/nmx_linux_cdev.c
+@@ -572,7 +572,7 @@ static int nmx_mmap(struct nmx_open *o, struct nmx_drm_mmap *req)
+     linux_set_current(curthread);
+     struct mm_struct *mm = current->mm;
+     if (mm == NULL || !mmget_not_zero(mm)) {
+-        printf("NMX mmap diag: no mm (mm %p)\n", mm);
++        printf("NMX mmap: no mm (mm %p)\n", mm);
+         mtx_destroy(&u->obj.lock);
+         free(u->pages, M_NMXCDEV);
+         free(u, M_NMXCDEV);
+@@ -592,9 +592,10 @@ static int nmx_mmap(struct nmx_open *o, struct nmx_drm_mmap *req)
+     curthread->td_fpop = o->fp;
+     down_write(&mm->mmap_sem);
+     int err = -filp->f_op->mmap(filp, vma);
+-    printf("NMX mmap diag: f_op->mmap off 0x%llx size %llu -> %d, vm_ops %p fault %p pfn_count %d npages %zu flags 0x%lx\n",
+-           (unsigned long long)req->offset, (unsigned long long)size, err, vma->vm_ops,
+-           vma->vm_ops ? (void *)vma->vm_ops->fault : NULL, vma->vm_pfn_count, u->npages, (unsigned long)vma->vm_flags);
++    if (err)
++        printf("NMX mmap: f_op->mmap off 0x%llx size %llu -> %d, vm_ops %p fault %p pfn_count %d npages %zu flags 0x%lx\n",
++               (unsigned long long)req->offset, (unsigned long long)size, err, vma->vm_ops,
++               vma->vm_ops ? (void *)vma->vm_ops->fault : NULL, vma->vm_pfn_count, u->npages, (unsigned long)vma->vm_flags);
+     if (err == 0) {
+         u->vm_opened = vma->vm_ops != NULL;
+         if (vma->vm_ops != NULL && vma->vm_ops->fault != NULL) {
+@@ -614,13 +615,13 @@ static int nmx_mmap(struct nmx_open *o, struct nmx_drm_mmap *req)
+     up_write(&mm->mmap_sem);
+     curthread->td_fpop = oldfp;
+     if (err)
+-        printf("NMX mmap diag: populate/pin -> %d (pinned %d)\n", err, u->pinned);
++        printf("NMX mmap: populate/pin -> %d (pinned %d)\n", err, u->pinned);
+ 
+     if (err == 0) {
+         int writable = (vma->vm_flags & VM_WRITE) != 0;
+         err = nmx_xnu_map_user(u->pages, u->npages, u->cache, writable, fixed, &u->uaddr, &u->xmap);
+         if (err)
+-            printf("NMX mmap diag: map_user -> %d\n", err);
++            printf("NMX mmap: map_user -> %d\n", err);
+     }
+     if (err) {
+         umap_free(u);

@@ -1,0 +1,24 @@
+From dbe32589910a3d3766f6846bc12ad9016bfec7e8 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 03:59:43 +0200
+Subject: [PATCH 06/50] xe: name the PCI driver drmn so LinuxKPI registers it
+ on vgapci (xe never attached)
+
+---
+ fork_xe.py | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/gpu-port/xkpi/fork_xe.py b/gpu-port/xkpi/fork_xe.py
+index f55f5fe..630769f 100644
+--- a/gpu-port/xkpi/fork_xe.py
++++ b/gpu-port/xkpi/fork_xe.py
+@@ -82,4 +82,9 @@ edit("display/xe_display.c", [('#include "intel_acpi.h"\n', '#include "intel_acp
+ # sriov_configure, removed above, and stays off: pf readiness fails without VFs to provision).
+ edit("xe_pci.c", [("\tPLATFORM(PANTHERLAKE),\n\t.has_display = true,\n\t.require_force_probe = true,\n",
+                    "\tPLATFORM(PANTHERLAKE),\n\t.has_display = true,\n\t.has_sriov = true,\n\t.require_force_probe = true,\n", 1)])
++# LinuxKPI puts a PCI driver on the "vgapci" bus class (where NMXGPU offers display devices, nmx_port_attach) only
++# when it is named "drmn" - drm-kmod renames i915's and amdgpu's driver for that. xe kept "xe", registered on plain
++# "pci" and was never offered the GPU: every xe device ended in "vgapci0: no driver attached".
++edit("xe_pci.c", [("static struct pci_driver xe_pci_driver = {\n\t.name = DRIVER_NAME,\n",
++                   "static struct pci_driver xe_pci_driver = {\n\t.name = \"drmn\",\t/* LinuxKPI: a DRM driver, on vgapci */\n", 1)])
+ print("xe fork applied")

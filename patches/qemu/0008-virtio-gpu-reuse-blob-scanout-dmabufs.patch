@@ -1,0 +1,133 @@
+From ab64a351321502b9dc411f6b14358be77252c3aa Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 17:26:16 +0200
+Subject: [PATCH 2/2] virtio-gpu: reuse a blob scanout's dmabuf when the guest
+ flips back to it
+
+Every SET_SCANOUT_BLOB made a new QemuDmaBuf and freed the previous one,
+so the display imported the resource again (GTK/EGL: an EGL image of a
+scattered udmabuf) on every flip. A guest page-flipping between a few
+blob resources at 120 Hz spent 2.4 ms (p50) in each SET_SCANOUT_BLOB for
+a 2880x1710 buffer. The dmabufs now stay per resource, scanout and
+geometry and are reused, so the display keeps its import: 37 us. They go
+when their resource is unreferenced; one that is still on a scanout then
+is marked dead (resource id 0, never matched) and freed once the scanout
+moves on.
+
+Signed-off-by: ericek111 <erik.brocko@letemsvetemapplem.eu>
+---
+ hw/display/virtio-gpu-udmabuf.c | 55 ++++++++++++++++++++++++++++-----
+ include/hw/virtio/virtio-gpu.h  |  4 +++
+ 2 files changed, 51 insertions(+), 8 deletions(-)
+
+diff --git a/hw/display/virtio-gpu-udmabuf.c b/hw/display/virtio-gpu-udmabuf.c
+index 5a642d5..40abc6d 100644
+--- a/hw/display/virtio-gpu-udmabuf.c
++++ b/hw/display/virtio-gpu-udmabuf.c
+@@ -170,8 +170,27 @@ static void virtio_gpu_free_dmabuf(VirtIOGPU *g, VGPUDMABuf *dmabuf)
+ void virtio_gpu_fini_udmabuf(VirtIOGPU *g, struct virtio_gpu_simple_resource *res)
+ {
+     int max_outputs = g->parent_obj.conf.max_outputs;
++    VGPUDMABuf *d, *tmp;
+     int i;
+ 
++    /* the resource's cached dmabufs, except one still on a scanout */
++    QTAILQ_FOREACH_SAFE(d, &g->dmabuf.bufs, next, tmp) {
++        bool shown = false;
++
++        if (d->resource_id != res->resource_id) {
++            continue;
++        }
++        for (i = 0; i < max_outputs; i++) {
++            shown |= g->dmabuf.primary[i] == d;
++        }
++        if (!shown) {
++            virtio_gpu_free_dmabuf(g, d);
++        } else {
++            /* freed once the scanout moves on; never reused (ids start at 1) */
++            d->resource_id = 0;
++        }
++    }
++
+     for (i = 0; i < max_outputs; i++) {
+         VGPUDMABuf *dmabuf = g->dmabuf.primary[i];
+ 
+@@ -209,6 +228,9 @@ static VGPUDMABuf
+                                   DRM_FORMAT_MOD_INVALID, &res->dmabuf_fd,
+                                   1, true, false);
+     dmabuf->scanout_id = scanout_id;
++    dmabuf->resource_id = res->resource_id;
++    dmabuf->fb = *fb;
++    dmabuf->r = *r;
+     QTAILQ_INSERT_HEAD(&g->dmabuf.bufs, dmabuf, next);
+ 
+     return dmabuf;
+@@ -221,16 +243,30 @@ int virtio_gpu_update_dmabuf(VirtIOGPU *g,
+                              struct virtio_gpu_rect *r)
+ {
+     struct virtio_gpu_scanout *scanout = &g->parent_obj.scanout[scanout_id];
+-    VGPUDMABuf *new_primary, *old_primary = NULL;
++    VGPUDMABuf *new_primary = NULL, *d, *tmp;
+     uint32_t width, height;
+ 
+-    new_primary = virtio_gpu_create_dmabuf(g, scanout_id, res, fb, r);
++    /*
++     * A guest that flips between a few blob resources sets each of them as
++     * the scanout again and again.  Keep a dmabuf per resource and reuse it:
++     * the display keeps its import (an EGL image of a scattered udmabuf costs
++     * milliseconds to create).  They go when the resource does.
++     */
++    QTAILQ_FOREACH(d, &g->dmabuf.bufs, next) {
++        if (d->scanout_id == scanout_id &&
++            d->resource_id == res->resource_id &&
++            !memcmp(&d->fb, fb, sizeof(*fb)) &&
++            !memcmp(&d->r, r, sizeof(*r)) &&
++            qemu_dmabuf_get_fds(d->buf, NULL)[0] == res->dmabuf_fd) {
++            new_primary = d;
++            break;
++        }
++    }
+     if (!new_primary) {
+-        return -EINVAL;
++        new_primary = virtio_gpu_create_dmabuf(g, scanout_id, res, fb, r);
+     }
+-
+-    if (g->dmabuf.primary[scanout_id]) {
+-        old_primary = g->dmabuf.primary[scanout_id];
++    if (!new_primary) {
++        return -EINVAL;
+     }
+ 
+     width = qemu_dmabuf_get_width(new_primary->buf);
+@@ -239,8 +275,11 @@ int virtio_gpu_update_dmabuf(VirtIOGPU *g,
+     qemu_console_resize(scanout->con, width, height);
+     qemu_console_gl_scanout_dmabuf(scanout->con, new_primary->buf);
+ 
+-    if (old_primary) {
+-        virtio_gpu_free_dmabuf(g, old_primary);
++    /* dmabufs of resources that went away while they were shown */
++    QTAILQ_FOREACH_SAFE(d, &g->dmabuf.bufs, next, tmp) {
++        if (!d->resource_id && d != new_primary) {
++            virtio_gpu_free_dmabuf(g, d);
++        }
+     }
+ 
+     return 0;
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index 1a1179e..cf9eaab 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -184,6 +184,10 @@ struct VirtIOGPUBaseClass {
+ typedef struct VGPUDMABuf {
+     QemuDmaBuf *buf;
+     uint32_t scanout_id;
++    /* what it shows, so a later SET_SCANOUT of the same can reuse it */
++    uint32_t resource_id;
++    struct virtio_gpu_framebuffer fb;
++    struct virtio_gpu_rect r;
+     QTAILQ_ENTRY(VGPUDMABuf) next;
+ } VGPUDMABuf;
+ 
+-- 
+2.56.0
+

@@ -1,0 +1,42 @@
+From cd439dafda67914d0de5be38fd52758397816010 Mon Sep 17 00:00:00 2001
+From: nm <nm@x>
+Date: Fri, 16 Oct 2026 11:04:38 +0200
+Subject: [PATCH 3/8] util/anon_file: Darwin per-user temp dir
+
+Generated-by: LLM
+---
+ src/util/anon_file.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/src/util/anon_file.c b/src/util/anon_file.c
+index 0cb6cfa347b..61c542c9bfe 100644
+--- a/src/util/anon_file.c
++++ b/src/util/anon_file.c
+@@ -35,6 +35,7 @@
+ 
+ #include <unistd.h>
+ #include <fcntl.h>
++#include <limits.h>
+ #include <errno.h>
+ #include <stdlib.h>
+ 
+@@ -125,6 +126,19 @@ get_or_create_user_temp_dir(void) {
+         return buf;
+     }
+ 
++#ifdef __APPLE__
++    {
++        char dir[PATH_MAX];
++        size_t len = confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof(dir));
++        if (len > 0 && len <= sizeof(dir)) {
++            n = asprintf(&buf, "%s", dir);
++            if (n < 0)
++               return NULL;
++            return buf;
++        }
++    }
++#endif
++
+     n = asprintf(&buf, "/tmp/xdg-runtime-mesa-%ld", (long)getuid());
+     if (n < 0)
+        return NULL;

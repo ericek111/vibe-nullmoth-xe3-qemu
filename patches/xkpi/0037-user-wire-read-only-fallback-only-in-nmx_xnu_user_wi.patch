@@ -1,0 +1,52 @@
+From aac75478012a5e563faa16fbe65f36107e7f6fe7 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 15:08:33 +0200
+Subject: [PATCH 37/50] user wire: read-only fallback only in nmx_xnu_user_wire
+ (the previous commit touched another function too)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ xnu/nmx_mm.cpp | 22 +++-------------------
+ 1 file changed, 3 insertions(+), 19 deletions(-)
+
+diff --git a/gpu-port/xkpi/xnu/nmx_mm.cpp b/gpu-port/xkpi/xnu/nmx_mm.cpp
+index c5289ff..48ee2ba 100644
+--- a/gpu-port/xkpi/xnu/nmx_mm.cpp
++++ b/gpu-port/xkpi/xnu/nmx_mm.cpp
+@@ -86,23 +86,7 @@ extern "C" int nmx_xnu_mm_copy(void *mm, uint64_t uaddr, void *kbuf, size_t len,
+                                                                   kIODirectionOutIn, task);
+     if (md == nullptr)
+         return ENOMEM;
+-    IOReturn pr = md->prepare();
+-    if (pr != kIOReturnSuccess && write) {
+-        /*
+-         * A range this task may only read (WindowServer's mapping of a full-screen IOSurface another process renders
+-         * into) cannot be wired for writing; the GPU still needs its pages. Wired for reading, the physical pages are
+-         * the same ones the surface's owner writes.
+-         */
+-        md->release();
+-        md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)uaddr, npages * PAGE_SIZE, kIODirectionOut, task);
+-        if (md == nullptr)
+-            return ENOMEM;
+-        IOReturn pr2 = md->prepare();
+-        IOLog("NullMoth GPU: wiring 0x%llx + %zu pages for writing failed (0x%x); for reading: 0x%x\n",
+-              (unsigned long long)uaddr, npages, pr, pr2);
+-        pr = pr2;
+-    }
+-    if (pr != kIOReturnSuccess) {
++    if (md->prepare() != kIOReturnSuccess) {
+         md->release();
+         return EFAULT;
+     }
+@@ -144,8 +128,8 @@ extern "C" int nmx_xnu_user_wire(void *mm, uint64_t uaddr, size_t npages, int wr
+         if (md == nullptr)
+             return ENOMEM;
+         IOReturn pr2 = md->prepare();
+-        IOLog("NullMoth GPU: wiring 0x%llx + %zu pages for writing failed (0x%x); for reading: 0x%x\n",
+-              (unsigned long long)uaddr, npages, pr, pr2);
++        IOLog("NullMoth GPU: wiring 0x%llx + %lu pages for writing failed (0x%x); for reading: 0x%x\n",
++              (unsigned long long)uaddr, (unsigned long)npages, pr, pr2);
+         pr = pr2;
+     }
+     if (pr != kIOReturnSuccess) {

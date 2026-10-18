@@ -1,0 +1,55 @@
+From 690838ab974e632c8aa38c10d5676d7ca8918766 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 01:45:54 +0200
+Subject: [PATCH 48/50] xe fork: Xe3 LRC workarounds 14026781792, 22021007897,
+ 14024681466 (7.2 backport)
+
+FF_MODE DIS_TE_PATCH_CTRL, XEHP_COMMON_SLICE_CHICKEN4
+SBE_PUSH_CONSTANT_BEHIND_FIX_ENABLE and XEHP_SLICE_COMMON_ECO_CHICKEN1
+FAST_CLEAR_VALIGN_FIX, with their register bits, as in 7.2's lrc_was.
+They live in the context image, so the VF applies them itself.
+
+Tested together on the VF (build b9acec2+-1017.014208): boot, login,
+GPU desktop, Metal compute exact.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fork_xe.py | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/gpu-port/xkpi/fork_xe.py b/gpu-port/xkpi/fork_xe.py
+index b8860e6..61b242d 100644
+--- a/gpu-port/xkpi/fork_xe.py
++++ b/gpu-port/xkpi/fork_xe.py
+@@ -159,6 +159,31 @@ edit("xe_memirq.c", [
+      "\tmemirq_received(memirq, status, ilog2(GUC_INTR_GUC2HOST), name);\n"
+      "\txe_guc_irq_handler(guc, GUC_INTR_GUC2HOST);\n", 1),
+ ])
++# Xe3 render workarounds (backport of upstream, as in Linux 7.2 xe_wa.c lrc_was): 14026781792 (FF_MODE
++# DIS_TE_PATCH_CTRL), 22021007897 for Xe3 (SBE_PUSH_CONSTANT_BEHIND_FIX_ENABLE) and 14024681466
++# (FAST_CLEAR_VALIGN_FIX). They live in the context image, so a VF applies them itself.
++edit("regs/xe_gt_regs.h", [
++    ("#define   DIS_MESH_AUTOSTRIP\t\t\tREG_BIT(15)\n",
++     "#define   DIS_MESH_AUTOSTRIP\t\t\tREG_BIT(15)\n#define   DIS_TE_PATCH_CTRL\t\t\tREG_BIT(4)\n", 1),
++    ("#define COMMON_SLICE_CHICKEN4\t\t\tXE_REG(0x7300, XE_REG_OPTION_MASKED)\n",
++     "#define COMMON_SLICE_CHICKEN4\t\t\tXE_REG(0x7300, XE_REG_OPTION_MASKED)\n"
++     "#define XEHP_COMMON_SLICE_CHICKEN4\t\tXE_REG_MCR(0x7300, XE_REG_OPTION_MASKED)\n"
++     "#define   SBE_PUSH_CONSTANT_BEHIND_FIX_ENABLE\tREG_BIT(12)\n", 1),
++    ("#define   MSC_MSAA_REODER_BUF_BYPASS_DISABLE\tREG_BIT(14)\n",
++     "#define   MSC_MSAA_REODER_BUF_BYPASS_DISABLE\tREG_BIT(14)\n#define   FAST_CLEAR_VALIGN_FIX\t\t\tREG_BIT(13)\n", 1),
++])
++edit("xe_wa.c", [("\t/* Xe3_LPG */\n\t{ XE_RTP_NAME(\"14021490052\"),",
++    "\t/* Xe3_LPG */\n"
++    "\t{ XE_RTP_NAME(\"14026781792\"),\n"
++    "\t  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(3000, 3510), ENGINE_CLASS(RENDER)),\n"
++    "\t  XE_RTP_ACTIONS(SET(FF_MODE, DIS_TE_PATCH_CTRL))\n\t},\n"
++    "\t{ XE_RTP_NAME(\"22021007897\"),\n"
++    "\t  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(3000, 3005), ENGINE_CLASS(RENDER)),\n"
++    "\t  XE_RTP_ACTIONS(SET(XEHP_COMMON_SLICE_CHICKEN4, SBE_PUSH_CONSTANT_BEHIND_FIX_ENABLE))\n\t},\n"
++    "\t{ XE_RTP_NAME(\"14024681466\"),\n"
++    "\t  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(3000, 3005), ENGINE_CLASS(RENDER)),\n"
++    "\t  XE_RTP_ACTIONS(SET(XEHP_SLICE_COMMON_ECO_CHICKEN1, FAST_CLEAR_VALIGN_FIX))\n\t},\n"
++    "\t{ XE_RTP_NAME(\"14021490052\"),", 1)])
+ # --- NMX VF DIAGNOSTICS (temporary, for bring-up on the VF) ---
+ # count VF interrupts, and on a G2H timeout print both CT descriptors: tells "GuC never read the H2G" (DMA/GGTT) from
+ # "GuC answered but no interrupt arrived" (IRQ path)

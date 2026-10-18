@@ -1,0 +1,33 @@
+From 5ea62db0d2592c136519777e33525d5fc8677911 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 01:02:01 +0200
+Subject: [PATCH 21/47] NMXAccel: create gNVSVPendLock with compare-and-swap
+
+The lock was created lazily with a plain check-then-assign. Two threads
+on the first nvAccelSurfDirty call could each allocate one, and the
+second assignment replaced the first. A thread that had locked the old
+lock then unlocked the new one, so mutual exclusion on the pending-mark
+table broke for that call and one lock leaked. Create it the way
+gIopFlipCacheLock already is.
+
+Not yet built or tested; goes into the next NMXAccel build round.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ kexts/NVRM/accel/nvrm-accel.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/kexts/NVRM/accel/nvrm-accel.cpp b/kexts/NVRM/accel/nvrm-accel.cpp
+index 7bf51a4..7bd7b09 100644
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -1574,7 +1574,7 @@ static unsigned nvAccelSurfDirty(void *cache, NVResource *res, unsigned plane)
+     unsigned int fl = *(volatile unsigned int *)(r + 0xc);
+     volatile unsigned short *valid = *(unsigned short *volatile *)(r + 0x30);
+     if (type != 0xc0 || (fl & 0x8000) || !valid || plane > 15) return NVRM_SS_NO_CACHE;
+-    if (!gNVSVPendLock) gNVSVPendLock = IOSimpleLockAlloc();
++    if (!gNVSVPendLock) { IOSimpleLock *l = IOSimpleLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gNVSVPendLock)) IOSimpleLockFree(l); }
+     if (!nvSVPend(_ZNK9IOSurface12getSurfaceIDEv(*(void *volatile *)((unsigned char *)cache + 0x10)), 1, res)) return NVRM_SS_NO_CACHE;
+     _ZN20IOSurfaceDeviceCache10setCurrentEv(cache);
+     valid[6] |= (unsigned short)(1u << plane);

@@ -1,0 +1,394 @@
+From 8ba7ef556a7dace68bf993f6e085906a39320f89 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 22:38:21 +0200
+Subject: [PATCH 4/5] Darwin: drmNmxOpen and IOKit-only devices when a sandbox
+ denies /dev/dri
+
+The App Sandbox and WebKit's GPU process can't read /dev/dri at all, so
+drmGetDevices2 found nothing and ANV no device. drmNmxOpen opens a node,
+falls back to read-only (WindowServer), and for the render node then
+returns a token fd (the read end of a pipe) bound to an IOKit DRM client;
+drmNmxIoctl matches clients by the pipe's inode as well as by clone minor.
+drmGetDevices2 and drmGetDevice2 describe the render node through the
+client (DRM_IOCTL_GET_PCIINFO) when /dev/dri is denied or the fd is a
+token. Clients are opened on NMXAccel, whose user clients those sandboxes
+allow, then on NMXGPU for an older NMXAccel.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ core-symbols.txt |   1 +
+ xf86drm.c        | 267 +++++++++++++++++++++++++++++++++++++++--------
+ xf86drm.h        |   3 +
+ 3 files changed, 230 insertions(+), 41 deletions(-)
+
+diff --git a/core-symbols.txt b/core-symbols.txt
+index f0a73a1f..1db30441 100644
+--- a/core-symbols.txt
++++ b/core-symbols.txt
+@@ -87,6 +87,7 @@ drmHashLookup
+ drmHashNext
+ drmIoctl
+ drmNmxIoctl
++drmNmxOpen
+ drmIsKMS
+ drmIsMaster
+ drmMalloc
+diff --git a/xf86drm.c b/xf86drm.c
+index ba5d3ebb..31c88528 100644
+--- a/xf86drm.c
++++ b/xf86drm.c
+@@ -148,6 +148,8 @@ static int drm_darwin_fstat(int fd, struct stat *st)
+ }
+ #define stat(path, st) drm_darwin_stat(path, st)
+ #define fstat(fd, st) drm_darwin_fstat(fd, st)
++static int drm_darwin_sandbox_devices(uint32_t flags, drmDevicePtr devices[], int max_devices);
++static int drm_darwin_token_device(int fd, uint32_t flags, drmDevicePtr *device);
+ #endif
+ #ifdef __APPLE__
+ /* Darwin assigns character majors at run time and its devname_r searches only the top level of /dev, so a DRM
+@@ -4865,6 +4867,10 @@ drm_public int drmGetDevice2(int fd, uint32_t flags, drmDevicePtr *device)
+     if (fstat(fd, &sbuf))
+         return -errno;
+ 
++#ifdef __APPLE__
++    if (S_ISFIFO(sbuf.st_mode))
++        return drm_darwin_token_device(fd, flags, device);
++#endif
+     if (!S_ISCHR(sbuf.st_mode))
+         return -EINVAL;
+ 
+@@ -4914,6 +4920,10 @@ drm_public int drmGetDevices2(uint32_t flags, drmDevicePtr devices[],
+         return -EINVAL;
+ 
+     sysdir = opendir(DRM_DIR_NAME);
++#ifdef __APPLE__
++    if (!sysdir && (errno == EPERM || errno == EACCES))
++        return drm_darwin_sandbox_devices(flags, devices, max_devices);
++#endif
+     if (!sysdir)
+         return -errno;
+ 
+@@ -5382,62 +5392,117 @@ drmGetFormatName(uint32_t format)
+ #include <IOKit/IOKitLib.h>
+ 
+ /*
+- * A sandboxed process (WindowServer) may open a DRM node read-only, but every ioctl on a device file fails with EPERM.
+- * NMXGPU offers the same node through an IOKit user client (IOAccelNMXDRMClient, which that sandbox allows): on EPERM
+- * the fd is switched to one, and every ioctl on it goes there from then on, so all its state (GEM handles, VMs,
+- * mappings) lives in one DRM file. The fd stays a real open of the node, for fstat() and device identification. A
+- * client is matched to its fd by the fd's device number: every open of a NullMoth node is its own clone minor, so a
+- * reused fd number never inherits another file's client.
++ * A sandboxed process may be denied ioctls on a DRM node (WindowServer may open it read-only) or the node itself (the
++ * App Sandbox and WebKit's GPU process can't read /dev/dri). NMXGPU offers the same render node through an IOKit user
++ * client (IOAccelNMXDRMClient), vended by the accelerator (NMXAccel), whose user clients those sandboxes allow (an
++ * older NMXAccel without it leaves NMXGPU's own, which WindowServer's sandbox allows by its "IOAccel" name). A fd is
++ * switched to one such client, and every ioctl on it goes there from then on, so all its state (GEM handles, VMs,
++ * mappings) lives in one DRM file:
++ *  - a read-only open of the node whose ioctl failed with EPERM: matched to its client by the clone minor, as every
++ *    open of a NullMoth node is its own device number, so a reused fd number never inherits another file's client;
++ *  - when the node can't be opened at all, drmNmxOpen returns a token instead: the read end of a pipe, matched by the
++ *    pipe's inode. drmGetDevices2 and drmGetDevice2 describe the render node through the client then.
+  */
+ struct nmx_uc {
+     int fd;
+-    dev_t rdev;
++    dev_t dev;
++    ino_t ino;
+     io_connect_t conn;
+     struct nmx_uc *next;
+ };
+ static struct nmx_uc *nmx_ucs;
+ static pthread_mutex_t nmx_ucs_lock = PTHREAD_MUTEX_INITIALIZER;
+ 
++static bool nmx_uc_ident(const struct stat *st, dev_t *dev, ino_t *ino)
++{
++    if (S_ISCHR(st->st_mode)) {
++        *dev = st->st_rdev;
++        *ino = 0;
++        return true;
++    }
++    if (S_ISFIFO(st->st_mode)) {
++        *dev = st->st_dev;
++        *ino = st->st_ino;
++        return true;
++    }
++    return false;
++}
++
++static io_connect_t nmx_uc_connect(void)
++{
++    static const char *const providers[] = { "NMXAccel", "NMXGPU" };
++    io_connect_t conn = 0;
++    unsigned i;
++
++    for (i = 0; i < sizeof(providers) / sizeof(providers[0]) && !conn; i++) {
++        io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(providers[i]));
++
++        if (!svc)
++            continue;
++        if (IOServiceOpen(svc, mach_task_self(), 'NMXD', &conn) != KERN_SUCCESS)
++            conn = 0;
++        IOObjectRelease(svc);
++    }
++    return conn;
++}
++
++/* the fd number now names another file (or gets a new client): its old client is stale */
++static void nmx_uc_forget_locked(int fd)
++{
++    struct nmx_uc *u, **pp;
++
++    for (pp = &nmx_ucs; (u = *pp) != NULL; pp = &u->next) {
++        if (u->fd != fd)
++            continue;
++        *pp = u->next;
++        IOServiceClose(u->conn);
++        free(u);
++        return;
++    }
++}
++
++static bool nmx_uc_add_locked(int fd, dev_t dev, ino_t ino, io_connect_t conn)
++{
++    struct nmx_uc *u = malloc(sizeof(*u));
++
++    if (!u)
++        return false;
++    u->fd = fd;
++    u->dev = dev;
++    u->ino = ino;
++    u->conn = conn;
++    u->next = nmx_ucs;
++    nmx_ucs = u;
++    return true;
++}
++
+ static io_connect_t nmx_uc_get(int fd, int create)
+ {
+     struct stat st;
+-    struct nmx_uc *u, **pp;
++    struct nmx_uc *u;
+     io_connect_t conn = 0;
++    dev_t dev;
++    ino_t ino;
+ 
+     /*
+      * The real fstat, not drm_darwin_fstat: the clone minor is what tells two opens apart (the DRM minor is the same
+      * for every open of a node), and this runs on every ioctl, where F_GETPATH + sscanf cost more than the call.
+      */
+-    if ((fstat)(fd, &st) != 0 || !S_ISCHR(st.st_mode))
++    if ((fstat)(fd, &st) != 0 || !nmx_uc_ident(&st, &dev, &ino))
+         return 0;
+     pthread_mutex_lock(&nmx_ucs_lock);
+-    for (pp = &nmx_ucs; (u = *pp) != NULL; pp = &u->next) {
++    for (u = nmx_ucs; u != NULL; u = u->next) {
+         if (u->fd != fd)
+             continue;
+-        if (u->rdev == st.st_rdev) {
++        if (u->dev == dev && u->ino == ino)
+             conn = u->conn;
+-            break;
+-        }
+-        /* the fd number now names another open: its old client is stale */
+-        *pp = u->next;
+-        IOServiceClose(u->conn);
+-        free(u);
++        else
++            nmx_uc_forget_locked(fd);
+         break;
+     }
+-    if (!conn && create) {
+-        io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NMXGPU"));
+-        if (svc) {
+-            if (IOServiceOpen(svc, mach_task_self(), 'NMXD', &conn) != KERN_SUCCESS)
+-                conn = 0;
+-            IOObjectRelease(svc);
+-        }
+-        if (conn && (u = malloc(sizeof(*u))) != NULL) {
+-            u->fd = fd;
+-            u->rdev = st.st_rdev;
+-            u->conn = conn;
+-            u->next = nmx_ucs;
+-            nmx_ucs = u;
+-        } else if (conn) {
++    if (!conn && create && S_ISCHR(st.st_mode)) {
++        conn = nmx_uc_connect();
++        if (conn && !nmx_uc_add_locked(fd, dev, ino, conn)) {
+             IOServiceClose(conn);
+             conn = 0;
+         }
+@@ -5446,6 +5511,25 @@ static io_connect_t nmx_uc_get(int fd, int create)
+     return conn;
+ }
+ 
++static int nmx_uc_call(io_connect_t conn, unsigned long request, void *arg)
++{
++    uint64_t cmd = request, err = 0;
++    uint32_t nout = 1;
++    size_t len = IOCPARM_LEN(request), outlen = (request & IOC_OUT) ? len : 0;
++    kern_return_t kr = IOConnectCallMethod(conn, 0, &cmd, 1, (request & IOC_IN) ? arg : NULL,
++                                           (request & IOC_IN) ? len : 0, &err, &nout,
++                                           (request & IOC_OUT) ? arg : NULL, &outlen);
++    if (kr != KERN_SUCCESS) {
++        errno = EIO;
++        return -1;
++    }
++    if (err) {
++        errno = (int)err;
++        return -1;
++    }
++    return 0;
++}
++
+ drm_public int drmNmxIoctl(int fd, unsigned long request, void *arg)
+ {
+     io_connect_t conn = nmx_uc_get(fd, 0);
+@@ -5459,23 +5543,124 @@ drm_public int drmNmxIoctl(int fd, unsigned long request, void *arg)
+             return -1;
+         }
+     }
+-    uint64_t cmd = request, err = 0;
+-    uint32_t nout = 1;
+-    size_t len = IOCPARM_LEN(request), outlen = (request & IOC_OUT) ? len : 0;
+-    kern_return_t kr = IOConnectCallMethod(conn, 0, &cmd, 1, (request & IOC_IN) ? arg : NULL,
+-                                           (request & IOC_IN) ? len : 0, &err, &nout,
+-                                           (request & IOC_OUT) ? arg : NULL, &outlen);
+-    if (kr != KERN_SUCCESS) {
+-        errno = EIO;
++    return nmx_uc_call(conn, request, arg);
++}
++
++/* the node the IOKit client opens (IOAccelNMXDRMClient::start) */
++#define NMX_UC_NODE DRM_DIR_NAME "/renderD128"
++
++static int nmx_token_open(int cloexec)
++{
++    io_connect_t conn = nmx_uc_connect();
++    struct stat st;
++    int ends[2], err;
++    dev_t dev;
++    ino_t ino;
++
++    if (!conn) {
++        errno = EACCES;
+         return -1;
+     }
+-    if (err) {
+-        errno = (int)err;
++    if (pipe(ends)) {
++        err = errno;
++        IOServiceClose(conn);
++        errno = err;
++        return -1;
++    }
++    close(ends[1]);
++    if ((cloexec && fcntl(ends[0], F_SETFD, FD_CLOEXEC) < 0) || (fstat)(ends[0], &st) != 0 ||
++        !nmx_uc_ident(&st, &dev, &ino)) {
++        err = errno;
++        close(ends[0]);
++        IOServiceClose(conn);
++        errno = err ? err : EIO;
++        return -1;
++    }
++    pthread_mutex_lock(&nmx_ucs_lock);
++    nmx_uc_forget_locked(ends[0]);
++    if (!nmx_uc_add_locked(ends[0], dev, ino, conn)) {
++        pthread_mutex_unlock(&nmx_ucs_lock);
++        close(ends[0]);
++        IOServiceClose(conn);
++        errno = ENOMEM;
+         return -1;
+     }
++    pthread_mutex_unlock(&nmx_ucs_lock);
++    return ends[0];
++}
++
++drm_public int drmNmxOpen(const char *path, int flags)
++{
++    int fd = open(path, flags);
++
++    if (fd >= 0 || (errno != EPERM && errno != EACCES))
++        return fd;
++    if ((flags & O_ACCMODE) != O_RDONLY && (fd = open(path, (flags & ~O_ACCMODE) | O_RDONLY)) >= 0)
++        return fd;
++    if ((errno != EPERM && errno != EACCES) || strcmp(path, NMX_UC_NODE) != 0)
++        return -1;
++    return nmx_token_open(flags & O_CLOEXEC);
++}
++
++static int drm_darwin_uc_device(io_connect_t conn, drmDevicePtr *device)
++{
++    char node[PATH_MAX] = NMX_UC_NODE;
++    struct drm_pciinfo pinfo;
++    drmDevicePtr dev;
++    char *addr;
++
++    if (nmx_uc_call(conn, DRM_IOCTL_GET_PCIINFO, &pinfo))
++        return -errno;
++    dev = drmDeviceAlloc(DRM_NODE_RENDER, node, sizeof(drmPciBusInfo), sizeof(drmPciDeviceInfo), &addr);
++    if (!dev)
++        return -ENOMEM;
++    dev->bustype = DRM_BUS_PCI;
++    dev->businfo.pci = (drmPciBusInfoPtr)addr;
++    dev->businfo.pci->domain = pinfo.domain;
++    dev->businfo.pci->bus = pinfo.bus;
++    dev->businfo.pci->dev = pinfo.dev;
++    dev->businfo.pci->func = pinfo.func;
++    dev->deviceinfo.pci = (drmPciDeviceInfoPtr)(addr + sizeof(drmPciBusInfo));
++    dev->deviceinfo.pci->vendor_id = pinfo.vendor_id;
++    dev->deviceinfo.pci->device_id = pinfo.device_id;
++    dev->deviceinfo.pci->subvendor_id = pinfo.subvendor_id;
++    dev->deviceinfo.pci->subdevice_id = pinfo.subdevice_id;
++    dev->deviceinfo.pci->revision_id = pinfo.revision_id;
++    *device = dev;
+     return 0;
+ }
+ 
++static int drm_darwin_sandbox_devices(uint32_t flags, drmDevicePtr devices[], int max_devices)
++{
++    io_connect_t conn = nmx_uc_connect();
++    drmDevicePtr dev;
++    int ret;
++
++    (void)flags;
++    if (!conn)
++        return -EACCES;
++    ret = drm_darwin_uc_device(conn, &dev);
++    IOServiceClose(conn);
++    if (ret)
++        return ret;
++    if (devices != NULL && max_devices > 0) {
++        devices[0] = dev;
++        return 1;
++    }
++    drmFreeDevice(&dev);
++    return devices != NULL ? 0 : 1;
++}
++
++static int drm_darwin_token_device(int fd, uint32_t flags, drmDevicePtr *device)
++{
++    io_connect_t conn = nmx_uc_get(fd, 0);
++
++    (void)flags;
++    if (!conn)
++        return -EINVAL;
++    return drm_darwin_uc_device(conn, device);
++}
++
+ /* the NullMoth DRM node ioctls (the kext's nmx_drm_uapi.h; the two must stay identical) */
+ struct nmx_drm_mmap {
+     uint64_t offset;
+diff --git a/xf86drm.h b/xf86drm.h
+index 8a141a92..2d86839a 100644
+--- a/xf86drm.h
++++ b/xf86drm.h
+@@ -114,6 +114,9 @@ extern int drmIoctl(int fd, unsigned long request, void *arg);
+ #ifdef __APPLE__
+ /* ioctl on a NullMoth DRM node; in a sandbox that denies device ioctls it goes through NMXGPU's IOKit user client */
+ extern int drmNmxIoctl(int fd, unsigned long request, void *arg);
++/* open(2) of a NullMoth DRM node that falls back to read-only, then (for the render node, where a sandbox denies the
++ * node) to a fd standing for an IOKit client of it, for drmNmxIoctl, drmGetDevice2 and close(2) */
++extern int drmNmxOpen(const char *path, int flags);
+ #endif
+ extern void *drmGetHashTable(void);
+ extern drmHashEntry *drmGetEntry(int fd);

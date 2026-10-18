@@ -1,0 +1,22 @@
+From 55c68a4ee2a9a99d11d01c711963e692f78bdf66 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 03:55:30 +0200
+Subject: [PATCH 05/50] build-guest.sh: keep NMXNPU's kext stub out of the
+ NMXGPU link
+
+---
+ build-guest.sh | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/gpu-port/xkpi/build-guest.sh b/gpu-port/xkpi/build-guest.sh
+index 0f245fc..8321aee 100755
+--- a/gpu-port/xkpi/build-guest.sh
++++ b/gpu-port/xkpi/build-guest.sh
+@@ -28,5 +28,7 @@ case "$WHAT" in
+ esac
+ fail=$(( $(ls logs/*.failed 2>/dev/null | wc -l) + $(ls logs-i915/*.failed 2>/dev/null | wc -l) + $(find logs-xe -name '*.failed' | wc -l) ))
+ echo "compile failures: $fail ($(( $(date +%s) - t0 )) s)"
++# rt.sh compiles every xnu/*.cpp, NMXNPU's kext stub included; it has its own kmod_info and belongs to the NPU kext
++rm -f xnuobj/nmx_npu_kext.o
+ rm -rf "$OUT/NMXGPU.kext"
+ kext/build.sh "$OUT"

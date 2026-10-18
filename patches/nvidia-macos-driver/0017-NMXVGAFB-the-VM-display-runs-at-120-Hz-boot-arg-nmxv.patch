@@ -1,0 +1,94 @@
+From e50ac80e54e66e1527f9cd8f165918c69b05b977 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 23:24:53 +0200
+Subject: [PATCH 17/47] NMXVGAFB: the VM display runs at 120 Hz (boot-arg
+ nmxvgafb_hz)
+
+The one 1920x1080 mode reported 60 Hz and the VBL timer ran at 60 Hz. The
+host panel runs at 120 Hz and QEMU's GTK display (patched as for the win11
+VM) releases the guest once per host refresh, so the mode, its detailed
+timing, the NVRMTiming answers and the VBL timer now use 120 Hz;
+nmxvgafb_hz=<30..240> changes it. WindowServer then presents at 120 Hz
+(most gaps under 12 ms under pointer motion).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ kexts/NMXVGAFB/nmxvgafb.cpp | 26 +++++++++++++++++---------
+ 1 file changed, 17 insertions(+), 9 deletions(-)
+
+diff --git a/kexts/NMXVGAFB/nmxvgafb.cpp b/kexts/NMXVGAFB/nmxvgafb.cpp
+index 5690b66..206665e 100644
+--- a/kexts/NMXVGAFB/nmxvgafb.cpp
++++ b/kexts/NMXVGAFB/nmxvgafb.cpp
+@@ -73,8 +73,11 @@ private:
+     IOReturn scanoutSurface(NMXScanoutSurface *r);
+     IOReturn scanoutHome();
+     void dropSurfBlob(SurfBlob &b);
+-    static constexpr uint64_t kFrameNs = 16666667ull;
+-    // CEA-like timing for the one mode, so WindowServer sees 60 Hz (it showed 0.00 Hz without timing information)
++    // the one mode's refresh rate: 120 Hz (the host panel's; QEMU's GTK display releases the guest once per host
++    // refresh), boot-arg nmxvgafb_hz=<30..240> to change it. The VBL timer runs at this rate.
++    uint32_t fHz = 120;
++    uint64_t fFrameNs = 8333333ull;
++    // CEA-like timing for the one mode, so WindowServer sees the rate (it showed 0.00 Hz without timing information)
+     uint32_t fHT = 0, fVT = 0;
+     uint64_t fPclk = 0;
+     // the display hold: the registry stays busy from start() until the accelerator has armed this head (phase 1), so
+@@ -124,7 +127,7 @@ private:
+             }
+         }
+         if (me->fVbl.proc) me->fVbl.proc(me->fVbl.target, me->fVbl.ref);
+-        uint64_t period; nanoseconds_to_absolutetime(kFrameNs, &period);
++        uint64_t period; nanoseconds_to_absolutetime(me->fFrameNs, &period);
+         now = mach_absolute_time();
+         me->fVblNext = (me->fVblNext && me->fVblNext + period > now) ? me->fVblNext + period : now + period;
+         thread_call_enter_delayed(me->fVblTimer, me->fVblNext);
+@@ -168,7 +171,7 @@ public:
+         if (mode != 1 || !info) return kIOReturnBadArgument;
+         bzero(info, sizeof(*info));
+         info->maxDepthIndex = 0; info->nominalWidth = fWidth; info->nominalHeight = fHeight;
+-        info->refreshRate = 60 << 16; info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
++        info->refreshRate = fHz << 16; info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
+         return kIOReturnSuccess;
+     }
+     UInt64 getPixelFormatsForDisplayMode(IODisplayModeID, IOIndex) override { return 0; }
+@@ -338,7 +341,12 @@ bool NMXVGAFB::start(IOService *provider)
+     }
+     fBase = (IOPhysicalAddress)(v.v_baseAddr & ~0xFFFul);
+     fWidth = (uint32_t)v.v_width; fHeight = (uint32_t)v.v_height; fRowBytes = (uint32_t)v.v_rowBytes;
+-    fHT = fWidth + 160; fVT = fHeight + 35; fPclk = (uint64_t)fHT * fVT * 60;
++    {
++        uint32_t hz = 0;
++        if (PE_parse_boot_argn("nmxvgafb_hz", &hz, sizeof hz) && hz >= 30 && hz <= 240) fHz = hz;
++        fFrameNs = 1000000000ull / fHz;
++    }
++    fHT = fWidth + 160; fVT = fHeight + 35; fPclk = (uint64_t)fHT * fVT * fHz;
+     // the framebuffer must lie in one of the device's memory BARs, or it is not this device's
+     IOPCIDevice *pci = (IOPCIDevice *)provider;
+     bool inBar = false;
+@@ -393,20 +401,20 @@ bool NMXVGAFB::start(IOService *provider)
+     // numbers as getTimingInfoForDisplayMode: pixel clock in Hz, refresh in mHz, sync polarity positive
+     {
+         UInt32 k5[13] = { 0x4b350001u, (UInt32)fPclk, fWidth, fWidth + 48, fWidth + 80, fHT, fHeight, fHeight + 3,
+-                          fHeight + 8, fVT, 60000u, 1u, 1u };
++                          fHeight + 8, fVT, fHz * 1000u, 1u, 1u };
+         if (OSData *k5d = OSData::withBytes(k5, sizeof k5)) { setProperty("NVRMTiming", k5d); k5d->release(); }
+     }
+     if (fVirtioOn && OSCompareAndSwapPtr(nullptr, this, (void * volatile *)&gVtInst))
+         sysctl_register_oid(&sysctl__debug_nmxfb_vtiming);
+     fVblTimer = thread_call_allocate(vblFire, this);
+     if (fVblTimer) {
+-        uint64_t d; clock_interval_to_deadline((uint32_t)(kFrameNs / 1000), kMicrosecondScale, &d);
++        uint64_t d; clock_interval_to_deadline((uint32_t)(fFrameNs / 1000), kMicrosecondScale, &d);
+         fVblNext = d; thread_call_enter_delayed(fVblTimer, d);
+     }
+     // No registerPowerDriver here (NMIntelFB has one): IOFramebuffer::start sets up power management with its own
+     // power states, and a second registration with two states panicked in a power-change callout (read at 0x120).
+-    VFBLOG("%ux%u pitch %u at 0x%llx adopted from the firmware%s", fWidth, fHeight, fRowBytes, (unsigned long long)fBase,
+-           fVblTimer ? ", 60 Hz VBL timer" : ", NO VBL TIMER");
++    VFBLOG("%ux%u pitch %u at 0x%llx adopted from the firmware, %u Hz%s", fWidth, fHeight, fRowBytes,
++           (unsigned long long)fBase, fHz, fVblTimer ? " (VBL timer)" : ", NO VBL TIMER");
+     if (fSurfMap && (fHoldCap = thread_call_allocate(holdCapFire, this))) {
+         fHolding = 1; adjustBusy(1);
+         uint64_t d; clock_interval_to_deadline(kHoldCapSec, kSecondScale, &d);

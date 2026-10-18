@@ -1,0 +1,76 @@
+From 99b9df7ee9e6b551cc47bb2ac6c693ed004f0627 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 05:37:45 +0200
+Subject: [PATCH 19/50] devfs: detect and repair entry points that return with
+ interrupts disabled (diagnostic + guard)
+
+---
+ xnu/nmx_devfs.cpp | 27 ++++++++++++++++++++++++++-
+ 1 file changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/gpu-port/xkpi/xnu/nmx_devfs.cpp b/gpu-port/xkpi/xnu/nmx_devfs.cpp
+index 826b30c..17066d2 100644
+--- a/gpu-port/xkpi/xnu/nmx_devfs.cpp
++++ b/gpu-port/xkpi/xnu/nmx_devfs.cpp
+@@ -91,6 +91,26 @@ static void *cookie_for_open(int m, int *node_out)
+ 
+ /* ---- entry points ------------------------------------------------------------------------------------------------- */
+ 
++/*
++ * A driver call must hand the thread back with interrupts enabled. A thread that returned to user space with them
++ * off died at exit (workq_exit -> "unsafe thread_call_cancel_wait"). Check RFLAGS.IF after every entry point, name
++ * the call that left it clear, and turn interrupts back on.
++ */
++static inline bool irqs_on(void)
++{
++    unsigned long fl;
++    __asm__ __volatile__("pushfq; popq %0" : "=r"(fl));
++    return (fl & 0x200) != 0;
++}
++
++static void irq_check(const char *what, unsigned long cmd)
++{
++    if (!irqs_on()) {
++        IOLog("NullMoth devfs: IRQ LEAK: %s (cmd 0x%lx) returned with interrupts disabled; re-enabling\n", what, cmd);
++        __asm__ __volatile__("sti" ::: "memory");
++    }
++}
++
+ static int nmx_open(dev_t dev, int flags, int devtype, struct proc *p)
+ {
+     int m = minor(dev);
+@@ -98,6 +118,7 @@ static int nmx_open(dev_t dev, int flags, int devtype, struct proc *p)
+     if (cookie == nullptr)
+         return ENXIO;
+     int err = nmx_cdev_open(cookie, m, flags);
++    irq_check("open", 0);
+     IOLockLock(g_lock);
+     if (err)
+         g_open_node[m] = 0;
+@@ -111,6 +132,7 @@ static int nmx_close(dev_t dev, int flags, int devtype, struct proc *p)
+ {
+     int m = minor(dev);
+     int err = nmx_cdev_close(m, flags);
++    irq_check("close", 0);
+     IOLockLock(g_lock);
+     if (m >= NODE_MINORS && m < OPEN_MINOR_MAX) {
+         g_open_node[m] = 0;
+@@ -122,7 +144,9 @@ static int nmx_close(dev_t dev, int flags, int devtype, struct proc *p)
+ 
+ static int nmx_ioctl(dev_t dev, u_long cmd, caddr_t data, int fflag, struct proc *p)
+ {
+-    return nmx_cdev_ioctl(minor(dev), cmd, data, fflag);
++    int err = nmx_cdev_ioctl(minor(dev), cmd, data, fflag);
++    irq_check("ioctl", cmd);
++    return err;
+ }
+ 
+ /*
+@@ -140,6 +164,7 @@ static int nmx_read(dev_t dev, struct uio *uio, int ioflag)
+     user_size_t len = uio_curriovlen(uio);
+     size_t done = 0;
+     int err = nmx_cdev_read(minor(dev), (uint64_t)base, (size_t)len, &done, (ioflag & IO_NDELAY) ? 1 : 0);
++    irq_check("read", 0);
+     if (done > 0)
+         uio_update(uio, (user_size_t)done);
+     return err;

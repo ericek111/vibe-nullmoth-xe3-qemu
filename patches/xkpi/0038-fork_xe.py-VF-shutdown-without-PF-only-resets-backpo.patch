@@ -1,0 +1,52 @@
+From 3251fbfb7cff76b282e723cf0b8b691f11ce2285 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 16:34:03 +0200
+Subject: [PATCH 38/50] fork_xe.py: VF shutdown without PF-only resets
+ (backport from upstream xe)
+
+xe_driver_flr_disabled() is true on a VF and do_gt_reset() asks the GuC for a VF reset
+(VF2GUC_VF_RESET) instead of writing GDRST, as Linux 7.2 does. 6.14 wrote GU_CNTL from the VF
+on every restart and waited out its 3 s timeout inside NMXGPU's systemWillShutdown
+("Driver-FLR-reinit wait completion failed! -60", "Restart still waiting on NMXGPU").
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ fork_xe.py | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/gpu-port/xkpi/fork_xe.py b/gpu-port/xkpi/fork_xe.py
+index 6f48549..212d9e0 100644
+--- a/gpu-port/xkpi/fork_xe.py
++++ b/gpu-port/xkpi/fork_xe.py
+@@ -118,6 +118,30 @@ edit("xe_pm.c", [
+      "\t/* macOS port: no runtime PM (see xe_pm_runtime_get_if_active) */\n"
+      "\tpm_runtime_get_noresume(xe->drm.dev);\n\treturn true;\n", 1),
+ ])
++# Shutdown on a VF (backport of upstream, as in Linux 7.2): the driver-initiated FLR and the GDRST full-GT reset are PF
++# registers. A VF reads GU_CNTL_PROTECTED as 0 ("FLR allowed"), so 6.14's xe_device_shutdown wrote GU_CNTL, which a
++# VF cannot, and waited out its 3 s completion timeout ("Driver-FLR-reinit wait completion failed! -60") inside
++# NMXGPU's systemWillShutdown, on every restart ("Restart still waiting on NMXGPU"). A VF quiesces its GTs and asks the
++# GuC to reset its own state (VF2GUC_VF_RESET) instead; the PF resets the function itself.
++edit("xe_device.c", [("static bool xe_driver_flr_disabled(struct xe_device *xe)\n{\n"
++                      "\treturn xe_mmio_read32(xe_root_tile_mmio(xe), GU_CNTL_PROTECTED) & DRIVERINT_FLR_DIS;\n}\n",
++                      "static bool xe_driver_flr_disabled(struct xe_device *xe)\n{\n"
++                      "\tif (IS_SRIOV_VF(xe))\n\t\treturn true;\n\n"
++                      "\treturn xe_mmio_read32(xe_root_tile_mmio(xe), GU_CNTL_PROTECTED) & DRIVERINT_FLR_DIS;\n}\n", 1)])
++edit("xe_gt_sriov_vf.c", [("\terr = guc_action_vf_reset(guc);\n\tif (unlikely(err))\n"
++                           "\t\txe_gt_sriov_err(gt, \"Failed to reset GuC state (%pe)\\n\", ERR_PTR(err));\n\treturn err;\n}\n",
++                           "\terr = guc_action_vf_reset(guc);\n\tif (unlikely(err))\n"
++                           "\t\txe_gt_sriov_err(gt, \"Failed to reset GuC state (%pe)\\n\", ERR_PTR(err));\n\treturn err;\n}\n\n"
++                           "/* xe_gt_sriov_vf_reset - reset the GuC's state for this VF (needs GuC MMIO communication) */\n"
++                           "int xe_gt_sriov_vf_reset(struct xe_gt *gt)\n{\n"
++                           "\tif (!xe_device_uc_enabled(gt_to_xe(gt)))\n\t\treturn -ENODEV;\n\n"
++                           "\treturn vf_reset_guc_state(gt);\n}\n", 1)])
++edit("xe_gt_sriov_vf.h", [("int xe_gt_sriov_vf_bootstrap(struct xe_gt *gt);\n",
++                           "int xe_gt_sriov_vf_bootstrap(struct xe_gt *gt);\nint xe_gt_sriov_vf_reset(struct xe_gt *gt);\n", 1)])
++edit("xe_gt.c", [("#include \"xe_sriov.h\"\n", "#include \"xe_sriov.h\"\n#include \"xe_gt_sriov_vf.h\"\n", 1),
++                 ("static int do_gt_reset(struct xe_gt *gt)\n{\n\tint err;\n\n",
++                  "static int do_gt_reset(struct xe_gt *gt)\n{\n\tint err;\n\n"
++                  "\tif (IS_SRIOV_VF(gt_to_xe(gt)))\n\t\treturn xe_gt_sriov_vf_reset(gt);\n\n", 1)])
+ # --- NMX VF DIAGNOSTICS (temporary, for bring-up on the VF) ---
+ # count VF interrupts, and on a G2H timeout print both CT descriptors: tells "GuC never read the H2G" (DMA/GGTT) from
+ # "GuC answered but no interrupt arrived" (IRQ path)

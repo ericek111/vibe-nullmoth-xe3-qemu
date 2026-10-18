@@ -1,0 +1,68 @@
+From 4edc16b3cc44d5232e131bbcdaea72821a97cc44 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sun, 18 Oct 2026 00:28:05 +0200
+Subject: [PATCH 47/47] NMXVGAFB: one control-queue batch in flight at a time
+
+submitBatch uses fixed descriptors and command/response buffers, but its
+wait for the answer sleeps on fLock and so lets a second submitter in. The
+display event's GET_DISPLAY_INFO (a thread call, outside fScanLock) did so
+during a flip: it rewrote command 0 before QEMU had read the flip's
+SET_SCANOUT_BLOB, which never arrived (its response stayed 0, the fenced
+flush of the blob not on the scan-out got INVALID_PARAMETER), the used
+index ran out of step and every later command waited until virtio-gpu was
+given up - a frozen display after a fullscreen toggle. QEMU's trace showed
+GET_DISPLAY_INFO and the lone RESOURCE_FLUSH with no SET_SCANOUT_BLOB.
+
+A submitter now waits until the batch in flight is answered. Reproduced
+before on the second fullscreen cycle during a window drag; after, 15
+cycles (30 mode changes) with the collision serialized 4 times, no errors.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ kexts/NMXVGAFB/nmx_virtio_gpu.cpp | 12 ++++++++++++
+ kexts/NMXVGAFB/nmx_virtio_gpu.h   |  2 ++
+ 2 files changed, 14 insertions(+)
+
+diff --git a/kexts/NMXVGAFB/nmx_virtio_gpu.cpp b/kexts/NMXVGAFB/nmx_virtio_gpu.cpp
+index 87ca0ca..d5566db 100644
+--- a/kexts/NMXVGAFB/nmx_virtio_gpu.cpp
++++ b/kexts/NMXVGAFB/nmx_virtio_gpu.cpp
+@@ -358,6 +358,16 @@ uint32_t NMXVirtioGPU::submitBatch(Cmd *c, unsigned n, uint64_t *doneAt)
+     for (unsigned i = 0; i < n; i++)
+         if (c[i].len > (n == 1 ? kCmdMax : i ? 4096 : kCmd1Off) || c[i].respLen > (n == 1 ? kRespMax : kResp1Off)) return 0;
+     IOLockLock(fLock);
++    // One batch at a time: the wait below drops fLock, and a second submitter (the display event's GET_DISPLAY_INFO
++    // during a flip) rewrote command 0 while the host had yet to read it - the flip's SET_SCANOUT_BLOB never arrived,
++    // the used index ran out of step and every later command waited for good.
++    if (fInFlight && fReady && fWaitLogs < 4) {
++        fWaitLogs++;
++        VGLOG("command 0x%x waits for the batch in flight", ((const GpuHdr *)c[0].cmd)->type);
++    }
++    while (fInFlight && fReady) IOLockSleep(fLock, &fInFlight, THREAD_UNINT);
++    if (!fReady) { IOLockUnlock(fLock); return 0; }
++    fInFlight = true;
+     VqDesc *d = (VqDesc *)(fRingKva + kOffDesc);
+     volatile uint16_t *avail = (volatile uint16_t *)(fRingKva + kOffAvail);   // flags, idx, ring[]
+     for (unsigned i = 0; i < n; i++) {
+@@ -427,6 +437,8 @@ uint32_t NMXVirtioGPU::submitBatch(Cmd *c, unsigned n, uint64_t *doneAt)
+         fReady = false;
+         VGLOG("command 0x%x timed out; virtio-gpu disabled", ((const GpuHdr *)c[0].cmd)->type);
+     }
++    fInFlight = false;
++    IOLockWakeup(fLock, &fInFlight, false);
+     IOLockUnlock(fLock);
+     return type;
+ }
+diff --git a/kexts/NMXVGAFB/nmx_virtio_gpu.h b/kexts/NMXVGAFB/nmx_virtio_gpu.h
+index 4628989..e2b4d37 100644
+--- a/kexts/NMXVGAFB/nmx_virtio_gpu.h
++++ b/kexts/NMXVGAFB/nmx_virtio_gpu.h
+@@ -95,6 +95,8 @@ private:
+     uint8_t *fCmdKva = nullptr;
+     uint16_t fQSize = 0, fAvailIdx = 0, fUsedSeen = 0;
+     IOLock *fLock = nullptr;
++    bool fInFlight = false;               // a batch owns the descriptors and buffers until it is answered
++    unsigned fWaitLogs = 0;
+     bool fReady = false, fBlob = false, fEdid = false;
+     uint64_t fCommands = 0, fFailures = 0, fFenceId = 0;
+     Timing fTiming[kTimings] = {};

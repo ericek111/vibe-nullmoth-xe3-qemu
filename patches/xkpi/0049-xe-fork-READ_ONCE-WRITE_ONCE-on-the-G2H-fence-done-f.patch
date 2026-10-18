@@ -1,0 +1,36 @@
+From 0b1a8669b0fe2a9f9a4cc23bbb19b5c4b8f4b4bd Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 01:45:54 +0200
+Subject: [PATCH 49/50] xe fork: READ_ONCE/WRITE_ONCE on the G2H fence done
+ flag (7.2 backport)
+
+As upstream: the waiter in guc_ct_send_recv reads g2h_fence.done with
+READ_ONCE, parse_g2h_response sets it with WRITE_ONCE.
+
+Tested together on the VF (build b9acec2+-1017.014208): boot, login,
+GPU desktop, Metal compute exact.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fork_xe.py | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/gpu-port/xkpi/fork_xe.py b/gpu-port/xkpi/fork_xe.py
+index 61b242d..b9e64cc 100644
+--- a/gpu-port/xkpi/fork_xe.py
++++ b/gpu-port/xkpi/fork_xe.py
+@@ -184,6 +184,14 @@ edit("xe_wa.c", [("\t/* Xe3_LPG */\n\t{ XE_RTP_NAME(\"14021490052\"),",
+     "\t  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(3000, 3005), ENGINE_CLASS(RENDER)),\n"
+     "\t  XE_RTP_ACTIONS(SET(XEHP_SLICE_COMMON_ECO_CHICKEN1, FAST_CLEAR_VALIGN_FIX))\n\t},\n"
+     "\t{ XE_RTP_NAME(\"14021490052\"),", 1)])
++# G2H fence completion flag (backport of upstream, as in Linux 7.2 xe_guc_ct.c): the waiter reads g2h_fence.done
++# with READ_ONCE and parse_g2h_response sets it with WRITE_ONCE. (Runs after the IRQ-less poll edit above, which
++# split the wait into two.)
++edit("xe_guc_ct.c", [
++    ("ct->g2h_fence_wq, g2h_fence.done, ", "ct->g2h_fence_wq, READ_ONCE(g2h_fence.done), ", 2),
++    ("\t\tif (g2h_fence.done) {\n", "\t\tif (READ_ONCE(g2h_fence.done)) {\n", 1),
++    ("\tg2h_fence->done = true;\n\tsmp_mb();\n", "\tWRITE_ONCE(g2h_fence->done, true);\n\tsmp_mb();\n", 1),
++])
+ # --- NMX VF DIAGNOSTICS (temporary, for bring-up on the VF) ---
+ # count VF interrupts, and on a G2H timeout print both CT descriptors: tells "GuC never read the H2G" (DMA/GGTT) from
+ # "GuC answered but no interrupt arrived" (IRQ path)

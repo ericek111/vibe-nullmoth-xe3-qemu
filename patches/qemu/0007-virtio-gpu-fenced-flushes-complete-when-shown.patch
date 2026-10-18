@@ -1,0 +1,504 @@
+From d7df6ee355c9be44b00f69852e9def786d603705 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 16:32:31 +0200
+Subject: [PATCH 1/2] virtio-gpu: fenced flushes of a GL scanout complete when
+ the frame is shown
+
+A RESOURCE_FLUSH of a blob scanout is answered as soon as it is queued,
+so a guest has no page-flip completion: it can't tell when the host took
+its frame, when the previous buffer is free, or where the host's vblank
+is. A fenced flush is now deferred to the fence queue and answered when
+the display reports the frame shown (new GraphicHwOps.frame_shown). The
+GTK EGL display reports it at the latch point of the refresh the frame
+makes - the host vblank plus the pacing phase of the previous patch, the
+first one the frame is at most QEMU_GTK_LATCH_SLACK_US (250 us: the trip from the guest) late for -
+once its draw is done. Displays that don't report frames answer when the
+renderer unblocks after the draw. A 50 ms timer answers fences a display
+never reports (a hidden window); after three such timeouts in a row the
+device stops deferring until the display reports again.
+
+Unfenced flushes are unchanged.
+
+Signed-off-by: ericek111 <erik.brocko@letemsvetemapplem.eu>
+---
+ hw/display/trace-events          |  1 +
+ hw/display/virtio-gpu-base.c     | 12 +++++
+ hw/display/virtio-gpu-gl.c       |  1 +
+ hw/display/virtio-gpu-rutabaga.c |  1 +
+ hw/display/virtio-gpu.c          | 77 +++++++++++++++++++++++++++++++-
+ hw/display/virtio-vga.c          | 11 +++++
+ include/hw/virtio/virtio-gpu.h   | 13 ++++++
+ include/ui/console.h             |  6 +++
+ include/ui/gtk.h                 |  3 ++
+ ui/console.c                     | 14 ++++++
+ ui/gtk.c                         | 75 +++++++++++++++++++++++++++++++
+ ui/trace-events                  |  3 ++
+ 12 files changed, 215 insertions(+), 2 deletions(-)
+
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index 4bfc457..7bf29ad 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -55,6 +55,7 @@ virtio_gpu_cmd_ctx_submit(uint32_t ctx, uint32_t size) "ctx 0x%x, size %d"
+ virtio_gpu_update_cursor(uint32_t scanout, uint32_t x, uint32_t y, const char *type, uint32_t res) "scanout %d, x %d, y %d, %s, res 0x%x"
+ virtio_gpu_fence_ctrl(uint64_t fence, uint32_t type) "fence 0x%" PRIx64 ", type 0x%x"
+ virtio_gpu_fence_resp(uint64_t fence) "fence 0x%" PRIx64
++virtio_gpu_flush_fence_timeout(uint32_t timeouts) "timeouts %u"
+ virtio_gpu_inc_inflight_fences(uint32_t inflight) "in-flight+ %u"
+ virtio_gpu_dec_inflight_fences(uint32_t inflight) "in-flight- %u"
+ virtio_gpu_cmd_suspended(uint32_t cmd) "cmd 0x%x"
+diff --git a/hw/display/virtio-gpu-base.c b/hw/display/virtio-gpu-base.c
+index 270fbaa..3c50488 100644
+--- a/hw/display/virtio-gpu-base.c
++++ b/hw/display/virtio-gpu-base.c
+@@ -169,6 +169,17 @@ virtio_gpu_get_flags(void *opaque)
+     return flags;
+ }
+ 
++static void
++virtio_gpu_frame_shown(void *opaque)
++{
++    VirtIOGPUBase *g = opaque;
++    VirtIOGPUBaseClass *vgc = VIRTIO_GPU_BASE_GET_CLASS(g);
++
++    if (vgc->frame_shown) {
++        vgc->frame_shown(g);
++    }
++}
++
+ static const GraphicHwOps virtio_gpu_ops = {
+     .get_flags = virtio_gpu_get_flags,
+     .invalidate = virtio_gpu_invalidate_display,
+@@ -176,6 +187,7 @@ static const GraphicHwOps virtio_gpu_ops = {
+     .text_update = virtio_gpu_text_update,
+     .ui_info = virtio_gpu_ui_info,
+     .gl_block = virtio_gpu_gl_block,
++    .frame_shown = virtio_gpu_frame_shown,
+ };
+ 
+ bool
+diff --git a/hw/display/virtio-gpu-gl.c b/hw/display/virtio-gpu-gl.c
+index 2b7a41c..97545d8 100644
+--- a/hw/display/virtio-gpu-gl.c
++++ b/hw/display/virtio-gpu-gl.c
+@@ -79,6 +79,7 @@ static void virtio_gpu_gl_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
+         cmd->vq = vq;
+         cmd->error = 0;
+         cmd->finished = false;
++        cmd->deferred = false;
+         QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
+         cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
+     }
+diff --git a/hw/display/virtio-gpu-rutabaga.c b/hw/display/virtio-gpu-rutabaga.c
+index 041216a..d51fd2f 100644
+--- a/hw/display/virtio-gpu-rutabaga.c
++++ b/hw/display/virtio-gpu-rutabaga.c
+@@ -1088,6 +1088,7 @@ static void virtio_gpu_rutabaga_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
+         cmd->vq = vq;
+         cmd->error = 0;
+         cmd->finished = false;
++        cmd->deferred = false;
+         QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
+         cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
+     }
+diff --git a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
+index f991baf..3920bba 100644
+--- a/hw/display/virtio-gpu.c
++++ b/hw/display/virtio-gpu.c
+@@ -518,6 +518,62 @@ static void virtio_gpu_transfer_to_host_2d(VirtIOGPU *g,
+     }
+ }
+ 
++/*
++ * How long a fenced flush may wait for the display, and how many such
++ * timeouts in a row make the device stop deferring (a display that never
++ * blocks, such as a hidden window) until the display unblocks again.
++ */
++#define VIRTIO_GPU_FLUSH_FENCE_TIMEOUT_MS 50
++#define VIRTIO_GPU_FLUSH_FENCE_MAX_TIMEOUTS 3
++
++static void virtio_gpu_process_fenceq(VirtIOGPU *g);
++
++static void virtio_gpu_flush_fence_timeout(void *opaque)
++{
++    VirtIOGPU *g = opaque;
++
++    if (QTAILQ_EMPTY(&g->fenceq)) {
++        return;
++    }
++    if (g->parent_obj.renderer_blocked) {
++        /* a draw is in flight: its end may answer them; look again later */
++        timer_mod(g->flush_fence_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
++                  VIRTIO_GPU_FLUSH_FENCE_TIMEOUT_MS);
++        return;
++    }
++    if (g->flush_fence_timeouts < VIRTIO_GPU_FLUSH_FENCE_MAX_TIMEOUTS) {
++        g->flush_fence_timeouts++;
++    }
++    trace_virtio_gpu_flush_fence_timeout(g->flush_fence_timeouts);
++    virtio_gpu_process_fenceq(g);
++}
++
++/*
++ * A fenced RESOURCE_FLUSH of a blob on a GL scanout completes when the frame
++ * is on its way to the screen, not when the flush is queued: at the latch
++ * point of the refresh it makes when the display reports that (frame_shown),
++ * otherwise once the display has drawn it and lets the guest go on (it
++ * unblocks the renderer).  Like a page flip on real hardware, the guest learns
++ * when its frame was taken, can reuse the previous buffer from then on, and
++ * can take the answers as its vblank.  Unfenced flushes are answered at once,
++ * as before.
++ */
++static void virtio_gpu_defer_flush_fence(VirtIOGPU *g,
++                                         struct virtio_gpu_ctrl_command *cmd)
++{
++    if (!(cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_FENCE) ||
++        g->flush_fence_timeouts >= VIRTIO_GPU_FLUSH_FENCE_MAX_TIMEOUTS) {
++        return;
++    }
++    cmd->deferred = true;
++    if (!g->flush_fence_timer) {
++        g->flush_fence_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
++                                            virtio_gpu_flush_fence_timeout, g);
++    }
++    timer_mod(g->flush_fence_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
++              VIRTIO_GPU_FLUSH_FENCE_TIMEOUT_MS);
++}
++
+ static void virtio_gpu_resource_flush(VirtIOGPU *g,
+                                       struct virtio_gpu_ctrl_command *cmd)
+ {
+@@ -559,6 +615,7 @@ static void virtio_gpu_resource_flush(VirtIOGPU *g,
+         }
+ 
+         if (update_submitted) {
++            virtio_gpu_defer_flush_fence(g, cmd);
+             return;
+         }
+         if (!within_bounds) {
+@@ -1127,7 +1184,7 @@ void virtio_gpu_simple_process_cmd(VirtIOGPU *g,
+         cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+         break;
+     }
+-    if (!cmd->finished) {
++    if (!cmd->finished && !cmd->deferred) {
+         if (!g->parent_obj.renderer_blocked) {
+             virtio_gpu_ctrl_response_nodata(g, cmd, cmd->error ? cmd->error :
+                                             VIRTIO_GPU_RESP_OK_NODATA);
+@@ -1213,10 +1270,23 @@ static void virtio_gpu_handle_gl_flushed(VirtIOGPUBase *b)
+ {
+     VirtIOGPU *g = container_of(b, VirtIOGPU, parent_obj);
+ 
+-    virtio_gpu_process_fenceq(g);
++    if (!g->display_reports_shown) {
++        /* the display blocks and unblocks again: deferred fences work */
++        g->flush_fence_timeouts = 0;
++        virtio_gpu_process_fenceq(g);
++    }
+     virtio_gpu_process_cmdq(g);
+ }
+ 
++static void virtio_gpu_handle_frame_shown(VirtIOGPUBase *b)
++{
++    VirtIOGPU *g = container_of(b, VirtIOGPU, parent_obj);
++
++    g->display_reports_shown = true;
++    g->flush_fence_timeouts = 0;
++    virtio_gpu_process_fenceq(g);
++}
++
+ static void virtio_gpu_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
+ {
+     VirtIOGPU *g = VIRTIO_GPU(vdev);
+@@ -1231,6 +1301,7 @@ static void virtio_gpu_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
+         cmd->vq = vq;
+         cmd->error = 0;
+         cmd->finished = false;
++        cmd->deferred = false;
+         QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
+         cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
+     }
+@@ -1700,6 +1771,7 @@ static void virtio_gpu_device_unrealize(DeviceState *qdev)
+     g_clear_pointer(&g->ctrl_bh, qemu_bh_delete);
+     g_clear_pointer(&g->cursor_bh, qemu_bh_delete);
+     g_clear_pointer(&g->reset_bh, qemu_bh_delete);
++    g_clear_pointer(&g->flush_fence_timer, timer_free);
+     qemu_cond_destroy(&g->reset_cond);
+     virtio_gpu_base_device_unrealize(qdev);
+ }
+@@ -1864,6 +1936,7 @@ static void virtio_gpu_class_init(ObjectClass *klass, const void *data)
+     VirtIOGPUBaseClass *vgbc = &vgc->parent;
+ 
+     vgc->handle_ctrl = virtio_gpu_handle_ctrl;
++    vgbc->frame_shown = virtio_gpu_handle_frame_shown;
+     vgc->process_cmd = virtio_gpu_simple_process_cmd;
+     vgc->update_cursor_data = virtio_gpu_update_cursor_data;
+     vgc->resource_destroy = virtio_gpu_resource_destroy;
+diff --git a/hw/display/virtio-vga.c b/hw/display/virtio-vga.c
+index 2ae649c..016a20e 100644
+--- a/hw/display/virtio-vga.c
++++ b/hw/display/virtio-vga.c
+@@ -67,6 +67,16 @@ static void virtio_vga_base_gl_block(void *opaque, bool block)
+     }
+ }
+ 
++static void virtio_vga_base_frame_shown(void *opaque)
++{
++    VirtIOVGABase *vvga = opaque;
++    VirtIOGPUBase *g = vvga->vgpu;
++
++    if (g->hw_ops->frame_shown) {
++        g->hw_ops->frame_shown(g);
++    }
++}
++
+ static int virtio_vga_base_get_flags(void *opaque)
+ {
+     VirtIOVGABase *vvga = opaque;
+@@ -82,6 +92,7 @@ static const GraphicHwOps virtio_vga_base_ops = {
+     .text_update = virtio_vga_base_text_update,
+     .ui_info = virtio_vga_base_ui_info,
+     .gl_block = virtio_vga_base_gl_block,
++    .frame_shown = virtio_vga_base_frame_shown,
+ };
+ 
+ static const VMStateDescription vmstate_virtio_vga_base = {
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index 220231e..1a1179e 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -141,6 +141,8 @@ struct virtio_gpu_ctrl_command {
+     struct virtio_gpu_ctrl_hdr cmd_hdr;
+     uint32_t error;
+     bool finished;
++    /* answered from fenceq once the display has shown the frame */
++    bool deferred;
+     QTAILQ_ENTRY(virtio_gpu_ctrl_command) next;
+ };
+ 
+@@ -168,6 +170,7 @@ struct VirtIOGPUBaseClass {
+     VirtioDeviceClass parent;
+ 
+     void (*gl_flushed)(VirtIOGPUBase *g);
++    void (*frame_shown)(VirtIOGPUBase *g);
+ };
+ 
+ #define VIRTIO_GPU_BASE_PROPERTIES(_state, _conf)                       \
+@@ -208,6 +211,16 @@ struct VirtIOGPU {
+     bool processing_cmdq;
+ 
+     uint32_t inflight;
++
++    /*
++     * Fenced flushes of a GL scanout wait in fenceq for the display to
++     * unblock; the timer answers them if it never does.
++     */
++    QEMUTimer *flush_fence_timer;
++    uint32_t flush_fence_timeouts;
++    /* the display reports shown frames: they, not unblocking, answer fences */
++    bool display_reports_shown;
++
+     struct {
+         uint32_t max_inflight;
+         uint32_t requests;
+diff --git a/include/ui/console.h b/include/ui/console.h
+index 3634956..80e149b 100644
+--- a/include/ui/console.h
++++ b/include/ui/console.h
+@@ -342,6 +342,11 @@ typedef struct GraphicHwOps {
+     void (*text_update)(void *opaque, uint32_t *text);
+     void (*ui_info)(void *opaque, uint32_t head, QemuUIInfo *info);
+     void (*gl_block)(void *opaque, bool block);
++    /*
++     * Optional: the display has latched the guest's latest frame, at the
++     * refresh it will be shown in (see qemu_console_hw_frame_shown).
++     */
++    void (*frame_shown)(void *opaque);
+ } GraphicHwOps;
+ 
+ QemuConsole *qemu_graphic_console_create(DeviceState *dev, uint32_t head,
+@@ -357,6 +362,7 @@ void qemu_console_hw_update_done(QemuConsole *con);
+ void qemu_console_hw_invalidate(QemuConsole *con);
+ void qemu_console_hw_text_update(QemuConsole *con, uint32_t *chardata);
+ void qemu_console_hw_gl_block(QemuConsole *con, bool block);
++void qemu_console_hw_frame_shown(QemuConsole *con);
+ 
+ void qemu_console_early_init(void);
+ 
+diff --git a/include/ui/gtk.h b/include/ui/gtk.h
+index 5e712a7..cdaf201 100644
+--- a/include/ui/gtk.h
++++ b/include/ui/gtk.h
+@@ -73,6 +73,9 @@ typedef struct VirtualGfxConsole {
+     int64_t frame_released_ns;
+     int64_t frame_turnaround_ns;
+     int64_t frame_turnaround_dev_ns;
++    /* when the frame drawn last is latched for its refresh (frame_shown) */
++    int64_t frame_latch_ns;
++    QEMUTimer *shown_timer;
+ #endif
+ } VirtualGfxConsole;
+ 
+diff --git a/ui/console.c b/ui/console.c
+index a8a2a24..d2a178f 100644
+--- a/ui/console.c
++++ b/ui/console.c
+@@ -181,6 +181,19 @@ static void console_hw_gl_unblock_timer(void *opaque)
+     warn_report("console: no gl-unblock within one second");
+ }
+ 
++/*
++ * Called by a display that knows when a frame makes it to the screen: once the
++ * frame flushed last is drawn and has made the compositor's deadline for a
++ * refresh (or will at that refresh's latch point).
++ */
++void qemu_console_hw_frame_shown(QemuConsole *con)
++{
++    assert(con != NULL);
++    if (con->hw_ops->frame_shown) {
++        con->hw_ops->frame_shown(con->hw);
++    }
++}
++
+ void qemu_console_hw_gl_block(QemuConsole *con, bool block)
+ {
+     uint64_t timeout;
+@@ -192,6 +205,7 @@ void qemu_console_hw_gl_block(QemuConsole *con, bool block)
+         con->gl_block--;
+     }
+     assert(con->gl_block >= 0);
++    trace_console_gl_block(con->index, block, con->gl_block);
+     if (!con->hw_ops->gl_block) {
+         return;
+     }
+diff --git a/ui/gtk.c b/ui/gtk.c
+index 83e852f..a5d4b75 100644
+--- a/ui/gtk.c
++++ b/ui/gtk.c
+@@ -763,6 +763,75 @@ static int64_t gd_hw_gl_frame_lead(VirtualConsole *vc)
+     return vc->gfx.frame_turnaround_ns + 2 * vc->gfx.frame_turnaround_dev_ns;
+ }
+ 
++/*
++ * How far past a latch point a frame may arrive and still count for it: only
++ * the trip from the guest's flip to here.  A guest takes the latch point as
++ * its vblank, so a frame later than that was meant for the next refresh; a
++ * larger slack let frames flipped just after it count a refresh early.
++ */
++static int64_t gd_latch_slack_ns(void)
++{
++    static int64_t slack = -1;
++
++    if (slack < 0) {
++        const char *env = g_getenv("QEMU_GTK_LATCH_SLACK_US");
++        slack = env ? g_ascii_strtoll(env, NULL, 10) * 1000 : 250000;
++    }
++    return slack;
++}
++
++/*
++ * The latch point of the refresh a frame arriving now makes: the first
++ * vblank + phase it isn't too late for.  Without the vblank, the arrival.
++ */
++static int64_t gd_frame_latch(VirtualConsole *vc, int64_t now)
++{
++#ifdef GD_VBLANK_PACING
++    int64_t vblank;
++
++    if (gd_vblank_last(vc, &vblank) && vc->gfx.vblank_period_ns > 0) {
++        int64_t period = vc->gfx.vblank_period_ns;
++        int64_t latch = vblank + gd_vblank_phase_ns();
++
++        while (latch > now + period - gd_latch_slack_ns()) {
++            latch -= period;
++        }
++        while (latch < now - gd_latch_slack_ns()) {
++            latch += period;
++        }
++        return latch;
++    }
++#endif
++    return now;
++}
++
++static void gd_hw_gl_shown_timer(void *opaque)
++{
++    VirtualConsole *vc = opaque;
++
++    qemu_console_hw_frame_shown(vc->gfx.dcl.con);
++}
++
++/*
++ * The frame drawn last is done: report it shown at its latch point, or now
++ * when that has passed.  The guest takes this as its flip completing.
++ */
++static void gd_hw_gl_frame_drawn(VirtualConsole *vc)
++{
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++
++    trace_gd_frame_shown(vc->gfx.frame_latch_ns - now);
++    if (vc->gfx.frame_latch_ns > now) {
++        if (!vc->gfx.shown_timer) {
++            vc->gfx.shown_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
++                                               gd_hw_gl_shown_timer, vc);
++        }
++        timer_mod(vc->gfx.shown_timer, vc->gfx.frame_latch_ns);
++        return;
++    }
++    qemu_console_hw_frame_shown(vc->gfx.dcl.con);
++}
++
+ /* Called when the guest flushes a new frame after being released. */
+ void gd_hw_gl_frame_arrived(VirtualConsole *vc)
+ {
+@@ -770,6 +839,8 @@ void gd_hw_gl_frame_arrived(VirtualConsole *vc)
+     int64_t t = now - vc->gfx.frame_released_ns;
+     int64_t err;
+ 
++    vc->gfx.frame_latch_ns = gd_frame_latch(vc, now);
++
+     if (!vc->gfx.frame_released_ns || t > vc->gfx.frame_interval_ns) {
+         /* the guest was idle, not a measure of its frame turnaround */
+         return;
+@@ -795,6 +866,8 @@ void gd_hw_gl_release(VirtualConsole *vc)
+ {
+     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+     int64_t next = vc->gfx.frame_release_ns + vc->gfx.frame_interval_ns;
++
++    gd_hw_gl_frame_drawn(vc);
+ #ifdef GD_VBLANK_PACING
+     int64_t vblank;
+ 
+@@ -849,6 +922,8 @@ void gd_hw_gl_flushed(void *vcon)
+         close(fence_fd);
+         qemu_dmabuf_set_fence_fd(dmabuf, -1);
+         gd_hw_gl_release(vc);
++    } else {
++        trace_gd_gl_flushed_nofence(fence_fd);
+     }
+ }
+ 
+diff --git a/ui/trace-events b/ui/trace-events
+index 7112ea6..b240f4d 100644
+--- a/ui/trace-events
++++ b/ui/trace-events
+@@ -2,6 +2,7 @@
+ 
+ # console.c
+ console_gfx_new(void) ""
++console_gl_block(int idx, bool block, int count) "console %d block %d count %d"
+ console_gfx_reuse(int index) "%d"
+ console_gfx_close(int index) "%d"
+ console_putchar_csi(int esc_param0, int esc_param1, int ch, int nb_esc_params) "escape sequence CSI%d;%d%c, %d parameters"
+@@ -27,6 +28,8 @@ gd_grab(const char *tab, const char *device, const char *reason) "tab=%s, dev=%s
+ gd_ungrab(const char *tab, const char *device) "tab=%s, dev=%s"
+ gd_vblank_source(const char *monitor, int card, uint32_t crtc, int64_t period_ns) "monitor=%s card=%d crtc=%u period=%" PRId64 "ns"
+ gd_frame_arrived(int64_t lateness_ns, int64_t turnaround_ns, int64_t lead_ns) "lateness=%" PRId64 "ns turnaround=%" PRId64 "ns lead=%" PRId64 "ns"
++gd_frame_shown(int64_t wait_ns) "wait=%" PRId64 "ns"
++gd_gl_flushed_nofence(int fence_fd) "fence %d: the current dmabuf has none (its release is lost)"
+ gd_keymap_windowing(const char *name) "backend=%s"
+ gd_gl_area_create_context(void *ctx, int major, int minor) "ctx=%p, major=%d, minor=%d"
+ gd_gl_area_destroy_context(void *ctx, void *current_ctx) "ctx=%p, current_ctx=%p"
+-- 
+2.56.0
+

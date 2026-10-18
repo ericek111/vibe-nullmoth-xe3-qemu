@@ -1,0 +1,34 @@
+From 454d6a18a77bc3096848caacb7c458b3c2926b02 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 19:52:59 +0200
+Subject: [PATCH] drm_file_update_pid: no synchronize_rcu() for FreeBSD's
+ integer pids
+
+On FreeBSD the pid is a plain integer and task_pid() is the thread id, so every DRM ioctl from a new
+thread waited a full RCU grace period for nothing: no reader can hold an integer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ drivers/gpu/drm/drm_file.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/drivers/gpu/drm/drm_file.c b/drivers/gpu/drm/drm_file.c
+index 6d25949758..3410296692 100644
+--- a/drivers/gpu/drm/drm_file.c
++++ b/drivers/gpu/drm/drm_file.c
+@@ -498,7 +498,14 @@ void drm_file_update_pid(struct drm_file *filp)
+ #endif
+ 	mutex_unlock(&dev->filelist_mutex);
+ 
++	/*
++	 * FreeBSD: the pid is a plain integer (and task_pid() is the thread id,
++	 * so this runs for every new calling thread): no reader can hold the old
++	 * one, so there is no grace period to wait for.
++	 */
++#ifdef __linux__
+ 	synchronize_rcu();
++#endif
+ 	put_pid(old);
+ }
+ 

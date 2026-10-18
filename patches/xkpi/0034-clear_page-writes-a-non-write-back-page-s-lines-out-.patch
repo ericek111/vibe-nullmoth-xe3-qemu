@@ -1,0 +1,57 @@
+From 10bddabc79a2b64b92b6448588eb9d6d4f7d94c2 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 14:17:28 +0200
+Subject: [PATCH 34/50] clear_page writes a non-write-back page's lines out of
+ the CPU cache
+
+TTM zeroes pages it takes back into its pool with clear_page(page_address(p)), through the write-back
+kernel view and without kmap; the dirty lines later landed on uploads written through write-combined user
+mappings (8 MB CPU->GPU copy: up to 40000 cache lines lost).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ bsdcompat/src/nmx_page.c      | 11 +++++++++++
+ override/include/linux/page.h |  8 +++++++-
+ 2 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/gpu-port/xkpi/bsdcompat/src/nmx_page.c b/gpu-port/xkpi/bsdcompat/src/nmx_page.c
+index b6a931d..63bf446 100644
+--- a/gpu-port/xkpi/bsdcompat/src/nmx_page.c
++++ b/gpu-port/xkpi/bsdcompat/src/nmx_page.c
+@@ -755,6 +755,17 @@ void pmap_zero_page(vm_page_t m)
+     bzero(m->nmx_kva, PAGE_SIZE);
+ }
+ 
++/* LinuxKPI's clear_page (override/include/linux/page.h): zero, then write a non-write-back page's lines out */
++struct vm_page *nmx_kva_to_page(const void *va);
++void nmx_clear_page(void *va)
++{
++    bzero(va, PAGE_SIZE);
++    vm_page_t m = nmx_kva_to_page(va);
++    if (m != NULL && m->md.pat_mode != VM_MEMATTR_WRITE_BACK)
++        pmap_invalidate_cache_range((vm_offset_t)va & ~(vm_offset_t)PAGE_MASK,
++                                    ((vm_offset_t)va & ~(vm_offset_t)PAGE_MASK) + PAGE_SIZE);
++}
++
+ /* ---- accounting --------------------------------------------------------------------------------------------------- */
+ 
+ uint64_t nmx_physmem_pages(void)
+diff --git a/gpu-port/xkpi/override/include/linux/page.h b/gpu-port/xkpi/override/include/linux/page.h
+index 8587f2c..86b8966 100644
+--- a/gpu-port/xkpi/override/include/linux/page.h
++++ b/gpu-port/xkpi/override/include/linux/page.h
+@@ -137,6 +137,12 @@ int lkpi_set_pages_attr(struct page *page, int numpages, vm_memattr_t ma);
+  * clear_page() is called on kmem allocated page addresses, thus zeros a page
+  * not a 'struct page'.  Really belongs into <asm/page.h>.
+  */
+-#define	clear_page(_pa)		memset(_pa, 0, PAGE_SIZE)
++/*
++ * macOS port: a write-combined or uncached page is zeroed through the kernel's write-back view (TTM clears pages it
++ * takes back into its pool with clear_page(page_address(p))), so the lines are written out of the CPU cache before
++ * they can land on top of what the GPU or a write-combined user mapping wrote later (bsdcompat/src/nmx_page.c).
++ */
++void nmx_clear_page(void *va);
++#define	clear_page(_pa)		nmx_clear_page(_pa)
+ 
+ #endif	/* _LINUXKPI_LINUX_PAGE_H_ */

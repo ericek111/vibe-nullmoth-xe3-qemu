@@ -1,0 +1,287 @@
+From b3107d6bb6181cc501b145b239123e671dbab9dd Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 16:32:13 +0200
+Subject: [PATCH 34/47] NMXVGAFB: flips complete at the host's latch point; VBL
+ on that grid
+
+A final (ordered) flip now flushes fenced and returns when the host has
+latched the frame, so NMXAccel completes the transaction then, as a page
+flip completes at vblank on real hardware. With QEMU 0007 the answers lie
+on a grid (host vblank + a fixed phase), or later when a frame was drawn
+after its latch point: the grid is their lower envelope. An earlier answer
+moves it at once, a later one by at most 2 us (clock drift). The VBL timer
+runs on that grid alone. Answers count only after 8 took over 1 ms, so a
+host without 0007 (instant answers) leaves the free-running timer alone.
+
+Measured, Safari rAF at 60 fps on the 120 Hz panel: 101 of 101 frames
+held exactly two refreshes. VBL at the host's release instead (QEMU
+0006's adaptive release, an earlier version of this) drifted with
+WindowServer's own compositing offset; a 1.5 ms lead before the latch let
+flips submitted just after a VBL catch the latch that followed it (16% of
+frames uneven); debug.nmxfb_vbl_lead_us keeps that knob, default 0.
+
+The VBL timer no longer waits on the scan-out lock a flip holds.
+debug.nmxfb_vtrace lists the last 512 display events (vbl, latch, flip,
+answer) for vm/tools/ftrace.sh.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ kexts/NMXVGAFB/nmxvgafb.cpp | 160 +++++++++++++++++++++++++++++++++---
+ 1 file changed, 148 insertions(+), 12 deletions(-)
+
+diff --git a/kexts/NMXVGAFB/nmxvgafb.cpp b/kexts/NMXVGAFB/nmxvgafb.cpp
+index 953d4ba..a526e79 100644
+--- a/kexts/NMXVGAFB/nmxvgafb.cpp
++++ b/kexts/NMXVGAFB/nmxvgafb.cpp
+@@ -39,6 +39,18 @@ class NMXVGAFB : public IOFramebuffer {
+     Irq fVbl, fConnect;
+     thread_call_t fVblTimer = nullptr;
+     uint64_t fVblNext = 0;
++    // VBL phase: while frames flow, the host's answer to a flip's fenced flush is the vblank (QEMU releases the guest
++    // at a fixed phase of its panel's refresh); the timer runs on from the last one. fVblLock orders the two callers.
++    IOLock *fVblLock = nullptr;
++    uint64_t fLastVbl = 0, fPeriodAbs = 0;
++    uint64_t fLatch = 0;                  // a host latch point (mach time), 0 until the first answer
++    void vblTick(uint64_t at);
++    void hostLatch(uint64_t at);
++    // a host that answers fenced flushes at once (no QEMU 0007) gives no vblank: its answers count only once
++    // kPacedSeen of them took more than kPacedNs (with 0007 the answer for a frame comes about a refresh later)
++    static constexpr unsigned kPacedSeen = 8;
++    static constexpr uint64_t kPacedNs = 1000000;
++    unsigned fDeferredSeen = 0;
+     volatile bool fStopping = false;
+     IOPhysicalAddress fBase = 0;
+     uint32_t fWidth = 0, fHeight = 0, fRowBytes = 0;
+@@ -65,6 +77,19 @@ public:
+     static constexpr uint32_t kHistMs[kHist - 1] = { 12, 20, 28, 37, 45, 60, 100 };
+     uint64_t fPresentHist[kHist] = {};
+     uint64_t fSwitchN = 0, fSwitchNs = 0, fSwitchMaxNs = 0;
++    // VBLs, host answers taken as latch points, answers that moved the latch grid earlier
++    uint64_t fVblTimerN = 0, fLatchAnswers = 0, fLatchEarlier = 0;
++    // debug.nmxfb_vtrace: the last kTrace display events, times in us of the mach clock (ns on x86)
++    // V vbl, L latch grid after a host answer (arg its phase in the period, us), S flip of a surface (arg id),
++    // A host answer to its flush (arg round trip, us)
++    static constexpr unsigned kTrace = 512;
++    struct TraceEv { uint64_t us; uint32_t arg; char kind; };
++    TraceEv fTrace[kTrace] = {};
++    volatile uint32_t fTraceN = 0;
++    void trace(char kind, uint64_t at, uint32_t arg) {
++        const uint32_t i = OSIncrementAtomic((volatile SInt32 *)&fTraceN) % kTrace;
++        fTrace[i] = { at / 1000, arg, kind };
++    }
+     NMXVirtioGPU &virtio() { return fVirtio; }
+     // a copy of what scanout 0 shows now (the host reads the same pages): header + rows of B G R X, for debug.nmxfb_shot
+     IOReturn snapshot(void *dst, size_t cap, size_t *len);
+@@ -111,9 +136,10 @@ private:
+         // replaced is; only a lost device (a command timed out) ends the virtio scan-out. The own buffer is flushed
+         // every VBL (its CPU writers give no notice); a presented surface only for kSurfFlushNs after its present,
+         // which covers the plugin's copy-out into it after the GPU signals - an idle desktop costs no flushes
++        // A flip holds the scan-out lock while the host shows its frame (up to a refresh) and needs no VBL flush:
++        // the timer doesn't wait for it.
+         uint64_t now = mach_absolute_time();
+-        if (me->fVirtioOn && me->fScanLock) {
+-            IOLockLock(me->fScanLock);
++        if (me->fVirtioOn && me->fScanLock && IOLockTryLock(me->fScanLock)) {
+             uint64_t sinceNs = 0;
+             if (me->fCurRes != kScanResource) absolutetime_to_nanoseconds(now - me->fLastPresent, &sinceNs);
+             const bool flush = sinceNs < kSurfFlushNs && !(me->fCurRes != kScanResource && me->fCurFinal);
+@@ -130,11 +156,7 @@ private:
+                        me->fVirtio.commands(), me->fVirtio.failures());
+             }
+         }
+-        if (me->fVbl.proc) me->fVbl.proc(me->fVbl.target, me->fVbl.ref);
+-        uint64_t period; nanoseconds_to_absolutetime(me->fFrameNs, &period);
+-        now = mach_absolute_time();
+-        me->fVblNext = (me->fVblNext && me->fVblNext + period > now) ? me->fVblNext + period : now + period;
+-        thread_call_enter_delayed(me->fVblTimer, me->fVblNext);
++        me->vblTick(mach_absolute_time());
+     }
+ 
+ public:
+@@ -268,11 +290,78 @@ public:
+ 
+ OSDefineMetaClassAndStructors(NMXVGAFB, IOFramebuffer)
+ 
++/*
++ * VBL phase. With QEMU 0007 the host answers a flip's fenced flush at the latch point of the refresh the frame made
++ * (its vblank plus a fixed phase), or when the frame is drawn if that is later - so the latch grid is the lower
++ * envelope of the answers. An answer before the predicted latch moves the grid to it at once; a later one moves it by
++ * at most kCreepNs (the guest's and the host's clocks drift apart slowly). The VBL is the timer's alone, on the latch
++ * points as on a real display: a flip after it goes to the next refresh (WindowServer composites to flip just before
++ * its next VBL). debug.nmxfb_vbl_lead_us moves it earlier; with a lead, a flip submitted just after a VBL could still
++ * make the latch that follows it, a refresh early (measured: 16% of 60 fps frames uneven with 1.5 ms).
++ */
++static uint32_t gVblLeadUs = 0;
++SYSCTL_UINT(_debug, OID_AUTO, nmxfb_vbl_lead_us, CTLFLAG_RW | CTLFLAG_LOCKED, &gVblLeadUs, 0,
++            "NMXVGAFB: VBL this long (us) before the host's latch point (QEMU 0007 fenced flush answers); 0: on it, as on a real display");
++
++void NMXVGAFB::hostLatch(uint64_t at)
++{
++    if (!fVblLock || !fVblTimer) return;
++    static constexpr uint64_t kCreepNs = 2000;
++    IOLockLock(fVblLock);
++    const uint64_t p = fPeriodAbs;
++    if (!fLatch) fLatch = at;
++    else {
++        // the latch nearest to the answer, and how far the answer is from it
++        const int64_t d = (int64_t)(at - fLatch);
++        const int64_t k = (d >= 0 ? d + (int64_t)p / 2 : d - (int64_t)p / 2) / (int64_t)p;
++        const uint64_t pred = fLatch + (uint64_t)(k * (int64_t)p);
++        const int64_t e = (int64_t)(at - pred);
++        uint64_t creep; nanoseconds_to_absolutetime(kCreepNs, &creep);
++        fLatch = e < 0 ? at : pred + ((uint64_t)e < creep ? (uint64_t)e : creep);
++        if (e < 0) fLatchEarlier++;
++    }
++    fLatchAnswers++;
++    // the first VBL on the grid that no VBL served yet (one less than half a period after the last did): it can be
++    // due already when the answer beat the timer to this latch, and then the timer fires at once
++    uint64_t lead; nanoseconds_to_absolutetime((uint64_t)gVblLeadUs * 1000, &lead);
++    if (lead >= p) lead = p / 2;
++    const uint64_t served = fLastVbl ? fLastVbl + p / 2 : mach_absolute_time() - p / 2;
++    uint64_t next = fLatch - lead;
++    if (next <= served) next += ((served - next) / p + 1) * p;
++    else next -= ((next - served - 1) / p) * p;
++    if (next != fVblNext) { fVblNext = next; if (!fStopping) thread_call_enter_delayed(fVblTimer, next); }
++    trace('L', fLatch, (uint32_t)((fLatch % p) / 1000));
++    IOLockUnlock(fVblLock);
++}
++
++// the VBL timer: one VBL per refresh on the phase hostLatch set (or the one it had), skipping ticks it missed
++void NMXVGAFB::vblTick(uint64_t at)
++{
++    if (!fVblLock || !fVblTimer) return;
++    IOLockLock(fVblLock);
++    const uint64_t p = fPeriodAbs;
++    if (fVblNext && at + p / 4 < fVblNext) {
++        // a host answer moved the VBL since this tick was armed
++        thread_call_enter_delayed(fVblTimer, fVblNext);
++        IOLockUnlock(fVblLock);
++        return;
++    }
++    fVblTimerN++;
++    uint64_t next = fVblNext ? fVblNext + p : at + p;
++    if (next <= at) next += ((at - next) / p + 1) * p;
++    fLastVbl = at;
++    if (fVbl.proc) fVbl.proc(fVbl.target, fVbl.ref);
++    trace('V', at, 0);
++    fVblNext = next;
++    if (!fStopping) thread_call_enter_delayed(fVblTimer, next);
++    IOLockUnlock(fVblLock);
++}
++
+ // debug.nmxfb_vtiming: present pacing and virtio-gpu round trips (see fPresentHist and NMXVirtioGPU::timing)
+ static NMXVGAFB *volatile gVtInst;
+ static int nmxVtimingSysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+ {
+-    char buf[640];
++    char buf[896];
+     NMXVGAFB *f = gVtInst;
+     if (!f) { snprintf(buf, sizeof buf, "no virtio display"); return SYSCTL_OUT(req, buf, strlen(buf) + 1); }
+     const uint64_t *h = f->fPresentHist;
+@@ -280,14 +369,39 @@ static int nmxVtimingSysctl(struct sysctl_oid *, void *, int, struct sysctl_req
+                      " | switch n %llu avg %llu us max %llu us",
+                      h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], f->fSwitchN,
+                      f->fSwitchN ? f->fSwitchNs / f->fSwitchN / 1000 : 0, f->fSwitchMaxNs / 1000);
+-    static const char *const kName[3] = { "flush", "set_scanout", "other" };
+-    for (unsigned k = 0; k < 3 && n > 0 && n < (int)sizeof buf; k++) {
++    static const char *const kName[NMXVirtioGPU::kTimings] = { "flush", "set_scanout", "other", "shown" };
++    for (unsigned k = 0; k < NMXVirtioGPU::kTimings && n > 0 && n < (int)sizeof buf; k++) {
+         NMXVirtioGPU::Timing t = f->virtio().timing(k);
+         n += snprintf(buf + n, sizeof buf - (size_t)n, " | %s n %llu avg %llu us max %llu us", kName[k], t.n,
+                       t.n ? t.totalNs / t.n / 1000 : 0, t.maxNs / 1000);
+     }
++    if (n > 0 && n < (int)sizeof buf)
++        snprintf(buf + n, sizeof buf - (size_t)n, " | vbl %llu, latch answers %llu (moved earlier %llu) | irqs %llu (%s)",
++                 f->fVblTimerN, f->fLatchAnswers, f->fLatchEarlier, f->virtio().irqs(),
++                 f->virtio().interrupts() ? "MSI-X" : "polled");
+     return SYSCTL_OUT(req, buf, strlen(buf) + 1);
+ }
++static int nmxVtraceSysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
++{
++    NMXVGAFB *f = gVtInst;
++    if (!f) return ENODEV;
++    const size_t cap = NMXVGAFB::kTrace * 32 + 1;
++    char *buf = (char *)IOMalloc(cap);
++    if (!buf) return ENOMEM;
++    const uint32_t end = f->fTraceN, n = end < NMXVGAFB::kTrace ? end : NMXVGAFB::kTrace;
++    size_t len = 0;
++    for (uint32_t k = end - n; k != end && len < cap - 32; k++) {
++        const NMXVGAFB::TraceEv &e = f->fTrace[k % NMXVGAFB::kTrace];
++        len += (size_t)snprintf(buf + len, cap - len, "%llu %c %u\n", (unsigned long long)e.us, e.kind ? e.kind : '?', e.arg);
++    }
++    buf[len] = 0;
++    int r = SYSCTL_OUT(req, buf, len + 1);
++    IOFree(buf, cap);
++    return r;
++}
++SYSCTL_PROC(_debug, OID_AUTO, nmxfb_vtrace, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, nmxVtraceSysctl, "A",
++            "NMXVGAFB: the last display events (us, V/M/S/A, argument)");
++
+ SYSCTL_PROC(_debug, OID_AUTO, nmxfb_vtiming, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, nmxVtimingSysctl, "A",
+             "NMXVGAFB: present gaps, scan-out switch and virtio-gpu command times");
+ 
+@@ -430,9 +544,13 @@ bool NMXVGAFB::start(IOService *provider)
+     }
+     if (fVirtioOn && OSCompareAndSwapPtr(nullptr, this, (void * volatile *)&gVtInst)) {
+         sysctl_register_oid(&sysctl__debug_nmxfb_vtiming);
++        sysctl_register_oid(&sysctl__debug_nmxfb_vtrace);
++        sysctl_register_oid(&sysctl__debug_nmxfb_vbl_lead_us);
+         sysctl_register_oid(&sysctl__debug_nmxfb_shot);
+     }
+-    fVblTimer = thread_call_allocate(vblFire, this);
++    nanoseconds_to_absolutetime(fFrameNs, &fPeriodAbs);
++    fVblLock = IOLockAlloc();
++    fVblTimer = fVblLock ? thread_call_allocate(vblFire, this) : nullptr;
+     if (fVblTimer) {
+         uint64_t d; clock_interval_to_deadline((uint32_t)(fFrameNs / 1000), kMicrosecondScale, &d);
+         fVblNext = d; thread_call_enter_delayed(fVblTimer, d);
+@@ -458,12 +576,15 @@ void NMXVGAFB::stop(IOService *provider)
+     fStopping = true;
+     if (OSCompareAndSwapPtr(this, nullptr, (void * volatile *)&gVtInst)) {
+         sysctl_unregister_oid(&sysctl__debug_nmxfb_vtiming);
++        sysctl_unregister_oid(&sysctl__debug_nmxfb_vtrace);
++        sysctl_unregister_oid(&sysctl__debug_nmxfb_vbl_lead_us);
+         sysctl_unregister_oid(&sysctl__debug_nmxfb_shot);
+     }
+     if (fHoldCap) { thread_call_cancel(fHoldCap); while (!thread_call_free(fHoldCap)) { thread_call_cancel(fHoldCap); IOSleep(5); } fHoldCap = nullptr; }
+     releaseHold("stopping");
+     OSSafeReleaseNULL(fAccel);
+     if (fVblTimer) { thread_call_cancel(fVblTimer); while (!thread_call_free(fVblTimer)) { thread_call_cancel(fVblTimer); IOSleep(5); } fVblTimer = nullptr; }
++    if (fVblLock) { IOLockFree(fVblLock); fVblLock = nullptr; }
+     OSSafeReleaseNULL(fSurfMap);
+     // QEMU back in VGA mode (the firmware's framebuffer) before the blobs' memory goes
+     fVirtioOn = false;
+@@ -632,6 +753,8 @@ IOReturn NMXVGAFB::scanoutSurface(NMXScanoutSurface *r)
+     if (md->getLength() < bytes) return kIOReturnUnsupported;
+     const uint64_t t0 = mach_absolute_time();
+     IOReturn ret = kIOReturnSuccess;
++    uint64_t shownAt = 0;
++    bool host = false;
+     IOLockLock(fScanLock);
+     SurfBlob *hit = nullptr, *victim = nullptr;
+     for (auto &b : fSurf) {
+@@ -679,10 +802,23 @@ IOReturn NMXVGAFB::scanoutSurface(NMXScanoutSurface *r)
+         else {
+             fCurRes = hit->res; fCurW = hit->w; fCurH = hit->h;
+             fCurFinal = r->version >= 2 && (r->flags & NMX_SCANOUT_FINAL);
+-            fVirtio.flush(fCurRes, 0, 0, fCurW, fCurH);
++            // A final frame's flush is fenced: the host answers once it has shown it, so the flip (and the
++            // accelerator's transaction) completes then, and the answer is this display's vblank.
++            if (fCurFinal) {
++                const uint64_t f0 = mach_absolute_time();
++                trace('S', t0, r->surfaceId);
++                if (fVirtio.flushShown(fCurRes, fCurW, fCurH, &shownAt) && fVirtio.interrupts()) {
++                    uint64_t rt = 0; absolutetime_to_nanoseconds(shownAt - f0, &rt);
++                    trace('A', shownAt, (uint32_t)(rt / 1000));
++                    if (fDeferredSeen < kPacedSeen && rt > kPacedNs && ++fDeferredSeen == kPacedSeen)
++                        VFBLOG("virtio-gpu: the host answers fenced flushes when it has shown the frame - VBL follows its latch points");
++                    host = fDeferredSeen >= kPacedSeen;
++                }
++            } else fVirtio.flush(fCurRes, 0, 0, fCurW, fCurH);
+         }
+     }
+     IOLockUnlock(fScanLock);
++    if (host) hostLatch(shownAt);
+     uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+     r->ns = ns;
+     fSwitchN++; fSwitchNs += ns; if (ns > fSwitchMaxNs) fSwitchMaxNs = ns;

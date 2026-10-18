@@ -1,0 +1,70 @@
+From 63a6d24b825e5df6fae7e8dec8593203891b59d4 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 05:14:45 +0200
+Subject: [PATCH 28/47] plugin: tracing costs nothing while it is off
+
+nvtrace was a function, so its arguments were evaluated on every draw with tracing off - one of them an NSString's
+UTF8String (15% of a GL render thread) - and nvmtl_trace_on read the clock on every call (another ~8%). nvtrace is a
+macro now that evaluates its arguments only while tracing, and the request file is checked at most every 64 calls.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugin/NVMTLLibraryLoad.m |  2 +-
+ plugin/NVMTLObjects.m     | 17 ++++++++++-------
+ 2 files changed, 11 insertions(+), 8 deletions(-)
+
+diff --git a/plugin/NVMTLLibraryLoad.m b/plugin/NVMTLLibraryLoad.m
+index a821271..64ca5c0 100644
+--- a/plugin/NVMTLLibraryLoad.m
++++ b/plugin/NVMTLLibraryLoad.m
+@@ -72,7 +72,7 @@ static void nvmtl_translator_cache_tag(const char *path, char *tag, size_t capac
+         nvlog("translator cache: content read failed; using process-private identity");
+     }
+ }
+-static void nvtrace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
++static void nvtrace_emit(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+ typedef int (*nvmtl_sampler_fn)(const char *, const char *, const char *, uint8_t **, size_t *, char *, size_t);
+ static nvmtl_sampler_fn xlate_sampler;
+ typedef void (*nvmtl_tglen_fn)(const uint32_t *, uint32_t);
+diff --git a/plugin/NVMTLObjects.m b/plugin/NVMTLObjects.m
+index d7efbba..828b34f 100644
+--- a/plugin/NVMTLObjects.m
++++ b/plugin/NVMTLObjects.m
+@@ -15,7 +15,10 @@ void nvlog(const char *fmt, ...);
+ #import <objc/runtime.h>
+ #import <objc/message.h>
+ static int nvmtl_trace_on(void);
+-static void nvtrace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
++static void nvtrace_emit(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
++// the arguments are evaluated only while tracing: draws pass strings converted per call (UTF8String), which cost 15% of
++// a GL render thread with tracing off
++#define nvtrace(...) do { if (nvmtl_trace_on()) nvtrace_emit(__VA_ARGS__); } while (0)
+ static unsigned long long nvmtl_global_trace_id(id o) {
+     static char key; static unsigned long long next = 1;
+     @synchronized (o) {
+@@ -954,19 +957,19 @@ static void nvmtl_storage_twins_out(NVMTLCommandBuffer *cb) {
+ static int g_trace_lines;
+ static int g_trace_bigonly, g_trace_mute;
+ static int nvmtl_trace_on(void) {
+-    static uint64_t next; static int on;
+-    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
++    static uint64_t next; static int on; static unsigned calls;
+     static int cap = 2500;
+-    if (now >= next) { next = now + 250000000ull; int was = on; on = access("/tmp/nvmtl-trace-request", F_OK) == 0;
++    // the request file is looked at every 250 ms, and the clock read only every 64th call: this runs several times per draw
++    if ((calls++ & 63) || clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) < next) return on && !g_trace_mute && g_trace_lines < cap;
++    const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
++    { next = now + 250000000ull; int was = on; on = access("/tmp/nvmtl-trace-request", F_OK) == 0;
+         g_trace_bigonly = on && access("/tmp/nvmtl-trace-big", F_OK) == 0; if (!g_trace_bigonly) g_trace_mute = 0;
+         if (on && !was) { g_trace_lines = 0; cap = access("/tmp/nvmtl-trace-long", F_OK) == 0 ? 20000 : 2500; } }
+     return on && !g_trace_mute && g_trace_lines < cap;
+ }
+ static int nvtrace_scope(uint32_t w, uint32_t h) { int was = g_trace_mute; g_trace_mute = 0; (void)nvmtl_trace_on();
+     g_trace_mute = g_trace_bigonly && (w < 1000 || h < 100); return was; }
+-static void nvtrace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+-static void nvtrace(const char *fmt, ...) {
+-    if (!nvmtl_trace_on()) return;
++static void nvtrace_emit(const char *fmt, ...) {
+     char p[96]; snprintf(p, sizeof p, "/tmp/nvmtl-trace-%d.txt", (int)getpid());
+     int fd = open(p, O_WRONLY | O_CREAT | O_APPEND, 0600);
+     if (fd < 0) { static int said; if (!said++) nvlog("G15 trace: cannot open %s (errno %d)", p, errno); return; }

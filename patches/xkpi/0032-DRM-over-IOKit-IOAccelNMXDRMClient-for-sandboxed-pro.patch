@@ -1,0 +1,296 @@
+From 48f38b68770afc0e1f2f1a62e9a02022efba9f69 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 11:10:21 +0200
+Subject: [PATCH 32/50] DRM over IOKit: IOAccelNMXDRMClient for sandboxed
+ processes (WindowServer)
+
+WindowServer's sandbox opens /dev/dri/renderD128 read-only but denies every ioctl on a device file; it may
+open IOKit user clients named IOAccel*. NMXGPU::newUserClient type 'NMXD' opens the render node through the
+devfs entry points; selector 0 runs one ioctl on it in the caller's context. libdrm's drmNmxIoctl switches
+an fd to it on EPERM.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ bsdcompat/include/nmx_xnu.h        |   4 +
+ bsdcompat/include/nmxxnu/nmx_xnu.h |   4 +
+ xnu/nmx_devfs.cpp                  |  41 ++++++++-
+ xnu/nmx_drmuc.cpp                  | 137 +++++++++++++++++++++++++++++
+ xnu/nmx_kext.cpp                   |  19 ++++
+ 5 files changed, 204 insertions(+), 1 deletion(-)
+ create mode 100644 xnu/nmx_drmuc.cpp
+
+diff --git a/gpu-port/xkpi/bsdcompat/include/nmx_xnu.h b/gpu-port/xkpi/bsdcompat/include/nmx_xnu.h
+index 177d73a..e87bfdb 100644
+--- a/gpu-port/xkpi/bsdcompat/include/nmx_xnu.h
++++ b/gpu-port/xkpi/bsdcompat/include/nmx_xnu.h
+@@ -81,6 +81,10 @@ int nmx_xnu_pci_msi_count(void *pci);
+ void nmx_xnu_set_dump_hook(void (*fn)(void));
+ void nmx_xnu_diag_fini(void);
+ void nmx_xnu_run_dump(void);
++/* the DRM user client (xnu/nmx_drmuc.cpp): one open of the devfs node at path, driven like the device file */
++int nmx_xnu_uc_open(const char *path, int *open_minor);
++int nmx_xnu_uc_ioctl(int open_minor, unsigned long cmd, void *data);
++void nmx_xnu_uc_close(int open_minor);
+ int nmx_xnu_pci_irq_setup(void *pci, int vector, void (*handler)(void *), void *arg, void **cookie);
+ void nmx_xnu_pci_irq_teardown(void *cookie);
+ /* returns once a handler running on this source has finished */
+diff --git a/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_xnu.h b/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_xnu.h
+index 734407e..ee462ea 100644
+--- a/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_xnu.h
++++ b/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_xnu.h
+@@ -81,6 +81,10 @@ int nmx_xnu_pci_msi_count(void *pci);
+ void nmx_xnu_set_dump_hook(void (*fn)(void));
+ void nmx_xnu_diag_fini(void);
+ void nmx_xnu_run_dump(void);
++/* the DRM user client (xnu/nmx_drmuc.cpp): one open of the devfs node at path, driven like the device file */
++int nmx_xnu_uc_open(const char *path, int *open_minor);
++int nmx_xnu_uc_ioctl(int open_minor, unsigned long cmd, void *data);
++void nmx_xnu_uc_close(int open_minor);
+ int nmx_xnu_pci_irq_setup(void *pci, int vector, void (*handler)(void *), void *arg, void **cookie);
+ void nmx_xnu_pci_irq_teardown(void *cookie);
+ /* returns once a handler running on this source has finished */
+diff --git a/gpu-port/xkpi/xnu/nmx_devfs.cpp b/gpu-port/xkpi/xnu/nmx_devfs.cpp
+index 585681a..c7c877c 100644
+--- a/gpu-port/xkpi/xnu/nmx_devfs.cpp
++++ b/gpu-port/xkpi/xnu/nmx_devfs.cpp
+@@ -40,6 +40,7 @@ static int g_major = -1;
+ static IOLock *g_lock;
+ static void *g_node_cookie[NODE_MINORS];       /* node minor -> LinuxKPI cookie (struct cdev *) */
+ static void *g_node_handle[NODE_MINORS];       /* devfs node handles */
++static char g_node_name[NODE_MINORS][32];      /* devfs path of each node ("dri/renderD128"), for the user client */
+ static uint16_t g_open_node[OPEN_MINOR_MAX];   /* open minor -> node minor + 1 (0 = free) */
+ static uint8_t g_open_active[OPEN_MINOR_MAX];  /* 1 while an open() of that minor succeeded and is not closed */
+ static int g_open_next = NODE_MINORS;
+@@ -252,8 +253,10 @@ extern "C" void *nmx_xnu_devfs_make(const char *path, uint32_t uid, uint32_t gid
+     IOLockLock(g_lock);
+     if (h == nullptr)
+         g_node_cookie[node] = nullptr;
+-    else
++    else {
+         g_node_handle[node] = h;
++        strlcpy(g_node_name[node], path, sizeof(g_node_name[node]));
++    }
+     IOLockUnlock(g_lock);
+     return h;
+ }
+@@ -357,3 +360,39 @@ extern "C" void nmx_xnu_unmap_user(void *handle)
+     um->map->release();
+     IODelete(um, UserMap, 1);
+ }
++
++/*
++ * The DRM user client (xnu/nmx_drmuc.cpp): sandboxed processes (WindowServer) may open a DRM node read-only but not
++ * issue ioctls on it, while IOKit user clients named IOAccel* are allowed. Each client is one open of a node, made and
++ * driven through the same entry points as an open of the device file.
++ */
++extern "C" int nmx_xnu_uc_open(const char *path, int *open_minor)
++{
++    *open_minor = -1;
++    if (g_major < 0)
++        return ENXIO;
++    int node = -1;
++    IOLockLock(g_lock);
++    for (int i = 0; i < NODE_MINORS; i++)
++        if (g_node_cookie[i] != nullptr && strcmp(g_node_name[i], path) == 0) { node = i; break; }
++    IOLockUnlock(g_lock);
++    if (node < 0)
++        return ENOENT;
++    int m = clone_minor(makedev(g_major, node), DEVFS_CLONE_ALLOC);
++    if (m < 0)
++        return ENFILE;
++    int err = nmx_open(makedev(g_major, m), FREAD | FWRITE, 0, nullptr);
++    if (err == 0)
++        *open_minor = m;
++    return err;
++}
++
++extern "C" int nmx_xnu_uc_ioctl(int open_minor, unsigned long cmd, void *data)
++{
++    return nmx_ioctl(makedev(g_major, open_minor), cmd, (caddr_t)data, FREAD | FWRITE, nullptr);
++}
++
++extern "C" void nmx_xnu_uc_close(int open_minor)
++{
++    nmx_close(makedev(g_major, open_minor), FREAD | FWRITE, 0, nullptr);
++}
+diff --git a/gpu-port/xkpi/xnu/nmx_drmuc.cpp b/gpu-port/xkpi/xnu/nmx_drmuc.cpp
+new file mode 100644
+index 0000000..dedacc8
+--- /dev/null
++++ b/gpu-port/xkpi/xnu/nmx_drmuc.cpp
+@@ -0,0 +1,137 @@
++/*
++ * IOAccelNMXDRMClient: a DRM node opened through IOKit instead of the device file.
++ *
++ * WindowServer's sandbox (com.apple.WindowServer.sb) lets it open /dev/dri/renderD128 read-only but denies every ioctl
++ * on a device file, while it may open IOKit user clients whose class name starts with "IOAccel" (Apple's GPU drivers
++ * are reached that way). So the class name is part of the interface. Each client is one open of the render node; its
++ * one external method runs a DRM (or NullMoth node) ioctl on that open, through the same entry point as an ioctl(2) on
++ * the device file. It runs on the caller's thread, so the user pointers inside an ioctl's argument (and the mappings
++ * NMX_DRM_IOCTL_MMAP makes) belong to the caller, as with the device file. libdrm's Darwin side switches a DRM fd to a
++ * client of this kind when an ioctl on it fails with EPERM.
++ */
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <sys/ioccom.h>
++#include <sys/errno.h>
++#include "nmx_xnu.h"
++
++class IOAccelNMXDRMClient : public IOUserClient {
++    OSDeclareDefaultStructors(IOAccelNMXDRMClient)
++    int fMinor = -1;
++    static constexpr uint32_t kMaxArg = IOCPARM_MAX;    /* 8 KiB: the largest argument an ioctl number can encode */
++public:
++    bool start(IOService *provider) override;
++    IOReturn clientClose() override;
++    void stop(IOService *provider) override;
++    IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
++                            OSObject *target, void *reference) override;
++};
++OSDefineMetaClassAndStructors(IOAccelNMXDRMClient, IOUserClient)
++
++bool IOAccelNMXDRMClient::start(IOService *provider)
++{
++    if (!IOUserClient::start(provider))
++        return false;
++    int err = nmx_xnu_uc_open("dri/renderD128", &fMinor);
++    if (err != 0) {
++        IOLog("NullMoth GPU: DRM user client: opening the render node failed (%d)\n", err);
++        return false;
++    }
++    return true;
++}
++
++IOReturn IOAccelNMXDRMClient::clientClose()
++{
++    if (fMinor >= 0) {
++        nmx_xnu_uc_close(fMinor);
++        fMinor = -1;
++    }
++    terminate();
++    return kIOReturnSuccess;
++}
++
++void IOAccelNMXDRMClient::stop(IOService *provider)
++{
++    if (fMinor >= 0) {
++        nmx_xnu_uc_close(fMinor);
++        fMinor = -1;
++    }
++    IOUserClient::stop(provider);
++}
++
++/*
++ * selector 0: ioctl. scalar in [0] = the ioctl number; structure in = its argument when the number has IOC_IN;
++ * structure out = its argument after the call when it has IOC_OUT (inline or by descriptor, as IOKit passes them).
++ * scalar out [0] = the errno the ioctl returned (0 on success), so transport failures stay distinct.
++ */
++IOReturn IOAccelNMXDRMClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++                                             IOExternalMethodDispatch *dispatch, OSObject *target, void *reference)
++{
++    if (selector != 0 || fMinor < 0)
++        return kIOReturnBadArgument;
++    if (args->scalarInputCount != 1 || args->scalarOutputCount != 1)
++        return kIOReturnBadArgument;
++    unsigned long cmd = (unsigned long)args->scalarInput[0];
++    uint32_t len = IOCPARM_LEN(cmd);
++    if (len > kMaxArg)
++        return kIOReturnBadArgument;
++    uint8_t stackbuf[256];
++    uint8_t *buf = len <= sizeof(stackbuf) ? stackbuf : (uint8_t *)IOMalloc(len);
++    if (buf == nullptr)
++        return kIOReturnNoMemory;
++    bzero(buf, len);
++    IOReturn ret = kIOReturnSuccess;
++    if ((cmd & IOC_IN) && len) {
++        if (args->structureInputDescriptor) {
++            if (args->structureInputDescriptor->getLength() < len ||
++                args->structureInputDescriptor->readBytes(0, buf, len) != len)
++                ret = kIOReturnBadArgument;
++        } else if (args->structureInputSize >= len && args->structureInput) {
++            memcpy(buf, args->structureInput, len);
++        } else {
++            ret = kIOReturnBadArgument;
++        }
++    }
++    if (ret == kIOReturnSuccess) {
++        int err = nmx_xnu_uc_ioctl(fMinor, cmd, buf);
++        args->scalarOutput[0] = (uint64_t)err;
++        if (err == 0 && (cmd & IOC_OUT) && len) {
++            if (args->structureOutputDescriptor) {
++                if (args->structureOutputDescriptor->getLength() < len ||
++                    args->structureOutputDescriptor->writeBytes(0, buf, len) != len)
++                    ret = kIOReturnBadArgument;
++                else
++                    args->structureOutputDescriptorSize = len;
++            } else if (args->structureOutputSize >= len && args->structureOutput) {
++                memcpy(args->structureOutput, buf, len);
++                args->structureOutputSize = len;
++            } else {
++                ret = kIOReturnBadArgument;
++            }
++        } else {
++            args->structureOutputSize = 0;
++        }
++    }
++    if (buf != stackbuf)
++        IOFree(buf, len);
++    return ret;
++}
++
++/* NMXGPU::newUserClient's half: type 'NMXD' makes one of these on the GPU's service */
++extern "C++" IOUserClient *nmx_drm_user_client(IOService *provider, task_t owningTask, void *securityID, UInt32 type)
++{
++    IOAccelNMXDRMClient *c = OSTypeAlloc(IOAccelNMXDRMClient);
++    if (c == nullptr)
++        return nullptr;
++    if (!c->initWithTask(owningTask, securityID, type) || !c->attach(provider)) {
++        c->release();
++        return nullptr;
++    }
++    if (!c->start(provider)) {
++        c->detach(provider);
++        c->release();
++        return nullptr;
++    }
++    return c;
++}
+diff --git a/gpu-port/xkpi/xnu/nmx_kext.cpp b/gpu-port/xkpi/xnu/nmx_kext.cpp
+index 3bbf517..91339e1 100644
+--- a/gpu-port/xkpi/xnu/nmx_kext.cpp
++++ b/gpu-port/xkpi/xnu/nmx_kext.cpp
+@@ -52,6 +52,8 @@ public:
+     void stop(IOService *provider) override;
+     IOReturn setPowerState(unsigned long state, IOService *device) override;
+     void systemWillShutdown(IOOptionBits spec) override;
++    IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
++                           IOUserClient **handler) override;
+ };
+ OSDefineMetaClassAndStructors(NMXGPU, IOService)
+ 
+@@ -281,6 +283,23 @@ void NMXGPU::stop(IOService *provider)
+     IOService::stop(provider);
+ }
+ 
++IOUserClient *nmx_drm_user_client(IOService *provider, task_t owningTask, void *securityID, UInt32 type);
++
++/* type 'NMXD': a DRM node opened through IOKit (xnu/nmx_drmuc.cpp), for sandboxed processes such as WindowServer */
++IOReturn NMXGPU::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
++                               IOUserClient **handler)
++{
++    if (type != 'NMXD')
++        return IOService::newUserClient(owningTask, securityID, type, properties, handler);
++    if (attach_ != 1)
++        return kIOReturnNotReady;
++    IOUserClient *c = nmx_drm_user_client(this, owningTask, securityID, type);
++    if (c == nullptr)
++        return kIOReturnNoResources;
++    *handler = c;
++    return kIOReturnSuccess;
++}
++
+ /* state 0 = sleep, 1 = on */
+ IOReturn NMXGPU::setPowerState(unsigned long state, IOService *device)
+ {

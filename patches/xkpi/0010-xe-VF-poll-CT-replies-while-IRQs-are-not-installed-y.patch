@@ -1,0 +1,31 @@
+From e190cd4749ef0d127f69b4d755bb948dcd1748e6 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 04:07:29 +0200
+Subject: [PATCH 10/50] xe VF: poll CT replies while IRQs are not installed yet
+ (6.14 handshakes with the PF before xe_irq_install)
+
+---
+ fork_xe.py | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/gpu-port/xkpi/fork_xe.py b/gpu-port/xkpi/fork_xe.py
+index a820011..7817d78 100644
+--- a/gpu-port/xkpi/fork_xe.py
++++ b/gpu-port/xkpi/fork_xe.py
+@@ -97,6 +97,16 @@ edit("xe_pci.c", [
+     ("\t\tgt->info.id = 0;\n\t\tgt->info.type = XE_GT_TYPE_UNINITIALIZED;\n",
+      "\t\tgt->info.id = 0;\n\t\tgt->info.type = XE_GT_TYPE_UNINITIALIZED;\n\t\tgt->mmio.adj_offset = 0;\n\t\tgt->mmio.adj_limit = 0;\n", 1),
+ ])
++# VF before interrupts: 6.14 runs the VF/PF handshake (VF2GUC relay over CT) in xe_gt_init_hwconfig(), before
++# xe_irq_install(); upstream later moved it after IRQs. The GuC answers (G2H tail moves) but nothing processes the
++# reply, so the wait timed out. While xe's IRQs are not enabled, poll: kick the G2H handling every 2 ms.
++edit("xe_guc_ct.c", [("\tret = wait_event_timeout(ct->g2h_fence_wq, g2h_fence.done, HZ);\n",
++    "\tif (!atomic_read(&ct_to_xe(ct)->irq.enabled)) {\n"
++    "\t\tunsigned long nmx_end = jiffies + HZ;\n\n"
++    "\t\tdo {\n\t\t\txe_guc_ct_irq_handler(ct);\n"
++    "\t\t\tret = wait_event_timeout(ct->g2h_fence_wq, g2h_fence.done, msecs_to_jiffies(2));\n"
++    "\t\t} while (!ret && time_before(jiffies, nmx_end));\n"
++    "\t} else {\n\t\tret = wait_event_timeout(ct->g2h_fence_wq, g2h_fence.done, HZ);\n\t}\n", 1)])
+ # --- NMX VF DIAGNOSTICS (temporary, for bring-up on the VF) ---
+ # count VF interrupts, and on a G2H timeout print both CT descriptors: tells "GuC never read the H2G" (DMA/GGTT) from
+ # "GuC answered but no interrupt arrived" (IRQ path)

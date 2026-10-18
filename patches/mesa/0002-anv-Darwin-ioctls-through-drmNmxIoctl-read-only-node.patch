@@ -1,0 +1,83 @@
+From 2c2b35150411a9c8ff1abe4aee9703fd3586ad24 Mon Sep 17 00:00:00 2001
+From: nm <nm@x>
+Date: Fri, 16 Oct 2026 11:03:17 +0200
+Subject: [PATCH 2/8] anv: Darwin ioctls through drmNmxIoctl; read-only node
+ opens when a sandbox denies writes
+
+Generated-by: LLM
+---
+ src/intel/common/intel_gem.h           | 5 +++++
+ src/intel/vulkan/anv_device.c          | 4 ++++
+ src/intel/vulkan/anv_physical_device.c | 4 ++++
+ src/util/os_drm.h                      | 4 ++++
+ 4 files changed, 17 insertions(+)
+
+diff --git a/src/intel/common/intel_gem.h b/src/intel/common/intel_gem.h
+index 5a85ef1e5b0..059079efabd 100644
+--- a/src/intel/common/intel_gem.h
++++ b/src/intel/common/intel_gem.h
+@@ -32,6 +32,9 @@
+ #include <stdlib.h>
+ #include <unistd.h>
+ #include <sys/ioctl.h>
++#ifdef __APPLE__
++#include <xf86drm.h>
++#endif
+ 
+ #include "intel_engine.h"
+ #include "drm-uapi/drm.h"
+@@ -86,6 +89,8 @@ intel_ioctl(int fd, unsigned long request, void *arg)
+     do {
+ #ifdef HAVE_INTEL_VIRTIO
+       ret = intel_virtio_ioctl(fd, request, arg);
++#elif defined(__APPLE__)
++      ret = drmNmxIoctl(fd, request, arg);
+ #else
+       ret = ioctl(fd, request, arg);
+ #endif
+diff --git a/src/intel/vulkan/anv_device.c b/src/intel/vulkan/anv_device.c
+index 0addc9c6289..94624ddfe73 100644
+--- a/src/intel/vulkan/anv_device.c
++++ b/src/intel/vulkan/anv_device.c
+@@ -930,6 +930,10 @@ VkResult anv_CreateDevice(
+ 
+    /* XXX(chadv): Can we dup() physicalDevice->fd here? */
+    device->fd = open(physical_device->path, O_RDWR | O_CLOEXEC);
++#ifdef __APPLE__
++   if (device->fd == -1 && errno == EPERM)
++      device->fd = open(physical_device->path, O_RDONLY | O_CLOEXEC);
++#endif
+    if (device->fd == -1) {
+       result = vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
+       goto fail_device;
+diff --git a/src/intel/vulkan/anv_physical_device.c b/src/intel/vulkan/anv_physical_device.c
+index bc2376960ab..466fd46e9e3 100644
+--- a/src/intel/vulkan/anv_physical_device.c
++++ b/src/intel/vulkan/anv_physical_device.c
+@@ -3015,6 +3015,10 @@ anv_physical_device_try_create(struct vk_instance *vk_instance,
+    int ret;
+ 
+    fd = open(path, O_RDWR | O_CLOEXEC);
++#ifdef __APPLE__
++   if (fd < 0 && errno == EPERM)
++      fd = open(path, O_RDONLY | O_CLOEXEC);
++#endif
+    if (fd < 0) {
+       if (errno == ENOMEM) {
+          return vk_errorf(instance, VK_ERROR_OUT_OF_HOST_MEMORY,
+diff --git a/src/util/os_drm.h b/src/util/os_drm.h
+index 0390ecdb9ac..b5bb62eca3b 100644
+--- a/src/util/os_drm.h
++++ b/src/util/os_drm.h
+@@ -24,7 +24,11 @@ drm_ioctl(int fd, uint32_t request, void *arg)
+    int ret;
+ 
+    do {
++#ifdef __APPLE__
++      ret = drmNmxIoctl(fd, request, arg);
++#else
+       ret = ioctl(fd, request, arg);
++#endif
+    } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
+ 
+    return ret ? -errno : 0;

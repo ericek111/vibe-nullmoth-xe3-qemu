@@ -1,0 +1,97 @@
+From 5d3a8107106813574431d5535873f5883511d32f Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 04:59:00 +0200
+Subject: [PATCH 16/50] xe pt walk: callbacks get a child copy; post_descend
+ only after a real descent (stale child -> fault in vm_bind)
+
+---
+ override/xe/nmx_xe_pt_walk.c | 48 +++++++++++++++++-------------------
+ 1 file changed, 22 insertions(+), 26 deletions(-)
+
+diff --git a/gpu-port/xkpi/override/xe/nmx_xe_pt_walk.c b/gpu-port/xkpi/override/xe/nmx_xe_pt_walk.c
+index 2d1f015..c808506 100644
+--- a/gpu-port/xkpi/override/xe/nmx_xe_pt_walk.c
++++ b/gpu-port/xkpi/override/xe/nmx_xe_pt_walk.c
+@@ -4,60 +4,56 @@
+  *
+  * The contract, as xe_pt.c relies on it:
+  *  - every entry of 'parent' (at 'level') that [addr, end) touches is handed to ops->pt_entry with the sub-range it
+- *    covers, [addr, next), and a pointer to its child slot (staged or live, per walk->staging), so a callback may
+- *    create the child; the action starts as ACTION_SUBTREE;
++ *    covers, [addr, next), and a copy of its child pointer (staged or live, per walk->staging), so a callback may
++ *    create the child and hand it back; the action starts as ACTION_SUBTREE;
+  *  - ACTION_SUBTREE descends into the child afterwards (directories only, and only when the child exists), then calls
+- *    ops->pt_post_descend for the entry; ACTION_CONTINUE moves on; ACTION_AGAIN calls pt_entry again;
++ *    ops->pt_post_descend for that entry; ACTION_CONTINUE moves on; ACTION_AGAIN calls pt_entry again;
+  *  - in shared mode, entries the range covers whole are skipped: only the tables other ranges also use are visited;
+  *  - the first error a callback returns stops the walk and is returned.
+  */
+ #include "xe_pt_walk.h"
+ 
+-static struct xe_ptw **child_slot(struct xe_ptw *parent, pgoff_t offset, unsigned int level,
+-				  const struct xe_pt_walk *walk, struct xe_ptw **scratch)
++/* the entry's current child: from the staged or the live table, per walk->staging; none for a level-0 table */
++static struct xe_ptw *child_of(struct xe_ptw *parent, pgoff_t offset, unsigned int level, const struct xe_pt_walk *walk)
+ {
+ 	struct xe_ptw **slots = walk->staging ? parent->staging : parent->children;
+ 
+-	/* a level-0 table holds PTEs, not children: callbacks get an empty slot of their own */
+-	if (level == 0 || slots == NULL) {
+-		*scratch = NULL;
+-		return scratch;
+-	}
+-	return &slots[offset];
++	return level == 0 || slots == NULL ? NULL : slots[offset];
+ }
+ 
++/*
++ * Callbacks get a copy of the child pointer: one that creates a child records it in the parent's tables itself and
++ * hands it back through the copy, and the walk descends into what the copy holds. pt_post_descend runs only for an
++ * entry the walk actually descended into (a directory entry with a child, action ACTION_SUBTREE) - it finishes that
++ * child's subtree, so calling it for an entry with no child let the unbind side act on tables that were never visited
++ * (a later walk then followed a stale child pointer: page fault in xe_pt_walk_range from xe_vm_bind_ioctl).
++ */
+ int xe_pt_walk_range(struct xe_ptw *parent, unsigned int level, u64 addr, u64 end, struct xe_pt_walk *walk)
+ {
+ 	while (addr < end) {
+ 		u64 next = xe_pt_addr_end(addr, end, level, walk);
+ 		pgoff_t offset = xe_pt_offset(addr, level, walk);
+-		struct xe_ptw *scratch, **child;
+ 		enum page_walk_action action;
++		struct xe_ptw *child;
+ 		int err;
+ 
+ 		if (walk->shared_pt_mode && !xe_pt_partial(addr, next, level, walk))
+ 			goto skip;
+ 
+-		child = child_slot(parent, offset, level, walk, &scratch);
+ 		do {
+ 			action = ACTION_SUBTREE;
+-			err = walk->ops->pt_entry(parent, offset, level, addr, next, child, &action, walk);
++			child = child_of(parent, offset, level, walk);
++			err = walk->ops->pt_entry(parent, offset, level, addr, next, &child, &action, walk);
+ 			if (err)
+ 				return err;
+ 		} while (action == ACTION_AGAIN);
+ 
+-		if (action == ACTION_SUBTREE) {
+-			if (level > 0 && *child != NULL) {
+-				err = xe_pt_walk_range(*child, level - 1, addr, next, walk);
+-				if (err)
+-					return err;
+-			}
+-			if (walk->ops->pt_post_descend) {
+-				err = walk->ops->pt_post_descend(parent, offset, level, addr, next, child, &action,
+-								 walk);
+-				if (err)
+-					return err;
+-			}
++		if (action == ACTION_SUBTREE && level > 0 && child != NULL) {
++			err = xe_pt_walk_range(child, level - 1, addr, next, walk);
++			if (!err && walk->ops->pt_post_descend)
++				err = walk->ops->pt_post_descend(parent, offset, level, addr, next, &child, &action, walk);
++			if (err)
++				return err;
+ 		}
+ skip:
+ 		/* next == 0 means the entry ended at the top of the address space */

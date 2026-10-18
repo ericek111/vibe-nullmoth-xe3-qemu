@@ -1,0 +1,244 @@
+From 01ea823463d9d619166b95c481846cf0c941786e Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 00:34:55 +0200
+Subject: [PATCH 45/50] nmx_mm: hold a task reference for each mm record and
+ each wired range
+
+The mm-to-task registry stored current_task() without a reference, and
+lookups returned the bare pointer after dropping the lock. The Linux mm
+outlives its process (xe's userptr notifier keeps it), so a worker that
+wired or copied user pages for an exited process walked a destroyed
+vm_map (panic: Invalid/destroyed RWLock in vm_map_copy_extract), or the
+map of an unrelated process once the task pointer was reused.
+
+The record now references its task until nmx_xnu_mm_forget. Lookups
+take a reference of their own, and a wired range keeps one until
+nmx_xnu_user_unwire, so the handle is now a small {descriptor, task}
+pair. For an exited task the map stays valid but empty, so wiring fails
+with EFAULT.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ bsdcompat/src/nmx_page.c |   2 +-
+ xnu/nmx_mm.cpp           | 120 +++++++++++++++++++++++++--------------
+ 2 files changed, 78 insertions(+), 44 deletions(-)
+
+diff --git a/gpu-port/xkpi/bsdcompat/src/nmx_page.c b/gpu-port/xkpi/bsdcompat/src/nmx_page.c
+index 63bf446..2da0cb9 100644
+--- a/gpu-port/xkpi/bsdcompat/src/nmx_page.c
++++ b/gpu-port/xkpi/bsdcompat/src/nmx_page.c
+@@ -290,7 +290,7 @@ void vm_page_wire(vm_page_t m)
+  * which is where Linux drivers release userptr pages.
+  */
+ struct user_pin {
+-    void *handle;                          /* nmx_xnu_user_wire descriptor */
++    void *handle;                          /* nmx_xnu_user_wire handle */
+     volatile u_int remaining;              /* page puts still to come */
+ };
+ struct pin_ref {
+diff --git a/gpu-port/xkpi/xnu/nmx_mm.cpp b/gpu-port/xkpi/xnu/nmx_mm.cpp
+index 48ee2ba..14efd8a 100644
+--- a/gpu-port/xkpi/xnu/nmx_mm.cpp
++++ b/gpu-port/xkpi/xnu/nmx_mm.cpp
+@@ -6,11 +6,18 @@
+  * own thread when the mm is created) and copies through an IOMemoryDescriptor over the user range in that task,
+  * which wires the pages for the duration of the copy. When the caller is already that process, plain copyin/copyout
+  * is used.
++ *
++ * Each record holds a reference on its task. The mm can outlive the process (xe's userptr notifier keeps it), and a
++ * worker then wiring through a bare task pointer walked a destroyed vm_map (panic in vm_map_copy_extract: invalid
++ * RWLock), or a different process's map once the pointer was reused. With the reference the exited task and its
++ * emptied map stay valid, and the wiring fails with EFAULT. Lookups hand out a reference of their own, so a record
++ * forgotten meanwhile cannot free the task under the caller.
+  */
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <IOKit/IOLib.h>
+ #include <sys/errno.h>
+ #include <sys/systm.h>
++#include <kern/task_ref.h>
+ #include "nmx_xnu.h"
+ 
+ namespace {
+@@ -32,12 +39,19 @@ IOLock *lock()
+     return gLock;
+ }
+ 
+-task_t find(void *mm)
++/* mm's task with a reference the caller drops with task_deallocate, or nullptr */
++task_t find_ref(void *mm)
+ {
++    task_t task = nullptr;
++    IOLockLock(lock());
+     for (MmTask *e = gList; e != nullptr; e = e->next)
+-        if (e->mm == mm)
+-            return e->task;
+-    return nullptr;
++        if (e->mm == mm) {
++            task = e->task;
++            task_reference(task);
++            break;
++        }
++    IOLockUnlock(gLock);
++    return task;
+ }
+ }
+ 
+@@ -48,6 +62,7 @@ extern "C" void nmx_xnu_mm_note_task(void *mm)
+         return;     /* the copy helpers then report EFAULT for this process: nothing is written blindly */
+     e->mm = mm;
+     e->task = current_task();
++    task_reference(e->task);
+     IOLockLock(lock());
+     e->next = gList;
+     gList = e;
+@@ -62,6 +77,7 @@ extern "C" void nmx_xnu_mm_forget(void *mm)
+             MmTask *e = *pp;
+             *pp = e->next;
+             IOLockUnlock(gLock);
++            task_deallocate(e->task);
+             IODelete(e, MmTask, 1);
+             return;
+         }
+@@ -73,27 +89,37 @@ extern "C" int nmx_xnu_mm_copy(void *mm, uint64_t uaddr, void *kbuf, size_t len,
+ {
+     if (len == 0)
+         return 0;
+-    IOLockLock(lock());
+-    task_t task = find(mm);
+-    IOLockUnlock(gLock);
++    task_t task = find_ref(mm);
+     if (task == nullptr)
+         return EFAULT;
+ 
+-    if (task == current_task())
+-        return to_user ? copyout(kbuf, (user_addr_t)uaddr, len) : copyin((user_addr_t)uaddr, kbuf, len);
+-
+-    IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)uaddr, len,
+-                                                                  kIODirectionOutIn, task);
+-    if (md == nullptr)
+-        return ENOMEM;
+-    if (md->prepare() != kIOReturnSuccess) {
+-        md->release();
+-        return EFAULT;
++    int err = EFAULT;
++    if (task == current_task()) {
++        err = to_user ? copyout(kbuf, (user_addr_t)uaddr, len) : copyin((user_addr_t)uaddr, kbuf, len);
++    } else {
++        IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)uaddr, len,
++                                                                      kIODirectionOutIn, task);
++        if (md == nullptr) {
++            err = ENOMEM;
++        } else {
++            if (md->prepare() == kIOReturnSuccess) {
++                IOByteCount done = to_user ? md->writeBytes(0, kbuf, len) : md->readBytes(0, kbuf, len);
++                md->complete();
++                err = done == len ? 0 : EFAULT;
++            }
++            md->release();
++        }
+     }
+-    IOByteCount done = to_user ? md->writeBytes(0, kbuf, len) : md->readBytes(0, kbuf, len);
+-    md->complete();
+-    md->release();
+-    return done == len ? 0 : EFAULT;
++    task_deallocate(task);
++    return err;
++}
++
++namespace {
++/* a wired user range: the descriptor and the task reference that keeps its map valid until unwire */
++struct UserWire {
++    IOMemoryDescriptor *md;
++    task_t task;
++};
+ }
+ 
+ extern "C" int nmx_xnu_user_wire(void *mm, uint64_t uaddr, size_t npages, int write, uint64_t *phys, void **handle)
+@@ -105,19 +131,22 @@ extern "C" int nmx_xnu_user_wire(void *mm, uint64_t uaddr, size_t npages, int wr
+         return EINVAL;
+     task_t task = current_task();
+     if (mm != nullptr) {
+-        IOLockLock(lock());
+-        task = find(mm);
+-        IOLockUnlock(gLock);
++        task = find_ref(mm);
+         if (task == nullptr)
+             return EFAULT;
++    } else {
++        task_reference(task);
++    }
++    UserWire *w = IONew(UserWire, 1);
++    if (w == nullptr) {
++        task_deallocate(task);
++        return ENOMEM;
+     }
+     /* the device writes the pages when the mapping is writable (kIODirectionIn), and always reads them */
+     IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)uaddr, npages * PAGE_SIZE,
+                                                                   write ? kIODirectionOutIn : kIODirectionOut, task);
+-    if (md == nullptr)
+-        return ENOMEM;
+-    IOReturn pr = md->prepare();
+-    if (pr != kIOReturnSuccess && write) {
++    IOReturn pr = md != nullptr ? md->prepare() : kIOReturnNoMemory;
++    if (md != nullptr && pr != kIOReturnSuccess && write) {
+         /*
+          * A range this task may only read (WindowServer's mapping of a full-screen IOSurface another process renders
+          * into) cannot be wired for writing; the GPU still needs its pages. Wired for reading, the physical pages are
+@@ -125,36 +154,41 @@ extern "C" int nmx_xnu_user_wire(void *mm, uint64_t uaddr, size_t npages, int wr
+          */
+         md->release();
+         md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)uaddr, npages * PAGE_SIZE, kIODirectionOut, task);
+-        if (md == nullptr)
+-            return ENOMEM;
+-        IOReturn pr2 = md->prepare();
++        IOReturn pr2 = md != nullptr ? md->prepare() : kIOReturnNoMemory;
+         IOLog("NullMoth GPU: wiring 0x%llx + %lu pages for writing failed (0x%x); for reading: 0x%x\n",
+               (unsigned long long)uaddr, (unsigned long)npages, pr, pr2);
+         pr = pr2;
+     }
+-    if (pr != kIOReturnSuccess) {
+-        md->release();
+-        return EFAULT;
+-    }
+-    for (size_t i = 0; i < npages; i++) {
++    int err = md == nullptr ? ENOMEM : pr != kIOReturnSuccess ? EFAULT : 0;
++    for (size_t i = 0; err == 0 && i < npages; i++) {
+         IOByteCount len = 0;
+         addr64_t pa = md->getPhysicalSegment(i * PAGE_SIZE, &len, kIOMemoryMapperNone);
+         if (pa == 0) {
+             md->complete();
+-            md->release();
+-            return EFAULT;
++            err = EFAULT;
+         }
+         phys[i] = pa;
+     }
+-    *handle = md;
++    if (err != 0) {
++        if (md != nullptr)
++            md->release();
++        task_deallocate(task);
++        IODelete(w, UserWire, 1);
++        return err;
++    }
++    w->md = md;
++    w->task = task;
++    *handle = w;
+     return 0;
+ }
+ 
+ extern "C" void nmx_xnu_user_unwire(void *handle)
+ {
+-    IOMemoryDescriptor *md = (IOMemoryDescriptor *)handle;
+-    if (md == nullptr)
++    UserWire *w = (UserWire *)handle;
++    if (w == nullptr)
+         return;
+-    md->complete();
+-    md->release();
++    w->md->complete();
++    w->md->release();
++    task_deallocate(w->task);
++    IODelete(w, UserWire, 1);
+ }

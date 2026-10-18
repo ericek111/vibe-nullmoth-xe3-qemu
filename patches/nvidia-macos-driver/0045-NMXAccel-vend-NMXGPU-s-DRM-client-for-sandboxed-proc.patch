@@ -1,0 +1,53 @@
+From 84931097358b3f4bfa1dbef00d26dc307466b111 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 22:38:21 +0200
+Subject: [PATCH 45/47] NMXAccel: vend NMXGPU's DRM client for sandboxed
+ processes
+
+The App Sandbox and WebKit's GPU process deny /dev/dri and only allow user
+clients whose provider is an IOAccelerator (system-graphics: iokit-connection
+"IOAccelerator"). Measured: IOAccelNMXDRMClient attached to NMXGPU is denied
+even when opened through the accelerator. NMXAccel now makes that class
+itself for type 'NMXD' and attaches it to the accelerator; the client opens
+the render node in start() as before. Sandboxed apps (Calculator, Safari,
+Notification Center, ...) found zero Vulkan devices and drew without Metal.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ kexts/NVRM/accel/nvrm-accel.cpp | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/kexts/NVRM/accel/nvrm-accel.cpp b/kexts/NVRM/accel/nvrm-accel.cpp
+index ea8c3ed..0886b1d 100644
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -505,8 +505,29 @@ public:
+         return nullptr;
+     }
+     IOService *fNVRM = nullptr;
++    IOService *fNMXGPU = nullptr;
+     IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
+                            IOUserClient **handler) APPLE_KEXT_OVERRIDE {
++#ifdef NMX_ACCEL
++        // 'NMXD' is NMXGPU's DRM client (one open of the render node). Sandboxed apps and WebKit's GPU process can't
++        // read /dev/dri, and may only open user clients whose provider is an IOAccelerator (system-graphics:
++        // iokit-connection "IOAccelerator"; measured: the same client attached to NMXGPU is denied), so it is made
++        // here, from NMXGPU's class, and attached to the accelerator. It opens the render node itself in start().
++        if (type == 'NMXD') {
++            if (!fNMXGPU) {
++                OSDictionary *m = serviceMatching("NMXGPU");
++                if (m) { fNMXGPU = waitForMatchingService(m, 100ULL * 1000 * 1000); m->release(); }
++            }
++            if (!fNMXGPU) { ALOG("newUserClient NMXD: no NMXGPU service"); return kIOReturnNotAttached; }
++            OSObject *o = OSMetaClass::allocClassWithName("IOAccelNMXDRMClient");
++            IOUserClient *c = OSDynamicCast(IOUserClient, o);
++            if (!c) { if (o) o->release(); ALOG("newUserClient NMXD: NMXGPU has no IOAccelNMXDRMClient"); return kIOReturnUnsupported; }
++            if (!c->initWithTask(owningTask, securityID, type) || !c->attach(this)) { c->release(); return kIOReturnNoResources; }
++            if (!c->start(this)) { c->detach(this); c->release(); return kIOReturnNotReady; }
++            *handler = c;
++            return kIOReturnSuccess;
++        }
++#endif
+         if ((type & 0xFFFF0000u) != 0x4E560000u) {
+             IOReturn fr = IOGraphicsAccelerator2::newUserClient(owningTask, securityID, type, handler);
+             if (fUcLogged < 40) { fUcLogged++;

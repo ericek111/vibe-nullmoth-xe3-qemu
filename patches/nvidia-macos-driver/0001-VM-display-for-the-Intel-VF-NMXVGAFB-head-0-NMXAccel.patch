@@ -1,0 +1,412 @@
+From 88dcee868fe2f95d1cc639db3afd1ccd09b3d037 Mon Sep 17 00:00:00 2001
+From: erik <eb.skola@gmail.com>
+Date: Fri, 16 Oct 2026 10:12:10 +0200
+Subject: [PATCH 01/47] VM display for the Intel VF: NMXVGAFB head 0, NMXAccel
+ arming sysctls, plugin admits WindowServer when not headless
+
+Local branch, not for upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ kexts/NMXVGAFB/Info.plist       |  30 ++++
+ kexts/NMXVGAFB/build.sh         |  12 ++
+ kexts/NMXVGAFB/nmxvgafb.cpp     | 245 ++++++++++++++++++++++++++++++++
+ kexts/NVRM/accel/nvrm-accel.cpp |  32 +++--
+ plugin/NVMTLDevice.m            |   6 +-
+ 5 files changed, 313 insertions(+), 12 deletions(-)
+ create mode 100644 kexts/NMXVGAFB/Info.plist
+ create mode 100755 kexts/NMXVGAFB/build.sh
+ create mode 100644 kexts/NMXVGAFB/nmxvgafb.cpp
+
+diff --git a/kexts/NMXVGAFB/Info.plist b/kexts/NMXVGAFB/Info.plist
+new file mode 100644
+index 0000000..5d9c61a
+--- /dev/null
++++ b/kexts/NMXVGAFB/Info.plist
+@@ -0,0 +1,30 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0"><dict>
++  <key>CFBundleIdentifier</key><string>com.nullmoth.NMXVGAFB</string>
++  <key>CFBundleName</key><string>NMXVGAFB</string>
++  <key>CFBundleExecutable</key><string>NMXVGAFB</string>
++  <key>CFBundlePackageType</key><string>KEXT</string>
++  <key>CFBundleVersion</key><string>0.1</string>
++  <key>CFBundleShortVersionString</key><string>0.1</string>
++  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
++  <key>IOKitPersonalities</key><dict>
++    <key>NMXVGAFB</key><dict>
++      <key>CFBundleIdentifier</key><string>com.nullmoth.NMXVGAFB</string>
++      <key>IOClass</key><string>NMXVGAFB</string>
++      <key>IOProviderClass</key><string>IOPCIDevice</string>
++      <!-- QEMU virtio-vga and std VGA (bochs) -->
++      <key>IOPCIMatch</key><string>0x10501af4 0x11111234</string>
++      <!-- above the firmware framebuffer (IONDRVFramebuffer, 20000); if start() declines, that one still takes it -->
++      <key>IOProbeScore</key><integer>60000</integer>
++      <key>IOMatchCategory</key><string>IOFramebuffer</string>
++    </dict>
++  </dict>
++  <key>OSBundleLibraries</key><dict>
++    <key>com.apple.kpi.iokit</key><string>8.0</string>
++    <key>com.apple.kpi.libkern</key><string>8.0</string>
++    <key>com.apple.kpi.mach</key><string>8.0</string>
++    <key>com.apple.iokit.IOPCIFamily</key><string>1.0.0</string>
++    <key>com.apple.iokit.IOGraphicsFamily</key><string>1.0.0</string>
++  </dict>
++</dict></plist>
+diff --git a/kexts/NMXVGAFB/build.sh b/kexts/NMXVGAFB/build.sh
+new file mode 100755
+index 0000000..4c29f4e
+--- /dev/null
++++ b/kexts/NMXVGAFB/build.sh
+@@ -0,0 +1,12 @@
++#!/bin/bash
++# build.sh <out>: NMXVGAFB.kext (run on the Mac / in the VM)
++set -uo pipefail
++D=$(cd "$(dirname "$0")" && pwd); OUT=$1; mkdir -p "$OUT/NMXVGAFB.kext/Contents/MacOS"
++SDK=$(xcrun --show-sdk-path); KHDR="$SDK/System/Library/Frameworks/Kernel.framework/Headers"
++xcrun clang++ -arch x86_64 -fapple-kext -mkernel -nostdinc -I"$KHDR" -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT \
++  -std=c++17 -fno-rtti -fno-exceptions -fno-builtin -fno-common -Wall -Wno-unused-parameter -Wno-inconsistent-missing-override -O2 \
++  -c "$D/nmxvgafb.cpp" -o "$OUT/nmxvgafb.o" || exit 1
++xcrun clang++ -arch x86_64 -fapple-kext -nostdlib -Xlinker -kext -lkmodc++ -lkmod -lcc_kext "$OUT/nmxvgafb.o" \
++  -o "$OUT/NMXVGAFB.kext/Contents/MacOS/NMXVGAFB" || exit 1
++cp "$D/Info.plist" "$OUT/NMXVGAFB.kext/Contents/Info.plist"
++echo "NMXVGAFB $(stat -f %z "$OUT/NMXVGAFB.kext/Contents/MacOS/NMXVGAFB") B"
+diff --git a/kexts/NMXVGAFB/nmxvgafb.cpp b/kexts/NMXVGAFB/nmxvgafb.cpp
+new file mode 100644
+index 0000000..915cede
+--- /dev/null
++++ b/kexts/NMXVGAFB/nmxvgafb.cpp
+@@ -0,0 +1,245 @@
++// NMXVGAFB: the display of a VM whose GPU is a headless SR-IOV virtual function (an Intel Panther Lake VF driven by
++// NMXGPU). The VM's own display device (QEMU virtio-vga / std VGA) keeps the linear framebuffer the firmware lit; this
++// framebuffer takes that mode over, unchanged, and offers it to NMXAccel as head 0. WindowServer then composites on
++// the VF and NMXAccel's display pipe copies each finished frame into this framebuffer (the CPU-only scan-out path
++// NMIntelFB uses for an Intel panel under the NVIDIA accelerator). Without NMXAccel it is a plain framebuffer.
++//
++// The IOFramebuffer plumbing (VBL timer, power and connection answers) follows NMIntelFB, which follows NVRMFB.
++
++#include <IOKit/IOLib.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/pci/IOPCIDevice.h>
++#include <IOKit/graphics/IOFramebuffer.h>
++#include <IOKit/IODeviceMemory.h>
++#include <kern/thread_call.h>
++#include <pexpert/pexpert.h>
++#include "../NMIntelFB/nvrm_vram_abi.h"
++
++#define VFBLOG(fmt, ...) IOLog("NMXVGAFB: " fmt "\n", ##__VA_ARGS__)
++
++#include <mach/kmod.h>
++extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_return_t _stop(kmod_info_t *ki, void *d);
++extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NMXVGAFB, "0.1", _start, _stop) }
++extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS; }
++extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
++
++namespace {
++IOPMPowerState kPowerStates[2] = {
++    { kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++    { kIOPMPowerStateVersion1, kIOPMDeviceUsable, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
++};
++}
++
++class NMXVGAFB : public IOFramebuffer {
++    OSDeclareDefaultStructors(NMXVGAFB)
++    IOMemoryMap *fSurfMap = nullptr;   // write-combined CPU view of the scan-out (NMXAccel's frames land here)
++    struct Irq { IOFBInterruptProc proc = nullptr; OSObject *target = nullptr; void *ref = nullptr; };
++    Irq fVbl, fConnect;
++    thread_call_t fVblTimer = nullptr;
++    uint64_t fVblNext = 0;
++    volatile bool fStopping = false;
++    IOPhysicalAddress fBase = 0;
++    uint32_t fWidth = 0, fHeight = 0, fRowBytes = 0;
++    static constexpr uint64_t kFrameNs = 16666667ull;
++    // CEA-like timing for the one mode, so WindowServer sees 60 Hz (it showed 0.00 Hz without timing information)
++    uint32_t fHT = 0, fVT = 0;
++    uint64_t fPclk = 0;
++
++    static void vblFire(thread_call_param_t p0, thread_call_param_t) {
++        NMXVGAFB *me = (NMXVGAFB *)p0;
++        if (me->fStopping) return;
++        if (me->fVbl.proc) me->fVbl.proc(me->fVbl.target, me->fVbl.ref);
++        uint64_t period; nanoseconds_to_absolutetime(kFrameNs, &period);
++        uint64_t now = mach_absolute_time();
++        me->fVblNext = (me->fVblNext && me->fVblNext + period > now) ? me->fVblNext + period : now + period;
++        thread_call_enter_delayed(me->fVblTimer, me->fVblNext);
++    }
++
++public:
++    IOService *probe(IOService *provider, SInt32 *score) override;
++    bool start(IOService *provider) override;
++    void stop(IOService *provider) override;
++
++    IOReturn enableController() override { return kIOReturnSuccess; }
++    bool isConsoleDevice() override { return true; }
++    IODeviceMemory *getApertureRange(IOPixelAperture aperture) override {
++        if (aperture != kIOFBSystemAperture) return nullptr;
++        return IODeviceMemory::withRange(fBase, (IOPhysicalLength)fRowBytes * fHeight);
++    }
++    IODeviceMemory *getVRAMRange() override { return getApertureRange(kIOFBSystemAperture); }
++    const char *getPixelFormats() override { return IO32BitDirectPixels "\0"; }
++    IOItemCount getDisplayModeCount() override { return 1; }
++    IOReturn getDisplayModes(IODisplayModeID *modes) override { modes[0] = 1; return kIOReturnSuccess; }
++    IOReturn getInformationForDisplayMode(IODisplayModeID mode, IODisplayModeInformation *info) override {
++        if (mode != 1 || !info) return kIOReturnBadArgument;
++        bzero(info, sizeof(*info));
++        info->maxDepthIndex = 0; info->nominalWidth = fWidth; info->nominalHeight = fHeight;
++        info->refreshRate = 60 << 16; info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
++        return kIOReturnSuccess;
++    }
++    UInt64 getPixelFormatsForDisplayMode(IODisplayModeID, IOIndex) override { return 0; }
++    IOReturn getPixelInformation(IODisplayModeID mode, IOIndex depth, IOPixelAperture aperture, IOPixelInformation *pi) override {
++        if (mode != 1 || depth != 0 || aperture != kIOFBSystemAperture || !pi) return kIOReturnUnsupportedMode;
++        bzero(pi, sizeof(*pi));
++        pi->bytesPerRow = fRowBytes; pi->bitsPerPixel = 32; pi->pixelType = kIORGBDirectPixels;
++        pi->componentCount = 3; pi->bitsPerComponent = 8;
++        pi->componentMasks[0] = 0x00FF0000; pi->componentMasks[1] = 0x0000FF00; pi->componentMasks[2] = 0x000000FF;
++        strlcpy(pi->pixelFormat, IO32BitDirectPixels, sizeof(pi->pixelFormat));
++        pi->activeWidth = fWidth; pi->activeHeight = fHeight;
++        return kIOReturnSuccess;
++    }
++    IOReturn getCurrentDisplayMode(IODisplayModeID *mode, IOIndex *depth) override { *mode = 1; *depth = 0; return kIOReturnSuccess; }
++    IOReturn getStartupDisplayMode(IODisplayModeID *mode, IOIndex *depth) override { return getCurrentDisplayMode(mode, depth); }
++    IOReturn getTimingInfoForDisplayMode(IODisplayModeID mode, IOTimingInformation *info) override {
++        if (mode != 1 || !info) return kIOReturnUnsupportedMode;
++        bzero(info, sizeof(*info));
++        info->appleTimingID = kIOTimingIDInvalid;
++        IODetailedTimingInformationV2 &d = info->detailedInfo.v2;
++        d.pixelClock = d.minPixelClock = d.maxPixelClock = fPclk;
++        d.horizontalActive = fWidth; d.horizontalBlanking = fHT - fWidth;
++        d.horizontalSyncOffset = 48; d.horizontalSyncPulseWidth = 32;
++        d.verticalActive = fHeight; d.verticalBlanking = fVT - fHeight;
++        d.verticalSyncOffset = 3; d.verticalSyncPulseWidth = 5;
++        info->flags = kIODetailedTimingValid;
++        return kIOReturnSuccess;
++    }
++    IOReturn setDisplayMode(IODisplayModeID mode, IOIndex depth) override { return (mode == 1 && depth == 0) ? kIOReturnSuccess : kIOReturnUnsupported; }
++    IOItemCount getConnectionCount() override { return 1; }
++    IOReturn callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4) override;
++    IOReturn registerForInterruptType(IOSelect type, IOFBInterruptProc proc, OSObject *target, void *ref, void **iref) override {
++        if (type == kIOFBVBLInterruptType) { fVbl = { proc, target, ref }; if (iref) *iref = &fVbl; return kIOReturnSuccess; }
++        if (type == kIOFBConnectInterruptType) { fConnect = { proc, target, ref }; if (iref) *iref = &fConnect; return kIOReturnSuccess; }
++        return kIOReturnUnsupported;
++    }
++    IOReturn unregisterInterrupt(void *) override { return kIOReturnSuccess; }
++    IOReturn setInterruptState(void *, UInt32) override { return kIOReturnSuccess; }
++    IOReturn setGammaTable(UInt32, UInt32, UInt32, void *) override { return kIOReturnSuccess; }
++    IOReturn setGammaTable(UInt32, UInt32, UInt32, void *, bool) override { return kIOReturnSuccess; }
++    IOReturn setCLUTWithEntries(IOColorEntry *, UInt32, UInt32, IOOptionBits) override { return kIOReturnSuccess; }
++    IOReturn setApertureEnable(IOPixelAperture, IOOptionBits) override { return kIOReturnSuccess; }
++    IOReturn setStartupDisplayMode(IODisplayModeID, IOIndex) override { return kIOReturnSuccess; }
++    // acknowledged at once, as NMIntelFB/NVRMFB do: left to IOFramebuffer, a power change waits on the controller
++    // thread and froze the displays on the first WindowServer restart
++    IOReturn setPowerState(unsigned long ordinal, IOService *) override {
++        handleEvent(ordinal ? kIOFBNotifyDidPowerOn : kIOFBNotifyWillPowerOff);
++        return kIOPMAckImplied;
++    }
++    IOReturn setAttribute(IOSelect attribute, uintptr_t value) override {
++        if (attribute == kIOWindowServerActiveAttribute) return kIOReturnSuccess;
++        if (attribute == kIOPowerAttribute) {
++            if (value) { IOReturn r = IOFramebuffer::setAttribute(attribute, value); handleEvent(kIOFBNotifyDidPowerOn);
++                         return r == kIOReturnUnsupported ? kIOReturnSuccess : r; }
++            handleEvent(kIOFBNotifyWillPowerOff);
++            IOReturn r = IOFramebuffer::setAttribute(attribute, value);
++            return r == kIOReturnUnsupported ? kIOReturnSuccess : r;
++        }
++        return IOFramebuffer::setAttribute(attribute, value);
++    }
++    IOReturn getAttribute(IOSelect attribute, uintptr_t *value) override {
++        if (attribute == kIOWindowServerActiveAttribute) { if (value) *value = 1; return kIOReturnSuccess; }
++        return IOFramebuffer::getAttribute(attribute, value);
++    }
++    IOReturn setAttributeForConnection(IOIndex idx, IOSelect attribute, uintptr_t value) override {
++        switch (attribute) {
++        case kConnectionPower: case kConnectionColorModesSupported: case kConnectionColorDepthsSupported:
++        case kConnectionControllerColorDepth: case kConnectionControllerDepthsSupported: case kConnectionColorMode:
++        case kConnectionDisplayFlags: case kConnectionFlags:
++            return kIOReturnSuccess;
++        default: return IOFramebuffer::setAttributeForConnection(idx, attribute, value);
++        }
++    }
++    IOReturn getAttributeForConnection(IOIndex idx, IOSelect attr, uintptr_t *value) override {
++        if (idx != 0 || !value) return kIOReturnBadArgument;
++        switch (attr) {
++        case kConnectionEnable: case kConnectionCheckEnable: *value = 1; return kIOReturnSuccess;
++        case kConnectionFlags: *value = kIOConnectionBuiltIn; return kIOReturnSuccess;
++        case kConnectionColorModesSupported: case kConnectionColorMode: *value = 0x00000001; return kIOReturnSuccess;
++        case kConnectionColorDepthsSupported: case kConnectionControllerColorDepth: case kConnectionControllerDepthsSupported:
++            *value = 0x00000002; return kIOReturnSuccess;
++        default: return IOFramebuffer::getAttributeForConnection(idx, attr, value);
++        }
++    }
++    IOReturn connectFlags(IOIndex, IODisplayModeID, IOOptionBits *flags) override {
++        if (flags) *flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
++        return kIOReturnSuccess;
++    }
++};
++
++OSDefineMetaClassAndStructors(NMXVGAFB, IOFramebuffer)
++
++IOService *NMXVGAFB::probe(IOService *provider, SInt32 *score)
++{
++    if (!OSDynamicCast(IOPCIDevice, provider)) return nullptr;
++    if (PE_parse_boot_argn("-nmxvgafboff", nullptr, 0)) { VFBLOG("off by boot-arg"); return nullptr; }
++    return IOFramebuffer::probe(provider, score);
++}
++
++bool NMXVGAFB::start(IOService *provider)
++{
++    // the mode the firmware lit (GOP): base, size and pitch of the linear framebuffer
++    PE_Video v;
++    bzero(&v, sizeof(v));
++    IOPlatformExpert *pe = getPlatform();
++    if (!pe || pe->getConsoleInfo(&v) != kIOReturnSuccess || !v.v_baseAddr || v.v_depth != 32 ||
++        v.v_width < 640 || v.v_height < 480 || v.v_rowBytes < v.v_width * 4) {
++        VFBLOG("no usable firmware framebuffer (base 0x%lx %lux%lu depth %lu pitch %lu) - leaving the display to IONDRV",
++               (unsigned long)v.v_baseAddr, (unsigned long)v.v_width, (unsigned long)v.v_height,
++               (unsigned long)v.v_depth, (unsigned long)v.v_rowBytes);
++        return false;
++    }
++    fBase = (IOPhysicalAddress)(v.v_baseAddr & ~0xFFFul);
++    fWidth = (uint32_t)v.v_width; fHeight = (uint32_t)v.v_height; fRowBytes = (uint32_t)v.v_rowBytes;
++    fHT = fWidth + 160; fVT = fHeight + 35; fPclk = (uint64_t)fHT * fVT * 60;
++    // the framebuffer must lie in one of the device's memory BARs, or it is not this device's
++    IOPCIDevice *pci = (IOPCIDevice *)provider;
++    bool inBar = false;
++    for (UInt32 i = 0; i < pci->getDeviceMemoryCount() && !inBar; i++) {
++        IODeviceMemory *m = pci->getDeviceMemoryWithIndex(i);
++        if (m && fBase >= m->getPhysicalAddress() &&
++            fBase + (uint64_t)fRowBytes * fHeight <= m->getPhysicalAddress() + m->getLength()) inBar = true;
++    }
++    if (!inBar) { VFBLOG("firmware framebuffer 0x%llx is not in this device's BARs", (unsigned long long)fBase); return false; }
++    pci->setMemoryEnable(true);
++    if (!IOFramebuffer::start(provider)) return false;
++    if (IODeviceMemory *sm = IODeviceMemory::withRange(fBase, (IOPhysicalLength)fRowBytes * fHeight)) {
++        fSurfMap = sm->map(kIOMapWriteCombineCache); sm->release();
++    }
++    if (fSurfMap) {
++        // head 0 of the GPU's accelerator (NMXAccel watches for this class)
++        setProperty("IOFBDependentID", 0x4E4D58560000001ull, 64);
++        setProperty("IOFBDependentIndex", 0ull, 32);
++    } else VFBLOG("the framebuffer would not map write-combined: no accelerated frames for it");
++    setProperty("built-in", kOSBooleanTrue);
++    fVblTimer = thread_call_allocate(vblFire, this);
++    if (fVblTimer) {
++        uint64_t d; clock_interval_to_deadline((uint32_t)(kFrameNs / 1000), kMicrosecondScale, &d);
++        fVblNext = d; thread_call_enter_delayed(fVblTimer, d);
++    }
++    registerPowerDriver(this, kPowerStates, 2);
++    VFBLOG("%ux%u pitch %u at 0x%llx adopted from the firmware%s", fWidth, fHeight, fRowBytes, (unsigned long long)fBase,
++           fVblTimer ? ", 60 Hz VBL timer" : ", NO VBL TIMER");
++    return true;
++}
++
++void NMXVGAFB::stop(IOService *provider)
++{
++    fStopping = true;
++    if (fVblTimer) { thread_call_cancel(fVblTimer); while (!thread_call_free(fVblTimer)) { thread_call_cancel(fVblTimer); IOSleep(5); } fVblTimer = nullptr; }
++    OSSafeReleaseNULL(fSurfMap);
++    IOFramebuffer::stop(provider);
++}
++
++// NMXAccel's display pipe asks its heads for their scan-out: a CPU mapping and no GPU address, so frames arrive by copy
++IOReturn NMXVGAFB::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4)
++{
++    if (fn && fn->isEqualTo(NVRM_VRAM_FN_SCANOUT)) {
++        NVRMVramRequest *r = (NVRMVramRequest *)p1;
++        if (!r || r->version != NVRM_VRAM_ABI_VERSION) return kIOReturnBadArgument;
++        if (!fSurfMap) return kIOReturnNotReady;
++        r->kva = (void *)fSurfMap->getVirtualAddress();
++        r->phys = 0; r->actualSize = 0;
++        r->width = fWidth; r->height = fHeight; r->pitch = fRowBytes;
++        return kIOReturnSuccess;
++    }
++    return IOFramebuffer::callPlatformFunction(fn, wait, p1, p2, p3, p4);
++}
+diff --git a/kexts/NVRM/accel/nvrm-accel.cpp b/kexts/NVRM/accel/nvrm-accel.cpp
+index 4e946ee..eabf7b2 100644
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -60,6 +60,9 @@ static int gNvAccelArmed = 0;
+ // a headless GPU hands frames to another GPU's WindowServer through system memory, so IOSurfaces must be copied out.
+ static int gNvHeadless = 0;
+ #ifdef NMX_ACCEL
++static bool gNmxVmDisplay = false;   // NMXVGAFB (a VM's display) is published: it becomes head 0 of this accelerator
++#endif
++#ifdef NMX_ACCEL
+ SYSCTL_INT(_debug, OID_AUTO, nmxaccel_headless, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, &gNvHeadless, 0,
+            "1 = AMD/Intel Metal device for apps; frames are copied to the framebuffer WindowServer draws");
+ #else
+@@ -618,13 +621,21 @@ public:
+             ALOG("multi-head: up to %u heads, registration lock %p%s", kNvMaxFB, fRegLock,
+                  fRegLock ? "" : " -- NULL: two sysctl writers could interleave a registration");
+ #ifdef NMX_ACCEL
+-            // AMD/Intel: the Metal device is for apps; WindowServer draws into NMXGPU's framebuffer, and the plugin copies
+-            // finished frames into the IOSurfaces it reads (the headless path NVIDIA laptops use)
+-            nvaccelInstallSysctl();
+-            gNvHeadless = 1;
+-            setProperty("NMXAccelHeadless", kOSBooleanTrue);
+-            ALOG("AMD/Intel accelerator up: Metal device for apps, frames copied to the framebuffer WindowServer draws");
++            // A VM display (NMXVGAFB on QEMU's virtio-vga/std VGA) is this accelerator's head 0: WindowServer composites
++            // on this GPU and the display pipe copies each frame into that framebuffer, as for NMIntelFB under the
++            // NVIDIA accelerator. Otherwise (AMD/Intel hardware): the Metal device is for apps; WindowServer draws into
++            // NMXGPU's framebuffer, and the plugin copies finished frames into the IOSurfaces it reads.
+             OSDictionary *fbm = nullptr;
++            if (OSDictionary *vm = serviceMatching("NMXVGAFB")) {
++                if (OSIterator *it = getMatchingServices(vm)) { gNmxVmDisplay = it->getNextObject() != nullptr; it->release(); }
++                if (gNmxVmDisplay) fbm = vm; else vm->release();
++            }
++            nvaccelInstallSysctl();
++            if (!gNmxVmDisplay) {
++                gNvHeadless = 1;
++                setProperty("NMXAccelHeadless", kOSBooleanTrue);
++                ALOG("AMD/Intel accelerator up: Metal device for apps, frames copied to the framebuffer WindowServer draws");
++            } else ALOG("AMD/Intel accelerator up with a VM display (NMXVGAFB): WindowServer can composite here once armed");
+ #else
+             OSDictionary *fbm = serviceMatching("NVRMNVDAFramebuffer");
+ #endif
+@@ -1138,12 +1149,14 @@ static void nvaccelInstallSysctl(void)
+ {
+     if (gSysctlInstalled) return;
+ #ifdef NMX_ACCEL
+-    // only this one: the NVIDIA accelerator may be loaded too, and owns the debug.nvaccel* names
+     sysctl_register_oid(&sysctl__debug_nmxaccel_headless);
+-    gSysctlInstalled = true;
++    // A VM whose display is NMXVGAFB arms this accelerator through the same names the NVIDIA one uses (no NVIDIA
++    // accelerator runs there). Elsewhere only the headless flag is offered: the NVIDIA accelerator may be loaded too.
++    if (!gNmxVmDisplay) { gSysctlInstalled = true; return; }
+ #else
+-    sysctl_register_oid(&sysctl__debug_nvaccelfb);
+     sysctl_register_oid(&sysctl__debug_nvaccel_headless);
++#endif
++    sysctl_register_oid(&sysctl__debug_nvaccelfb);
+     sysctl_register_oid(&sysctl__debug_nvaccel_vm_alloc);       sysctl_register_oid(&sysctl__debug_nvaccel_vm_alloc_bytes);
+     sysctl_register_oid(&sysctl__debug_nvaccel_vm_dealloc);     sysctl_register_oid(&sysctl__debug_nvaccel_vm_dealloc_bytes);
+     sysctl_register_oid(&sysctl__debug_nvaccel_vm_refused);
+@@ -1173,7 +1186,6 @@ static void nvaccelInstallSysctl(void)
+     sysctl_register_oid(&sysctl__debug_nvaccel_heads_piped);
+     gSysctlInstalled = true;
+     ALOG("sysctl debug.nvaccelfb installed -- `sudo sysctl -w debug.nvaccelfb=1` registers the framebuffer");
+-#endif
+ }
+ 
+ static inline void nvAccelZero(void *p, unsigned long n)
+diff --git a/plugin/NVMTLDevice.m b/plugin/NVMTLDevice.m
+index ed6aea0..33d535b 100644
+--- a/plugin/NVMTLDevice.m
++++ b/plugin/NVMTLDevice.m
+@@ -319,9 +319,11 @@ static bool nvmtl_process_is_allowed(void)
+     // A headless NVIDIA GPU (the display is on the Intel or AMD GPU) is a Metal device for apps only: WindowServer stays
+     // on the GPU that owns the display, as on Apple's two-GPU Macs. The list below cannot express this: "*" matches
+     // WindowServer before its "!WindowServer" line is reached.
++    // AMD/Intel (NMXAccel) is headless unless a VM display (NMXVGAFB) is its head: then WindowServer composites here,
++    // once the accelerator is armed (the "!WindowServer" line below)
+     { int hv = 0; size_t hn = sizeof hv;
+-      if (!strcmp(me, "WindowServer") && (nvmtl_vk_vendor() != 0x10de ||
+-                                          (sysctlbyname("debug.nvaccel_headless", &hv, &hn, NULL, 0) == 0 && hv))) {
++      const char *hname = nvmtl_vk_vendor() != 0x10de ? "debug.nmxaccel_headless" : "debug.nvaccel_headless";
++      if (!strcmp(me, "WindowServer") && (sysctlbyname(hname, &hv, &hn, NULL, 0) != 0 || hv)) {
+           nvlog("  headless GPU: no device for WindowServer (it composites on the GPU that owns the display)"); return false; } }
+     if (getenv("NVMTL_ENABLE")) return true;
+     if (!strcmp(me, "mtlprobe") || !strcmp(me, "nvmtltest") || !strcmp(me, "nvmtlrender")) return true;

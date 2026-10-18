@@ -1,0 +1,172 @@
+From b01999d6dcdd8a6b02dc84817870f4fb8ee728c6 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 20:54:34 +0200
+Subject: [PATCH 12/47] NMXAGDC: report plane 0's colour stages (CSC,
+ linearization, gamma) - no per-frame colour pass
+
+AGDC 0x711 (extended capability) is now answered for types 1 (CSC), 2 (gamma) and 4
+(linearization) on plane 0. Without them CoreDisplay's DisplayPipe::AreOperationsSupportedInHW
+failed and every present ran its software display pipe (RunGPUDisplayPipe -> RunFullDisplayPipe),
+rebuilding the colour tables on all cores: about 60% of WindowServer's time at an idle login window.
+Entry layouts from IOPresentment's IOPresentmentCapabilitiesDisplayPipe::IOPresentmentCreate*Dictionary;
+the values CoreDisplay looks for: gamma type 0x200 (3-channel 16-bit table, 1024 entries),
+linearization type 1 with configuration 0x10 (sRGB) and 0x20 (linear), any CSC entry; flags bit 2.
+The host owns the physical display's colour, so the VM display does not apply these stages. Measured:
+what CoreDisplay now asks for is linearization "linear", identity CSC and an identity gamma table;
+the frame is pixel-identical to the software path; WindowServer's busy time down about 4x
+(libsystem_m 1337 -> 43 samples in 5 s). debug.nmxfb_agdc_gamma=0 turns it off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ kexts/NMXAGDC/gen.py       | 62 ++++++++++++++++++++++++++++++++++++++
+ kexts/NMXAGDC/nmx-agdc.cpp | 41 +++++++++++++++++++++++++
+ 2 files changed, 103 insertions(+)
+
+diff --git a/kexts/NMXAGDC/gen.py b/kexts/NMXAGDC/gen.py
+index 29a7b97..5a31b69 100644
+--- a/kexts/NMXAGDC/gen.py
++++ b/kexts/NMXAGDC/gen.py
+@@ -67,5 +67,67 @@ IOReturn NMXAGDCLoader::callPlatformFunction(const OSSymbol *fn, bool wait, void
+ }''')
+ rep('nvdaAgdcInstallSysctl(); FBLOG("loaded; idle until `sysctl debug.nmxfb_agdc=1`"); return true;',
+     'nvdaAgdcInstallSysctl(); registerService(); FBLOG("loaded; comes up when NMXAccel arms a VM display"); return true;')
++# Plane 0's gamma (AGDC 0x711, extended capability type 2). IOPresentment builds the plane's GammaArray from it; with
++# none, CoreDisplay's DisplayPipe::AreOperationsSupportedInHW fails and every frame runs its software display pipe,
++# which rebuilds the colour tables on the CPU (CombineLUTs on all cores, about 60% of WindowServer's time at an idle
++# login window). The host (QEMU's GL window, KWin) owns the physical display's colour, so the plane takes the table
++# and the VM display does not apply it. Entry layout (0x32c bytes) from IOPresentment's
++# IOPresentmentCapabilitiesDisplayPipe::IOPresentmentCreateGammaDictionary: +0 flags, +4 plane mask (u64), +0xc
++# non-atomic application period (float), +0x10 type, +0x14 fixed format, +0x18 configuration id (u64), +0x20/+0x24
++# minimum/maximum value (float), +0x28 maximum size (u64). Type 0x200 is CoreDisplay's preferred one (a 3-channel
++# table of 16-bit entries, IOPCapabilities::GammaChannelTableEntryCountAndType); the flags are the plane scaler's.
++rep("""    if (gAgdcK5 && (cmd == NVK5_CMD_LINKCONFIG || cmd == NVK5_CMD_FBCAPEX)) {""", """    if (cmd == NVK5_CMD_FBCAPEX && out && outSize && *outSize == sizeof(struct NVAGDCFBExtCap)) {
++        struct NVAGDCFBExtCap *c = (struct NVAGDCFBExtCap *)out;
++        const uint32_t type = c->type;
++        OSBitOrAtomic(type, (volatile UInt32 *)&gAgdc711Types);
++        if ((type == 1 || type == 2 || type == 4) && gAgdcGamma && c->fbIndex == 0) {
++            nvk5_zero(c, sizeof *c); c->fbIndex = 0; c->type = type; c->count = 1;
++            uint8_t *e = c->entry[0];
++            nvk5_put32(e, 0x000, 0x80004);                        // flags; bit 2 is what CoreDisplay checks
++            nvk5_put32(e, 0x004, 1); nvk5_put32(e, 0x008, 0);    // plane 0
++            if (type == 2) {                                      // gamma: a 1024-entry 3-channel 16-bit table
++                nvk5_put32(e, 0x010, 0x200);
++                nvk5_put32(e, 0x020, 0x00000000u);                // 0.0f
++                nvk5_put32(e, 0x024, 0x3f800000u);                // 1.0f
++                nvk5_put32(e, 0x028, 1024); nvk5_put32(e, 0x02c, 0);
++            } else if (type == 4) {                               // linearization: sRGB (config 0x10) and linear (0x20)
++                c->count = 2;
++                nvk5_put32(e, 0x010, 1); nvk5_put32(e, 0x018, 0x10);
++                nvk5_put32(e, 0x024, 0x3f800000u);
++                uint8_t *e2 = c->entry[1];
++                nvk5_put32(e2, 0x000, 0x80004); nvk5_put32(e2, 0x004, 1);
++                nvk5_put32(e2, 0x010, 1); nvk5_put32(e2, 0x018, 0x20);
++                nvk5_put32(e2, 0x024, 0x3f800000u);
++            } else {                                              // CSC: a 3x3 matrix, coefficients -2..2
++                nvk5_put32(e, 0x010, 1);
++                nvk5_put32(e, 0x024, 0xc0000000u);                // -2.0f
++                nvk5_put32(e, 0x028, 0x40000000u);                // 2.0f
++            }
++            OSAddAtomic64(1, &gAgdcGammaAnswers);
++            return kIOReturnSuccess;
++        }
++    }
++    if (gAgdcK5 && (cmd == NVK5_CMD_LINKCONFIG || cmd == NVK5_CMD_FBCAPEX)) {""")
++rep("""static int    gAgdcK5 = 0;""", """static int    gAgdcK5 = 0;
++static int    gAgdcGamma = 1;          // answer plane 0's gamma capability (0x711 type 2)
++static SInt64 gAgdcGammaAnswers = 0;
++static int    gAgdc711Types = 0;       // bit t = an extended-capability query of type t (0x711)""")
++rep("""static void nvdaAgdcInstallSysctl(void)
++{
++""", """static void nvdaAgdcInstallSysctl(void)
++{
++    sysctl_register_oid(&sysctl__debug_nmxfb_agdc_gamma); sysctl_register_oid(&sysctl__debug_nmxfb_agdc_gamma_answers);
++    sysctl_register_oid(&sysctl__debug_nmxfb_agdc_711_types);
++""")
++rep("""static void nvdaAgdcRemoveSysctl(void)
++{
++""", """SYSCTL_INT (_debug, OID_AUTO, nmxfb_agdc_gamma, CTLFLAG_RW | CTLFLAG_LOCKED, &gAgdcGamma, 0, "1 = report plane 0's colour capabilities: CSC, linearization, gamma (read when WindowServer starts)");
++SYSCTL_QUAD(_debug, OID_AUTO, nmxfb_agdc_gamma_answers, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcGammaAnswers, "colour capability queries answered (CSC, linearization, gamma)");
++SYSCTL_INT (_debug, OID_AUTO, nmxfb_agdc_711_types, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdc711Types, 0, "the extended capability types (0x711) asked for, ORed");
++static void nvdaAgdcRemoveSysctl(void)
++{
++    sysctl_unregister_oid(&sysctl__debug_nmxfb_agdc_gamma); sysctl_unregister_oid(&sysctl__debug_nmxfb_agdc_gamma_answers);
++    sysctl_unregister_oid(&sysctl__debug_nmxfb_agdc_711_types);
++""")
+ open(os.path.join(here, "nmx-agdc.cpp"), "w").write("// GENERATED by gen.py from ../NVRMAGDC/nvrm-agdc.cpp. Do not edit.\n" + s)
+ print("nmx-agdc.cpp written")
+diff --git a/kexts/NMXAGDC/nmx-agdc.cpp b/kexts/NMXAGDC/nmx-agdc.cpp
+index 3dcfd66..a063301 100644
+--- a/kexts/NMXAGDC/nmx-agdc.cpp
++++ b/kexts/NMXAGDC/nmx-agdc.cpp
+@@ -42,6 +42,9 @@ static_assert(sizeof(NVAGDCVendorInfo) == 0x2c, "AGDCVendorInfo_t is 0x2c");
+ static_assert(sizeof(NVAGDCGPUCapability) == 0xdc, "AGDCGPUCapability_t is 0xdc");
+ 
+ static int    gAgdcK5 = 0;
++static int    gAgdcGamma = 1;          // answer plane 0's gamma capability (0x711 type 2)
++static SInt64 gAgdcGammaAnswers = 0;
++static int    gAgdc711Types = 0;       // bit t = an extended-capability query of type t (0x711)
+ static SInt64 gAgdcK5Link = 0, gAgdcK5Caps = 0;
+ static int    gAgdcK5Why = 0;
+ static SInt64 gAgdcCmds = 0, gAgdcUnsupported = 0;
+@@ -145,6 +148,37 @@ IOReturn NMXDeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned l
+         gAgdcMaxFBOut = (int)c->maxFramebuffers;
+         return kIOReturnSuccess;
+     }
++    if (cmd == NVK5_CMD_FBCAPEX && out && outSize && *outSize == sizeof(struct NVAGDCFBExtCap)) {
++        struct NVAGDCFBExtCap *c = (struct NVAGDCFBExtCap *)out;
++        const uint32_t type = c->type;
++        OSBitOrAtomic(type, (volatile UInt32 *)&gAgdc711Types);
++        if ((type == 1 || type == 2 || type == 4) && gAgdcGamma && c->fbIndex == 0) {
++            nvk5_zero(c, sizeof *c); c->fbIndex = 0; c->type = type; c->count = 1;
++            uint8_t *e = c->entry[0];
++            nvk5_put32(e, 0x000, 0x80004);                        // flags; bit 2 is what CoreDisplay checks
++            nvk5_put32(e, 0x004, 1); nvk5_put32(e, 0x008, 0);    // plane 0
++            if (type == 2) {                                      // gamma: a 1024-entry 3-channel 16-bit table
++                nvk5_put32(e, 0x010, 0x200);
++                nvk5_put32(e, 0x020, 0x00000000u);                // 0.0f
++                nvk5_put32(e, 0x024, 0x3f800000u);                // 1.0f
++                nvk5_put32(e, 0x028, 1024); nvk5_put32(e, 0x02c, 0);
++            } else if (type == 4) {                               // linearization: sRGB (config 0x10) and linear (0x20)
++                c->count = 2;
++                nvk5_put32(e, 0x010, 1); nvk5_put32(e, 0x018, 0x10);
++                nvk5_put32(e, 0x024, 0x3f800000u);
++                uint8_t *e2 = c->entry[1];
++                nvk5_put32(e2, 0x000, 0x80004); nvk5_put32(e2, 0x004, 1);
++                nvk5_put32(e2, 0x010, 1); nvk5_put32(e2, 0x018, 0x20);
++                nvk5_put32(e2, 0x024, 0x3f800000u);
++            } else {                                              // CSC: a 3x3 matrix, coefficients -2..2
++                nvk5_put32(e, 0x010, 1);
++                nvk5_put32(e, 0x024, 0xc0000000u);                // -2.0f
++                nvk5_put32(e, 0x028, 0x40000000u);                // 2.0f
++            }
++            OSAddAtomic64(1, &gAgdcGammaAnswers);
++            return kIOReturnSuccess;
++        }
++    }
+     if (gAgdcK5 && (cmd == NVK5_CMD_LINKCONFIG || cmd == NVK5_CMD_FBCAPEX)) {
+         IOReturn k5 = nvdaK5Answer(fFB, cmd, in, inSize, out, outSize);
+         if (k5 != kIOReturnUnsupported) return k5;
+@@ -274,8 +308,13 @@ SYSCTL_INT (_debug, OID_AUTO, nmxfb_agdc_k5_asked, CTLFLAG_RD | CTLFLAG_LOCKED,
+ SYSCTL_INT (_debug, OID_AUTO, nmxfb_agdc_k5_link_mask, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcK5LinkMask, 0, "bit i = kAGDCLinkConfig answered for index i");
+ SYSCTL_INT (_debug, OID_AUTO, nmxfb_agdc_k5_caps_mask, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcK5CapsMask, 0, "bit i = the plane-scaler capability answered for index i");
+ SYSCTL_INT (_debug, OID_AUTO, nmxfb_agdc_k5_last_refused_idx, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcK5LastRefusedIdx, 0, "the index the last BADARG/NOTFOUND refusal named (-1 none); an Unsupported 0x711 type shows in k5_asked only");
++SYSCTL_INT (_debug, OID_AUTO, nmxfb_agdc_gamma, CTLFLAG_RW | CTLFLAG_LOCKED, &gAgdcGamma, 0, "1 = report plane 0's colour capabilities: CSC, linearization, gamma (read when WindowServer starts)");
++SYSCTL_QUAD(_debug, OID_AUTO, nmxfb_agdc_gamma_answers, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcGammaAnswers, "colour capability queries answered (CSC, linearization, gamma)");
++SYSCTL_INT (_debug, OID_AUTO, nmxfb_agdc_711_types, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdc711Types, 0, "the extended capability types (0x711) asked for, ORed");
+ static void nvdaAgdcRemoveSysctl(void)
+ {
++    sysctl_unregister_oid(&sysctl__debug_nmxfb_agdc_gamma); sysctl_unregister_oid(&sysctl__debug_nmxfb_agdc_gamma_answers);
++    sysctl_unregister_oid(&sysctl__debug_nmxfb_agdc_711_types);
+     sysctl_unregister_oid(&sysctl__debug_nmxfb_agdc); sysctl_unregister_oid(&sysctl__debug_nmxfb_agdc_cmds);
+     sysctl_unregister_oid(&sysctl__debug_nmxfb_agdc_refused); sysctl_unregister_oid(&sysctl__debug_nmxfb_agdc_last_refused);
+     sysctl_unregister_oid(&sysctl__debug_nmxfb_agdc_k5); sysctl_unregister_oid(&sysctl__debug_nmxfb_agdc_k5_link);
+@@ -287,6 +326,8 @@ static void nvdaAgdcRemoveSysctl(void)
+ }
+ static void nvdaAgdcInstallSysctl(void)
+ {
++    sysctl_register_oid(&sysctl__debug_nmxfb_agdc_gamma); sysctl_register_oid(&sysctl__debug_nmxfb_agdc_gamma_answers);
++    sysctl_register_oid(&sysctl__debug_nmxfb_agdc_711_types);
+     sysctl_register_oid(&sysctl__debug_nmxfb_agdc); sysctl_register_oid(&sysctl__debug_nmxfb_agdc_cmds);
+     sysctl_register_oid(&sysctl__debug_nmxfb_agdc_refused); sysctl_register_oid(&sysctl__debug_nmxfb_agdc_last_refused);
+     sysctl_register_oid(&sysctl__debug_nmxfb_agdc_k5); sysctl_register_oid(&sysctl__debug_nmxfb_agdc_k5_link);

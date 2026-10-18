@@ -1,0 +1,44 @@
+From efd51ce75176b8766c1885a87710a835ae8544ef Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 05:07:32 +0200
+Subject: [PATCH 17/50] kext: one-shot opt-in through NVRAM nullmoth-gpu-once
+ (a later panic falls back to a start without the driver)
+
+---
+ xnu/nmx_kext.cpp | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/gpu-port/xkpi/xnu/nmx_kext.cpp b/gpu-port/xkpi/xnu/nmx_kext.cpp
+index 64ed032..28922c2 100644
+--- a/gpu-port/xkpi/xnu/nmx_kext.cpp
++++ b/gpu-port/xkpi/xnu/nmx_kext.cpp
+@@ -61,6 +61,29 @@ static bool opted_in(IOPCIDevice *pci, uint16_t vendor)
+         return false;
+     if (PE_parse_boot_argn(vendor == AMD_VENDOR ? "nmxamd" : "nmxintel", &v, sizeof(v)) && v != 0)
+         return true;
++    /*
++     * One-shot opt-in for test rounds: the NVRAM variable nullmoth-gpu-once is consumed here, so a start that panics
++     * or hangs later (not only during the attach the boot guard covers) is followed by a start without the driver.
++     */
++    if (IORegistryEntry *e = IORegistryEntry::fromPath("/options", gIODTPlane)) {
++        bool once = false;
++        if (IODTNVRAM *n = OSDynamicCast(IODTNVRAM, e)) {
++            if (OSObject *o = n->copyProperty("nullmoth-gpu-once")) {
++                o->release();
++                once = true;
++                if (const OSSymbol *k = OSSymbol::withCString("nullmoth-gpu-once")) {
++                    n->removeProperty(k);
++                    k->release();
++                }
++                n->sync();
++            }
++        }
++        e->release();
++        if (once) {
++            IOLog("NullMoth GPU: one-shot opt-in (nullmoth-gpu-once) used for this start\n");
++            return true;
++        }
++    }
+     OSObject *p = pci->getProperty("nullmoth-gpu");
+     if (OSBoolean *b = OSDynamicCast(OSBoolean, p))
+         return b->isTrue();

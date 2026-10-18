@@ -1,0 +1,371 @@
+From 9d65eeb7f4c0c0452480c2c97fe5603116e83031 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 18:37:41 +0200
+Subject: [PATCH 41/47] NMXVGAFB: the mode follows the host window
+
+QEMU's window at boot is often not the size it will be (a fresh window
+is 640x522 until maximised), so the start mode was the firmware's. A
+display event (debounced 300 ms) now reads the host's size and EDID
+again, advertises the size as a new mode ID and raises the connection-
+change interrupt; IOGraphics re-probes, WindowServer sets the new
+default mode, and setDisplayMode gives the scan-out the new geometry.
+
+The scan-out buffer is allocated once at start, while physical memory is
+unfragmented, for the start mode or 3840x2400, whichever is larger, with
+one blob over it; a switch is a new SET_SCANOUT_BLOB geometry on it.
+Allocating a buffer per mode and freeing the old one panicked
+(pmap_recycle_page: page is referenced - IOGraphics still mapped the old
+aperture) and the VM sat in the debugger.
+
+Tested: 2880x1710 <-> 1920x1200 / 1550x980 / ... and back, 25 cycles
+under pointer load, zero-copy flips throughout.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ kexts/NMXVGAFB/nmxvgafb.cpp | 214 ++++++++++++++++++++++++++++--------
+ 1 file changed, 168 insertions(+), 46 deletions(-)
+
+diff --git a/kexts/NMXVGAFB/nmxvgafb.cpp b/kexts/NMXVGAFB/nmxvgafb.cpp
+index 06811fd..161861a 100644
+--- a/kexts/NMXVGAFB/nmxvgafb.cpp
++++ b/kexts/NMXVGAFB/nmxvgafb.cpp
+@@ -67,7 +67,12 @@ class NMXVGAFB : public IOFramebuffer {
+     // every VBL; without it (or when it fails) the scan-out stays the VGA BAR the firmware lit
+     NMXVirtioGPU fVirtio;
+     IOBufferMemoryDescriptor *fScanBuf = nullptr;
+-    static constexpr uint32_t kScanResource = 1;
++    // The own buffer's blob (surfaces' blobs start at 16). It is allocated once, at start while physical memory is
++    // still unfragmented, large enough for any mode taken later (kScanCapPx or the start mode): a 20 MB contiguous
++    // allocation after login held the free-page lock until every CPU spun on it (the VM hung on a mode switch).
++    static constexpr uint32_t fScanRes = 1;
++    static constexpr uint64_t kScanCapPx = 3840ull * 2400;
++    uint64_t fScanCap = 0;                // bytes
+     bool fVirtioOn = false;
+     bool startVirtio(IOPCIDevice *pci, IOPhysicalAddress vgaBase);
+     // Hardware cursor over virtio-gpu's cursor queue: QEMU's GTK display makes the image the host pointer's shape, so
+@@ -87,7 +92,7 @@ class NMXVGAFB : public IOFramebuffer {
+     static constexpr unsigned kSurfBlobs = 8;
+     SurfBlob fSurf[kSurfBlobs] = {};
+     uint32_t fNextRes = 16;
+-    volatile uint32_t fCurRes = 0;        // the resource on scanout 0 (kScanResource or a surface's)
++    volatile uint32_t fCurRes = 0;        // the resource on scanout 0 (fScanRes or a surface's)
+     uint32_t fCurW = 0, fCurH = 0;
+     bool fCurFinal = false;               // the surface on scanout 0 came with NMX_SCANOUT_FINAL: no VBL re-flush
+     uint64_t fLastPresent = 0;            // mach time of the last scanoutSurface (a present)
+@@ -132,7 +137,18 @@ private:
+     uint32_t fRefreshMHz = 120000;
+     uint32_t fHT = 0, fVT = 0, fHSO = 48, fHSW = 32, fVSO = 3, fVSW = 5;
+     uint64_t fPclk = 0;
+-    void setTiming();
++    struct Timing { uint32_t ht, vt, hso, hsw, vso, vsw, mhz; uint64_t pclk, frameNs; };
++    // a mode's timing: the EDID's first detailed timing when it describes w x h, else reduced blanking at fHz
++    Timing timingFor(uint32_t w, uint32_t h) const;
++    static uint32_t pitchFor(uint32_t w) { return (w * 4 + 63) & ~63u; }
++    void setTiming();                     // the active mode's (fWidth x fHeight) into the fields above
++    void publishTiming();                 // NVRMTiming, the record NMXAGDC's link-config answers read
++    IODisplayModeID fActID = 1, fAdvID = 1, fNextID = 2;
++    uint32_t fAdvW = 0, fAdvH = 0;
++    thread_call_t fHotplug = nullptr;
++    static void displayEvent(void *p0);   // from the virtio interrupt: the host resized its window
++    static void hotplugFire(thread_call_param_t p0, thread_call_param_t);
++    bool switchMode();
+     // the host's EDID for scanout 0, handed to IOGraphics (the display shows up as what QEMU describes)
+     uint8_t fEdid[256] = {};
+     uint32_t fEdidLen = 0;
+@@ -168,8 +184,8 @@ private:
+         uint64_t now = mach_absolute_time();
+         if (me->fVirtioOn && me->fScanLock && IOLockTryLock(me->fScanLock)) {
+             uint64_t sinceNs = 0;
+-            if (me->fCurRes != kScanResource) absolutetime_to_nanoseconds(now - me->fLastPresent, &sinceNs);
+-            const bool flush = sinceNs < kSurfFlushNs && !(me->fCurRes != kScanResource && me->fCurFinal);
++            if (me->fCurRes != fScanRes) absolutetime_to_nanoseconds(now - me->fLastPresent, &sinceNs);
++            const bool flush = sinceNs < kSurfFlushNs && !(me->fCurRes != fScanRes && me->fCurFinal);
+             if (flush) me->fVirtio.flush(me->fCurRes, 0, 0, me->fCurW, me->fCurH);
+             if (!flush && me->fFlushing && me->fIdleLogs < 3) {
+                 me->fIdleLogs++;
+@@ -218,42 +234,55 @@ public:
+     }
+     IODeviceMemory *getVRAMRange() override { return getApertureRange(kIOFBSystemAperture); }
+     const char *getPixelFormats() override { return IO32BitDirectPixels "\0"; }
++    // Modes: the active one (fActID, fWidth x fHeight) and the advertised one (fAdvID, the host's latest size). They
++    // differ between a host resize (displayEvent) and WindowServer's switch to the new mode (setDisplayMode).
+     IOItemCount getDisplayModeCount() override { return 1; }
+-    IOReturn getDisplayModes(IODisplayModeID *modes) override { modes[0] = 1; return kIOReturnSuccess; }
++    IOReturn getDisplayModes(IODisplayModeID *modes) override { modes[0] = fAdvID; return kIOReturnSuccess; }
++    bool modeSize(IODisplayModeID mode, uint32_t *w, uint32_t *h) const {
++        if (mode == fAdvID) { *w = fAdvW; *h = fAdvH; return true; }
++        if (mode == fActID) { *w = fWidth; *h = fHeight; return true; }
++        return false;
++    }
+     IOReturn getInformationForDisplayMode(IODisplayModeID mode, IODisplayModeInformation *info) override {
+-        if (mode != 1 || !info) return kIOReturnBadArgument;
++        uint32_t w, h;
++        if (!info || !modeSize(mode, &w, &h)) return kIOReturnBadArgument;
++        const Timing t = timingFor(w, h);
+         bzero(info, sizeof(*info));
+-        info->maxDepthIndex = 0; info->nominalWidth = fWidth; info->nominalHeight = fHeight;
+-        info->refreshRate = (IOFixed1616)(((uint64_t)fRefreshMHz << 16) / 1000); info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
++        info->maxDepthIndex = 0; info->nominalWidth = w; info->nominalHeight = h;
++        info->refreshRate = (IOFixed1616)(((uint64_t)t.mhz << 16) / 1000);
++        info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | (mode == fAdvID ? kDisplayModeDefaultFlag : 0);
+         return kIOReturnSuccess;
+     }
+     UInt64 getPixelFormatsForDisplayMode(IODisplayModeID, IOIndex) override { return 0; }
+     IOReturn getPixelInformation(IODisplayModeID mode, IOIndex depth, IOPixelAperture aperture, IOPixelInformation *pi) override {
+-        if (mode != 1 || depth != 0 || aperture != kIOFBSystemAperture || !pi) return kIOReturnUnsupportedMode;
++        uint32_t w, h;
++        if (!modeSize(mode, &w, &h) || depth != 0 || aperture != kIOFBSystemAperture || !pi) return kIOReturnUnsupportedMode;
+         bzero(pi, sizeof(*pi));
+-        pi->bytesPerRow = fRowBytes; pi->bitsPerPixel = 32; pi->pixelType = kIORGBDirectPixels;
++        pi->bytesPerRow = mode == fActID ? fRowBytes : pitchFor(w); pi->bitsPerPixel = 32; pi->pixelType = kIORGBDirectPixels;
+         pi->componentCount = 3; pi->bitsPerComponent = 8;
+         pi->componentMasks[0] = 0x00FF0000; pi->componentMasks[1] = 0x0000FF00; pi->componentMasks[2] = 0x000000FF;
+         strlcpy(pi->pixelFormat, IO32BitDirectPixels, sizeof(pi->pixelFormat));
+-        pi->activeWidth = fWidth; pi->activeHeight = fHeight;
++        pi->activeWidth = w; pi->activeHeight = h;
+         return kIOReturnSuccess;
+     }
+-    IOReturn getCurrentDisplayMode(IODisplayModeID *mode, IOIndex *depth) override { *mode = 1; *depth = 0; return kIOReturnSuccess; }
++    IOReturn getCurrentDisplayMode(IODisplayModeID *mode, IOIndex *depth) override { *mode = fActID; *depth = 0; return kIOReturnSuccess; }
+     IOReturn getStartupDisplayMode(IODisplayModeID *mode, IOIndex *depth) override { return getCurrentDisplayMode(mode, depth); }
+     IOReturn getTimingInfoForDisplayMode(IODisplayModeID mode, IOTimingInformation *info) override {
+-        if (mode != 1 || !info) return kIOReturnUnsupportedMode;
++        uint32_t w, h;
++        if (!info || !modeSize(mode, &w, &h)) return kIOReturnUnsupportedMode;
++        const Timing t = timingFor(w, h);
+         bzero(info, sizeof(*info));
+         info->appleTimingID = kIOTimingIDInvalid;
+         IODetailedTimingInformationV2 &d = info->detailedInfo.v2;
+-        d.pixelClock = d.minPixelClock = d.maxPixelClock = fPclk;
+-        d.horizontalActive = fWidth; d.horizontalBlanking = fHT - fWidth;
+-        d.horizontalSyncOffset = fHSO; d.horizontalSyncPulseWidth = fHSW;
+-        d.verticalActive = fHeight; d.verticalBlanking = fVT - fHeight;
+-        d.verticalSyncOffset = fVSO; d.verticalSyncPulseWidth = fVSW;
++        d.pixelClock = d.minPixelClock = d.maxPixelClock = t.pclk;
++        d.horizontalActive = w; d.horizontalBlanking = t.ht - w;
++        d.horizontalSyncOffset = t.hso; d.horizontalSyncPulseWidth = t.hsw;
++        d.verticalActive = h; d.verticalBlanking = t.vt - h;
++        d.verticalSyncOffset = t.vso; d.verticalSyncPulseWidth = t.vsw;
+         info->flags = kIODetailedTimingValid;
+         return kIOReturnSuccess;
+     }
+-    IOReturn setDisplayMode(IODisplayModeID mode, IOIndex depth) override { return (mode == 1 && depth == 0) ? kIOReturnSuccess : kIOReturnUnsupported; }
++    IOReturn setDisplayMode(IODisplayModeID mode, IOIndex depth) override;
+     IOItemCount getConnectionCount() override { return 1; }
+     IOReturn callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4) override;
+     IOReturn registerForInterruptType(IOSelect type, IOFBInterruptProc proc, OSObject *target, void *ref, void **iref) override {
+@@ -321,8 +350,8 @@ public:
+         memcpy(data, fEdid + (blockNumber - 1) * 128, 128); *length = 128;
+         return kIOReturnSuccess;
+     }
+-    IOReturn connectFlags(IOIndex, IODisplayModeID, IOOptionBits *flags) override {
+-        if (flags) *flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
++    IOReturn connectFlags(IOIndex, IODisplayModeID mode, IOOptionBits *flags) override {
++        if (flags) *flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | (mode == fAdvID ? kDisplayModeDefaultFlag : 0);
+         return kIOReturnSuccess;
+     }
+ };
+@@ -578,6 +607,7 @@ bool NMXVGAFB::start(IOService *provider)
+         else if (!startVirtio(pci, fBase)) VFBLOG("start: no virtio-gpu scan-out - the VGA BAR stays the scan-out");
+     }
+     setTiming();
++    fAdvW = fWidth; fAdvH = fHeight;
+     VFBLOG("start: %ux%u pitch %u at 0x%llx, %u.%03u Hz, calling IOFramebuffer::start", fWidth, fHeight, fRowBytes,
+            (unsigned long long)fBase, fRefreshMHz / 1000, fRefreshMHz % 1000);
+     if (!IOFramebuffer::start(provider)) { VFBLOG("start: IOFramebuffer::start failed"); return false; }
+@@ -597,11 +627,9 @@ bool NMXVGAFB::start(IOService *provider)
+     setProperty("built-in", kOSBooleanTrue);
+     // the timing AGDC link-config answers read (NMXAGDC, from NVRMAGDC: NVRMFB publishes the same record); the same
+     // numbers as getTimingInfoForDisplayMode: pixel clock in Hz, refresh in mHz, sync polarity positive
+-    {
+-        UInt32 k5[13] = { 0x4b350001u, (UInt32)fPclk, fWidth, fWidth + fHSO, fWidth + fHSO + fHSW, fHT, fHeight,
+-                          fHeight + fVSO, fHeight + fVSO + fVSW, fVT, fRefreshMHz, 1u, 1u };
+-        if (OSData *k5d = OSData::withBytes(k5, sizeof k5)) { setProperty("NVRMTiming", k5d); k5d->release(); }
+-    }
++    publishTiming();
++    if (fVirtioOn && (fHotplug = thread_call_allocate(hotplugFire, this)))
++        fVirtio.setDisplayEventHandler(displayEvent, this);
+     if (fVirtioOn && OSCompareAndSwapPtr(nullptr, this, (void * volatile *)&gVtInst)) {
+         sysctl_register_oid(&sysctl__debug_nmxfb_vtiming);
+         sysctl_register_oid(&sysctl__debug_nmxfb_vtrace);
+@@ -647,6 +675,8 @@ void NMXVGAFB::stop(IOService *provider)
+         sysctl_unregister_oid(&sysctl__debug_nmxfb_shot);
+     }
+     if (fHoldCap) { thread_call_cancel(fHoldCap); while (!thread_call_free(fHoldCap)) { thread_call_cancel(fHoldCap); IOSleep(5); } fHoldCap = nullptr; }
++    fVirtio.setDisplayEventHandler(nullptr, nullptr);
++    if (fHotplug) { thread_call_cancel(fHotplug); while (!thread_call_free(fHotplug)) { thread_call_cancel(fHotplug); IOSleep(5); } fHotplug = nullptr; }
+     releaseHold("stopping");
+     OSSafeReleaseNULL(fAccel);
+     if (fVblThread) {
+@@ -696,7 +726,10 @@ bool NMXVGAFB::startVirtio(IOPCIDevice *pci, IOPhysicalAddress vgaBase)
+     if (en && hw >= 1024 && hh >= 600 && hw <= 7680 && hh <= 4320) {
+         fWidth = hw; fHeight = hh; fRowBytes = (hw * 4 + 63) & ~63u;
+     } else VFBLOG("virtio-gpu: keeping the firmware's %ux%u", fWidth, fHeight);
+-    const uint64_t bytes = ((uint64_t)fRowBytes * fHeight + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
++    uint64_t bytes = (uint64_t)fRowBytes * fHeight;
++    if (bytes < kScanCapPx * 4) bytes = kScanCapPx * 4;
++    bytes = (bytes + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
++    fScanCap = bytes;
+     fScanBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+         kIODirectionInOut | kIOMemoryPhysicallyContiguous, bytes, 0x000000FFFFFFF000ull);
+     if (!fScanBuf) { VFBLOG("virtio-gpu: no %llu bytes of contiguous memory for the scan-out", bytes); fVirtio.reset(); return false; }
+@@ -711,9 +744,9 @@ bool NMXVGAFB::startVirtio(IOPCIDevice *pci, IOPhysicalAddress vgaBase)
+         }
+         vm->release();
+     }
+-    if (!fVirtio.createBlob(kScanResource, phys, bytes) ||
+-        !fVirtio.setScanoutBlob(kScanResource, fWidth, fHeight, fRowBytes) ||
+-        !fVirtio.flush(kScanResource, 0, 0, fWidth, fHeight)) {
++    if (!fVirtio.createBlob(fScanRes, phys, bytes) ||
++        !fVirtio.setScanoutBlob(fScanRes, fWidth, fHeight, fRowBytes) ||
++        !fVirtio.flush(fScanRes, 0, 0, fWidth, fHeight)) {
+         VFBLOG("virtio-gpu: the blob scan-out was refused - back to VGA");
+         fVirtio.reset();
+         OSSafeReleaseNULL(fScanBuf);
+@@ -722,7 +755,7 @@ bool NMXVGAFB::startVirtio(IOPCIDevice *pci, IOPhysicalAddress vgaBase)
+     fBase = (IOPhysicalAddress)phys;
+     startCursor();
+     fScanLock = IOLockAlloc();
+-    fCurRes = kScanResource; fCurW = fWidth; fCurH = fHeight;
++    fCurRes = fScanRes; fCurW = fWidth; fCurH = fHeight;
+     fVirtioOn = true;
+     setProperty("NMXVirtioScanout", true);
+     VFBLOG("virtio-gpu: scan-out is a %ux%u blob in guest RAM at 0x%llx (was VGA 0x%llx)", fWidth, fHeight,
+@@ -999,25 +1032,114 @@ IOReturn NMXVGAFB::setCursorState(SInt32 x, SInt32 y, bool visible)
+     return kIOReturnSuccess;
+ }
+ 
+-// the mode's timing: the EDID's first detailed timing when it describes this mode, else reduced blanking at fHz
+-void NMXVGAFB::setTiming()
++NMXVGAFB::Timing NMXVGAFB::timingFor(uint32_t w, uint32_t h) const
+ {
++    Timing t;
+     auto d = [this](unsigned i) -> uint32_t { return fEdid[54 + i]; };     // the first detailed timing descriptor
+     const uint64_t pclk = (uint64_t)(d(0) | d(1) << 8) * 10000;
+     const uint32_t ha = d(2) | (d(4) & 0xf0) << 4, hb = d(3) | (d(4) & 0x0f) << 8;
+     const uint32_t va = d(5) | (d(7) & 0xf0) << 4, vb = d(6) | (d(7) & 0x0f) << 8;
+-    if (!fHzForced && fEdidLen >= 128 && pclk && ha == fWidth && va == fHeight && hb && vb) {
+-        fHT = ha + hb; fVT = va + vb; fPclk = pclk;
+-        fHSO = d(8) | (d(11) & 0xc0) << 2; fHSW = d(9) | (d(11) & 0x30) << 4;
+-        fVSO = d(10) >> 4 | (d(11) & 0x0c) << 2; fVSW = (d(10) & 0x0f) | (d(11) & 0x03) << 4;
++    if (!fHzForced && fEdidLen >= 128 && pclk && ha == w && va == h && hb && vb) {
++        t.ht = ha + hb; t.vt = va + vb; t.pclk = pclk;
++        t.hso = d(8) | (d(11) & 0xc0) << 2; t.hsw = d(9) | (d(11) & 0x30) << 4;
++        t.vso = d(10) >> 4 | (d(11) & 0x0c) << 2; t.vsw = (d(10) & 0x0f) | (d(11) & 0x03) << 4;
+     } else {
+-        fHT = fWidth + 160; fVT = fHeight + 35; fPclk = (uint64_t)fHT * fVT * fHz;
+-        fHSO = 48; fHSW = 32; fVSO = 3; fVSW = 5;
++        t.ht = w + 160; t.vt = h + 35; t.pclk = (uint64_t)t.ht * t.vt * fHz;
++        t.hso = 48; t.hsw = 32; t.vso = 3; t.vsw = 5;
+     }
+-    const uint64_t frame = (uint64_t)fHT * fVT;
+-    fFrameNs = frame * 1000000000ull / fPclk;
+-    fRefreshMHz = (uint32_t)((fPclk * 1000 + frame / 2) / frame);
+-    fHz = (fRefreshMHz + 500) / 1000;
++    const uint64_t frame = (uint64_t)t.ht * t.vt;
++    t.frameNs = frame * 1000000000ull / t.pclk;
++    t.mhz = (uint32_t)((t.pclk * 1000 + frame / 2) / frame);
++    return t;
++}
++
++void NMXVGAFB::setTiming()
++{
++    const Timing t = timingFor(fWidth, fHeight);
++    fHT = t.ht; fVT = t.vt; fHSO = t.hso; fHSW = t.hsw; fVSO = t.vso; fVSW = t.vsw; fPclk = t.pclk;
++    fFrameNs = t.frameNs; fRefreshMHz = t.mhz;
++    if (!fHzForced) fHz = (fRefreshMHz + 500) / 1000;
++    if (fVblLock) { IOLockLock(fVblLock); nanoseconds_to_absolutetime(fFrameNs, &fPeriodAbs); IOLockUnlock(fVblLock); }
++}
++
++void NMXVGAFB::publishTiming()
++{
++    UInt32 k5[13] = { 0x4b350001u, (UInt32)fPclk, fWidth, fWidth + fHSO, fWidth + fHSO + fHSW, fHT, fHeight,
++                      fHeight + fVSO, fHeight + fVSO + fVSW, fVT, fRefreshMHz, 1u, 1u };
++    if (OSData *k5d = OSData::withBytes(k5, sizeof k5)) { setProperty("NVRMTiming", k5d); k5d->release(); }
++}
++
++void NMXVGAFB::displayEvent(void *p0)
++{
++    NMXVGAFB *me = (NMXVGAFB *)p0;
++    if (me->fStopping || !me->fHotplug) return;
++    // a window being dragged larger sends a stream of these: act once it has settled
++    uint64_t d; clock_interval_to_deadline(300, kMillisecondScale, &d);
++    thread_call_enter_delayed(me->fHotplug, d);
++}
++
++/*
++ * The host's display changed (QEMU: the window was resized). The new size becomes the advertised mode - a new mode ID,
++ * so IOGraphics and WindowServer see a different mode, not one that changed under them - and the connection-change
++ * interrupt makes IOGraphics probe the modes (and the EDID, which QEMU regenerated for the size) again. WindowServer
++ * then sets it as the default, and setDisplayMode switches the scan-out.
++ */
++void NMXVGAFB::hotplugFire(thread_call_param_t p0, thread_call_param_t)
++{
++    NMXVGAFB *me = (NMXVGAFB *)p0;
++    if (me->fStopping || !me->fVirtioOn) return;
++    uint32_t w = 0, h = 0; bool en = false;
++    if (!me->fVirtio.displayInfo(&w, &h, &en)) return;
++    if (!en || w < 1024 || h < 600 || w > 7680 || h > 4320) {
++        VFBLOG("display event: host scanout 0 is %ux%u (%s) - not a mode, keeping %ux%u", w, h, en ? "enabled" : "disabled",
++               me->fAdvW, me->fAdvH);
++        return;
++    }
++    if (w == me->fAdvW && h == me->fAdvH) return;
++    uint8_t e[sizeof me->fEdid]; uint32_t elen = 0;
++    if (me->fVirtio.edid(e, sizeof e, &elen)) { memcpy(me->fEdid, e, elen); me->fEdidLen = elen; }
++    if (w == me->fWidth && h == me->fHeight) me->fAdvID = me->fActID;
++    else me->fAdvID = me->fNextID++;
++    me->fAdvW = w; me->fAdvH = h;
++    VFBLOG("display event: the host shows %ux%u - mode %d advertised (active %d, %ux%u)", w, h, (int)me->fAdvID,
++           (int)me->fActID, me->fWidth, me->fHeight);
++    if (me->fConnect.proc) me->fConnect.proc(me->fConnect.target, me->fConnect.ref);
++}
++
++IOReturn NMXVGAFB::setDisplayMode(IODisplayModeID mode, IOIndex depth)
++{
++    if (depth != 0) return kIOReturnUnsupported;
++    if (mode == fActID) return kIOReturnSuccess;
++    if (mode != fAdvID) return kIOReturnUnsupported;
++    return switchMode() ? kIOReturnSuccess : kIOReturnNoMemory;
++}
++
++// the scan-out takes the advertised size within the same buffer and blob (a new SET_SCANOUT_BLOB geometry); surface
++// blobs of the old size go
++bool NMXVGAFB::switchMode()
++{
++    if (!fVirtioOn || !fScanLock) return false;
++    const uint32_t w = fAdvW, h = fAdvH, pitch = pitchFor(w);
++    if ((uint64_t)pitch * h > fScanCap) {
++        VFBLOG("mode %d: %ux%u needs %llu bytes, the scan-out buffer has %llu", (int)fAdvID, w, h,
++               (unsigned long long)pitch * h, (unsigned long long)fScanCap);
++        return false;
++    }
++    IOLockLock(fScanLock);
++    bzero(fScanBuf->getBytesNoCopy(), (size_t)pitch * h);
++    const bool ok = fVirtio.setScanoutBlob(fScanRes, w, h, pitch) && fVirtio.flush(fScanRes, 0, 0, w, h);
++    if (ok) {
++        for (auto &b : fSurf) dropSurfBlob(b);
++        fCurRes = fScanRes; fCurW = w; fCurH = h; fCurFinal = false;
++        fWidth = w; fHeight = h; fRowBytes = pitch;
++        fActID = fAdvID;
++    }
++    IOLockUnlock(fScanLock);
++    if (!ok) { VFBLOG("mode %d: the host refused the %ux%u scan-out", (int)fAdvID, w, h); return false; }
++    setTiming();
++    publishTiming();
++    VFBLOG("mode %d: scan-out %ux%u pitch %u, %u.%03u Hz", (int)fActID, w, h, pitch, fRefreshMHz / 1000, fRefreshMHz % 1000);
++    return true;
+ }
+ 
+ IOReturn NMXVGAFB::snapshot(void *dst, size_t cap, size_t *len)
+@@ -1045,8 +1167,8 @@ IOReturn NMXVGAFB::scanoutHome()
+     if (!fVirtioOn || !fScanLock) return kIOReturnNotReady;
+     IOLockLock(fScanLock);
+     IOReturn ret = kIOReturnSuccess;
+-    if (fCurRes != kScanResource) {
+-        if (fVirtio.setScanoutBlob(kScanResource, fWidth, fHeight, fRowBytes)) { fCurRes = kScanResource; fCurW = fWidth; fCurH = fHeight; }
++    if (fCurRes != fScanRes) {
++        if (fVirtio.setScanoutBlob(fScanRes, fWidth, fHeight, fRowBytes)) { fCurRes = fScanRes; fCurW = fWidth; fCurH = fHeight; }
+         else ret = kIOReturnIOError;
+     }
+     IOLockUnlock(fScanLock);

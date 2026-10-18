@@ -1,0 +1,38 @@
+From 227ad8eee849ea97e6993f4bd4494c7727567568 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 13:13:27 +0200
+Subject: [PATCH 30/47] plugin: save a failing translator input while
+ /tmp/nvmtl-xlate-fail exists
+
+A shader the translator refuses makes Apple's GL renderer fall back to
+software vertex processing for every draw with that program (Minecraft:
+2 fps). The saved LLVM IR reproduces the failure with the host-side
+metal2vulkan CLI.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugin/NVMTLLibraryLoad.m | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/plugin/NVMTLLibraryLoad.m b/plugin/NVMTLLibraryLoad.m
+index 64ca5c0..1d93be0 100644
+--- a/plugin/NVMTLLibraryLoad.m
++++ b/plugin/NVMTLLibraryLoad.m
+@@ -781,7 +781,16 @@ NSData *nvmtl_compile_library_entry(NSData *air, NSString *ll, NSString *stage,
+         else {
+             gSpvMiss++;
+             if (xlate(ll.UTF8String, stage.UTF8String, &spv, &spvn, err, sizeof err) != 0) {
+-                nvlog("library: translate %s (%s) FAILED: %s", name.UTF8String, stage.UTF8String, err); if (error) *error = @(err); return nil;
++                nvlog("library: translate %s (%s) FAILED: %s", name.UTF8String, stage.UTF8String, err);
++                /* the failing input for the host-side translator (cargo run -- <file> <stage>): written while the
++                   directory /tmp/nvmtl-xlate-fail exists, named after the cache key */
++                if (spvp && access("/tmp/nvmtl-xlate-fail", W_OK) == 0) {
++                    NSString *f = [NSString stringWithFormat:@"/tmp/nvmtl-xlate-fail/%@-%@.ll",
++                                   spvp.lastPathComponent.stringByDeletingPathExtension, stage];
++                    [ll writeToFile:f atomically:YES encoding:NSUTF8StringEncoding error:NULL];
++                    nvlog("library: failing input saved as %s", f.UTF8String);
++                }
++                if (error) *error = @(err); return nil;
+             }
+             spvData = [NSData dataWithBytes:spv length:spvn];
+             { NSError *werr = nil;

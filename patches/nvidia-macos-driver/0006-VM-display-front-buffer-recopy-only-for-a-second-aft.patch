@@ -1,0 +1,129 @@
+From 8a22aa9dfa0e065e6ad4b6462eadb7231f0b0b5a Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 16:01:05 +0200
+Subject: [PATCH 06/47] VM display: front-buffer recopy only for a second after
+ a transaction; arm only an opened framebuffer
+
+- The 60 Hz full-frame copy cost ~20% of a core on a static screen; it now runs for one second after each
+  transaction (enough for the plugin's copy-out), then stops.
+- debug.nvaccelfb answers EBUSY until NMXVGAFB reports IOGraphics opened it (property NMXVGAFBOpen): arming right
+  after the head published panicked in IOFramebuffer::getAttributeExt (NULL + 0x120) from the pipe's
+  displayModeDidChange.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ kexts/NMXVGAFB/nmxvgafb.cpp     |  6 ++++++
+ kexts/NVRM/accel/nvrm-accel.cpp | 37 +++++++++++++++++++++++++--------
+ 2 files changed, 34 insertions(+), 9 deletions(-)
+
+diff --git a/kexts/NMXVGAFB/nmxvgafb.cpp b/kexts/NMXVGAFB/nmxvgafb.cpp
+index ce36ddd..1c0823f 100644
+--- a/kexts/NMXVGAFB/nmxvgafb.cpp
++++ b/kexts/NMXVGAFB/nmxvgafb.cpp
+@@ -58,6 +58,12 @@ public:
+     void stop(IOService *provider) override;
+ 
+     IOReturn enableController() override { return kIOReturnSuccess; }
++    // NMXAccel registers this head only once IOGraphics has opened it: the display pipe reads state open() sets up
++    IOReturn open() override {
++        IOReturn r = IOFramebuffer::open();
++        if (r == kIOReturnSuccess && opened) setProperty("NMXVGAFBOpen", kOSBooleanTrue);
++        return r;
++    }
+     // Not the kernel console: with true, IOGraphics moved the text console onto this framebuffer during boot and the
+     // machine stopped (console and serial output both, right after "IOG flags"). WindowServer does not need it.
+     bool isConsoleDevice() override { return false; }
+diff --git a/kexts/NVRM/accel/nvrm-accel.cpp b/kexts/NVRM/accel/nvrm-accel.cpp
+index 3297e45..9a98317 100644
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -948,8 +948,9 @@ void NVDisplayPipe::iopDropSources()
+  * VM display front buffer. NMXVGAFB's scan-out is plain memory that QEMU shows as it is, so the pipe's copy is the
+  * only way a frame gets there - and a transaction can arrive before the frame is in the surface's memory: the Metal
+  * plugin renders into a private image and copies it out to the IOSurface after the GPU signals, while WindowServer
+- * presents on that signal. A static screen sends no further transaction, so the panel kept an empty frame. Like a
+- * display engine scanning out its front buffer, the last presented surface is copied again at 60 Hz. The mapping
++ * presents on that signal. A static screen sends no further transaction, so the panel kept an empty frame. The last
++ * presented surface is copied again at 60 Hz for a second after each transaction (the full-frame copy costs about a
++ * fifth of a core, so a static screen stops it), which covers the plugin's copy-out. The mapping
+  * stays valid while it is the front: it sits in one of the pipe's source slots, which only performTransaction
+  * (under gNmxFrontLock) recycles.
+  */
+@@ -959,6 +960,8 @@ static struct { const NVDisplayPipe *pipe; const volatile unsigned *src; unsigne
+                 volatile unsigned *dst; unsigned dpitch; } gNmxFront;
+ static SInt64 gCntNmxFrontCopies;
+ static int gNmxFrontHz = 60;
++static unsigned gNmxFrontTicksLeft = 0;   // copies until the timer stops, refilled by each transaction
++static bool gNmxFrontArmed = false;
+ static constexpr unsigned kNmxFrontMaxHz = 240;
+ 
+ static void nmxFrontCopyLocked()
+@@ -977,7 +980,7 @@ static void nmxFrontCopyLocked()
+ static void nmxFrontArm()
+ {
+     const int hz = gNmxFrontHz;
+-    if (!gNmxFrontTimer || hz <= 0) return;
++    if (!gNmxFrontTimer || hz <= 0) { gNmxFrontArmed = false; return; }
+     uint64_t d; clock_interval_to_deadline(1000000u / (unsigned)(hz < (int)kNmxFrontMaxHz ? hz : kNmxFrontMaxHz),
+                                            kMicrosecondScale, &d);
+     thread_call_enter_delayed(gNmxFrontTimer, d);
+@@ -988,9 +991,10 @@ static void nmxFrontTick(thread_call_param_t, thread_call_param_t)
+     if (!gNmxFrontLock) return;
+     IOLockLock(gNmxFrontLock);
+     nmxFrontCopyLocked();
+-    const bool live = gNmxFront.src != nullptr;
++    const bool again = gNmxFront.src != nullptr && gNmxFrontTicksLeft && --gNmxFrontTicksLeft;
++    gNmxFrontArmed = again;
+     IOLockUnlock(gNmxFrontLock);
+-    if (live) nmxFrontArm();
++    if (again) nmxFrontArm();
+ }
+ 
+ static void nmxFrontInit()
+@@ -1007,11 +1011,13 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
+         nmxFrontInit();
+         if (gNmxFrontLock) {
+             IOLockLock(gNmxFrontLock);
+-            const bool wasLive = gNmxFront.src != nullptr;
+             IOReturn r = performTransactionCopy(txn);
+-            const bool live = gNmxFront.src != nullptr;
++            const int hz = gNmxFrontHz;
++            gNmxFrontTicksLeft = hz > 0 ? (unsigned)(hz < (int)kNmxFrontMaxHz ? hz : kNmxFrontMaxHz) : 0;
++            const bool arm = gNmxFront.src != nullptr && gNmxFrontTicksLeft && !gNmxFrontArmed;
++            if (arm) gNmxFrontArmed = true;
+             IOLockUnlock(gNmxFrontLock);
+-            if (live && !wasLive) nmxFrontArm();
++            if (arm) nmxFrontArm();
+             return r;
+         }
+     }
+@@ -1200,6 +1206,19 @@ static int nvaccelfb_sysctl SYSCTL_HANDLER_ARGS
+     int v = gNvAccelArmed;
+     int err = sysctl_handle_int(oidp, &v, 0, req);
+     if (err || req->newptr == 0) return err;
++#ifdef NMX_ACCEL
++    // Registering a framebuffer delivers a mode change, and the display pipe reads the framebuffer's attributes: on a
++    // framebuffer IOGraphics has not opened yet that read panicked (IOFramebuffer::getAttributeExt, NULL + 0x120).
++    // NMXVGAFB says when it is open; until then, ask again later.
++    if (v && gNmxVmDisplay) {
++        NVAccel *a = NVAccel::gAccel;
++        IOService *fb = a ? a->fFB : nullptr;
++        if (!fb || fb->getProperty("NMXVGAFBOpen") != kOSBooleanTrue) {
++            ALOG("sysctl debug.nvaccelfb=%d: the VM display is not open yet -- EBUSY", v);
++            return EBUSY;   // not EAGAIN: the kernel retries a handler that answers EAGAIN
++        }
++    }
++#endif
+     NVAccel::triggerFromSysctl(v);
+     return 0;
+ }
+@@ -1277,7 +1296,7 @@ static void nvaccelInstallSysctl(void)
+ static bool gVmSysctlInstalled = false;
+ NVACCEL_CNT(nmxfb_front_copies, gCntNmxFrontCopies, "VM display: front-buffer copies onto the panel");
+ SYSCTL_INT(_debug, OID_AUTO, nmxfb_front_hz, CTLFLAG_RW | CTLFLAG_LOCKED, &gNmxFrontHz, 0,
+-           "VM display: front-buffer copies per second (0 = only on transactions)");
++           "VM display: front-buffer copies per second for a second after each transaction (0 = only on transactions)");
+ static void nmxInstallVmSysctls(void)
+ {
+     if (gVmSysctlInstalled) return;

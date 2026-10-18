@@ -1,0 +1,287 @@
+From 8e398caa5bb3995d25e973d6030123de34cda613 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 16:32:13 +0200
+Subject: [PATCH 33/47] NMXVGAFB: virtio-gpu completions by MSI-X, and a fenced
+ flush
+
+Every command busy-polled (IODelay 10 us) for its round trip. With QEMU's
+GL display a command after a flush waits until the host has drawn the
+frame, up to a refresh, so a vCPU spun that long per frame. The control
+queue now interrupts on MSI-X vector 0 and the submitter sleeps on its
+lock; the filter stamps the answer's time. Polling stays as the fallback.
+
+flushShown() sends RESOURCE_FLUSH with VIRTIO_GPU_FLAG_FENCE. QEMU with
+win11/qemu patch 0007 answers it at the latch point of the refresh the
+frame makes; a host without it answers at once. Its round trips show as
+"shown" in debug.nmxfb_vtiming.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ kexts/NMXVGAFB/nmx_virtio_gpu.cpp | 120 +++++++++++++++++++++++++++---
+ kexts/NMXVGAFB/nmx_virtio_gpu.h   |  38 ++++++++--
+ 2 files changed, 141 insertions(+), 17 deletions(-)
+
+diff --git a/kexts/NMXVGAFB/nmx_virtio_gpu.cpp b/kexts/NMXVGAFB/nmx_virtio_gpu.cpp
+index c99b061..ec76d42 100644
+--- a/kexts/NMXVGAFB/nmx_virtio_gpu.cpp
++++ b/kexts/NMXVGAFB/nmx_virtio_gpu.cpp
+@@ -35,7 +35,8 @@ enum : uint32_t {
+     kCmdResourceCreateBlob = 0x010c, kCmdSetScanoutBlob = 0x010d,
+     kRespOkNoData = 0x1100, kRespOkDisplayInfo = 0x1101,
+ };
+-enum : uint32_t { kBlobMemGuest = 1, kFormatB8G8R8X8 = 2 };
++enum : uint32_t { kBlobMemGuest = 1, kFormatB8G8R8X8 = 2, kFlagFence = 1 };
++static constexpr uint16_t kNoVector = 0xffff;
+ #pragma pack(push, 1)
+ struct GpuHdr { uint32_t type, flags; uint64_t fenceId; uint32_t ctxId; uint8_t ringIdx, pad[3]; };
+ struct GpuRect { uint32_t x, y, w, h; };
+@@ -66,6 +67,78 @@ static inline void wr16(volatile uint8_t *b, uint32_t o, uint16_t v) { *(volatil
+ static inline void wr32(volatile uint8_t *b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; }
+ static inline void wr64(volatile uint8_t *b, uint32_t o, uint64_t v) { wr32(b, o, (uint32_t)v); wr32(b, o + 4, (uint32_t)(v >> 32)); }
+ 
++// ---- interrupt -----------------------------------------------------------------------------------------------------
++// the event source's owner: IOKit calls back an OSObject, this one forwards to the transport
++class NMXVirtioGPUIrq : public OSObject {
++    OSDeclareDefaultStructors(NMXVirtioGPUIrq)
++public:
++    NMXVirtioGPU *gpu = nullptr;
++    bool init() override { return OSObject::init(); }
++    static bool filter(OSObject *o, IOFilterInterruptEventSource *) { ((NMXVirtioGPUIrq *)o)->gpu->irqFilter(); return true; }
++    static void action(OSObject *o, IOInterruptEventSource *, int) { ((NMXVirtioGPUIrq *)o)->gpu->irqAction(); }
++};
++OSDefineMetaClassAndStructors(NMXVirtioGPUIrq, OSObject)
++
++// primary interrupt context: only the time (a message-signalled interrupt needs no ISR read or acknowledge)
++void NMXVirtioGPU::irqFilter()
++{
++    fIrqAt = mach_absolute_time();
++    fIrqs++;
++}
++
++// the work loop: wake the submitter, which sleeps on fLock until the used ring moves
++void NMXVirtioGPU::irqAction()
++{
++    if (!fLock) return;
++    IOLockLock(fLock);
++    IOLockWakeup(fLock, this, false);
++    IOLockUnlock(fLock);
++}
++
++// one MSI-X vector on a work loop of our own; false leaves the transport polling
++bool NMXVirtioGPU::setupIrq()
++{
++    if (!fPci->findPCICapability(kIOPCIMSIXCapability)) { VGLOG("no MSI-X capability - polling"); return false; }
++    int index = -1;
++    for (int pass = 0; pass < 2 && index < 0; pass++) {
++        if (pass) {
++            IOReturn r = fPci->configureInterrupts(kIOInterruptTypePCIMessagedX, 1, 1);
++            if (r != kIOReturnSuccess) { VGLOG("MSI-X: configureInterrupts 0x%x - polling", r); return false; }
++        }
++        for (int i = 0; ; i++) {
++            int type = 0;
++            if (fPci->getInterruptType(i, &type) != kIOReturnSuccess) break;
++            if (type & (kIOInterruptTypePCIMessaged | kIOInterruptTypePCIMessagedX)) { index = i; break; }
++        }
++    }
++    if (index < 0) { VGLOG("MSI-X: no message-signalled interrupt source - polling"); return false; }
++    fIrqOwner = OSTypeAlloc(NMXVirtioGPUIrq);
++    if (!fIrqOwner || !fIrqOwner->init()) { OSSafeReleaseNULL(fIrqOwner); return false; }
++    fIrqOwner->gpu = this;
++    fWl = IOWorkLoop::workLoop();
++    fIrq = fWl ? IOFilterInterruptEventSource::filterInterruptEventSource(fIrqOwner, &NMXVirtioGPUIrq::action,
++                                                                          &NMXVirtioGPUIrq::filter, fPci, index) : nullptr;
++    if (!fIrq || fWl->addEventSource(fIrq) != kIOReturnSuccess) {
++        VGLOG("MSI-X: no interrupt event source - polling");
++        teardownIrq();
++        return false;
++    }
++    fIrq->enable();
++    return true;
++}
++
++void NMXVirtioGPU::teardownIrq()
++{
++    fIrqOn = false;
++    if (fIrq) {
++        fIrq->disable();
++        if (fWl) fWl->removeEventSource(fIrq);
++        OSSafeReleaseNULL(fIrq);
++    }
++    OSSafeReleaseNULL(fWl);
++    OSSafeReleaseNULL(fIrqOwner);
++}
++
+ volatile uint8_t *NMXVirtioGPU::mapCap(uint8_t bar, uint32_t offset, uint32_t length)
+ {
+     if (bar > 5) return nullptr;
+@@ -118,11 +191,14 @@ bool NMXVirtioGPU::init(IOPCIDevice *pci)
+     wr8(fCommon, kStatus, kStAck | kStDriver | kStFeaturesOk);
+     if (!(rd8(fCommon, kStatus) & kStFeaturesOk)) { VGLOG("device refused features 0x%llx", (unsigned long long)want); reset(); return false; }
+     fBlob = want & kFGpuBlob; fEdid = want & kFGpuEdid;
++    const bool irq = setupIrq();
+     if (!setupQueue()) { reset(); return false; }
++    if (irq && !fIrqOn) { VGLOG("MSI-X: the device took no vector for the control queue - polling"); teardownIrq(); }
+     wr8(fCommon, kStatus, kStAck | kStDriver | kStFeaturesOk | kStDriverOk);
+     fReady = true;
+-    VGLOG("up: device features 0x%llx, using 0x%llx (blob %s, edid %s), control queue %u entries",
+-          (unsigned long long)have, (unsigned long long)want, fBlob ? "yes" : "NO", fEdid ? "yes" : "no", fQSize);
++    VGLOG("up: device features 0x%llx, using 0x%llx (blob %s, edid %s), control queue %u entries, %s",
++          (unsigned long long)have, (unsigned long long)want, fBlob ? "yes" : "NO", fEdid ? "yes" : "no", fQSize,
++          fIrqOn ? "MSI-X" : "polled");
+     return true;
+ }
+ 
+@@ -144,7 +220,10 @@ bool NMXVirtioGPU::setupQueue()
+     if (!fCmd) { VGLOG("no memory for the command area"); return false; }
+     fCmdKva = (uint8_t *)fCmd->getBytesNoCopy();
+     fCmdPhys = fCmd->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+-    wr16(fCommon, kQueueMsix, 0xffff);         // no interrupt: the driver polls
++    // the control queue interrupts on vector 0 when there is one; config changes don't interrupt
++    wr16(fCommon, kMsixConfig, kNoVector);
++    wr16(fCommon, kQueueMsix, fIrq ? 0 : kNoVector);
++    fIrqOn = fIrq && rd16(fCommon, kQueueMsix) == 0;
+     wr64(fCommon, kQueueDesc, fRingPhys + kOffDesc);
+     wr64(fCommon, kQueueDriver, fRingPhys + kOffAvail);
+     wr64(fCommon, kQueueDevice, fRingPhys + kOffUsed);
+@@ -159,6 +238,7 @@ void NMXVirtioGPU::reset()
+ {
+     if (fCommon) wr8(fCommon, kStatus, 0);    // QEMU: back to VGA mode
+     fReady = false;
++    teardownIrq();
+     OSSafeReleaseNULL(fRing);
+     fRingKva = nullptr;
+     OSSafeReleaseNULL(fCmd);
+@@ -169,7 +249,7 @@ void NMXVirtioGPU::reset()
+     if (fLock) { IOLockFree(fLock); fLock = nullptr; }
+ }
+ 
+-uint32_t NMXVirtioGPU::submit(const void *cmd, uint32_t cmdLen, void *resp, uint32_t respLen)
++uint32_t NMXVirtioGPU::submit(const void *cmd, uint32_t cmdLen, void *resp, uint32_t respLen, uint64_t *doneAt)
+ {
+     if (!fReady || cmdLen > kCmdMax || respLen > kRespMax) return 0;
+     IOLockLock(fLock);
+@@ -187,22 +267,30 @@ uint32_t NMXVirtioGPU::submit(const void *cmd, uint32_t cmdLen, void *resp, uint
+     volatile uint16_t *used = (volatile uint16_t *)(fRingKva + kOffUsed);     // flags, idx, ring[]
+     uint32_t type = 0;
+     const uint64_t t0 = mach_absolute_time();
++    uint64_t done = 0;
+     // up to 1 s: the host's GL display can take a frame or two to take a new scanout
+-    for (int i = 0; i < 100000; i++) {
++    uint64_t deadline; clock_interval_to_deadline(1, kSecondScale, &deadline);
++    for (;;) {
+         mb();
+         if (used[1] != fUsedSeen) {
+             fUsedSeen = used[1];
+             if (resp) memcpy(resp, fRingKva + kOffResp, respLen);
+             type = ((GpuHdr *)(fRingKva + kOffResp))->type;
++            // the interrupt's time when it is this answer's (it came after the command went out)
++            const uint64_t at = fIrqAt;
++            done = fIrqOn && at >= t0 ? at : mach_absolute_time();
+             break;
+         }
+-        IODelay(10);
++        if (mach_absolute_time() >= deadline) break;
++        if (fIrqOn) { AbsoluteTime dl; memcpy(&dl, &deadline, sizeof dl); IOLockSleepDeadline(fLock, this, dl, THREAD_UNINT); }
++        else IODelay(10);
+     }
++    if (doneAt) *doneAt = done;
+     fCommands++;
+     {
+-        const uint32_t ct = ((const GpuHdr *)fCmdKva)->type;
+-        Timing &tm = fTiming[ct == kCmdResourceFlush ? 0 : ct == kCmdSetScanoutBlob ? 1 : 2];
+-        uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++        const GpuHdr *h = (const GpuHdr *)fCmdKva;
++        Timing &tm = fTiming[h->type == kCmdResourceFlush ? (h->flags & kFlagFence ? 3 : 0) : h->type == kCmdSetScanoutBlob ? 1 : 2];
++        uint64_t ns = 0; absolutetime_to_nanoseconds((done ? done : mach_absolute_time()) - t0, &ns);
+         tm.n++; tm.totalNs += ns; if (ns > tm.maxNs) tm.maxNs = ns;
+     }
+     if (!type) {
+@@ -289,3 +377,15 @@ bool NMXVirtioGPU::flush(uint32_t resourceId, uint32_t x, uint32_t y, uint32_t w
+     c.hdr.type = kCmdResourceFlush; c.r = { x, y, w, h }; c.resourceId = resourceId;
+     return submitNoData(&c, sizeof c, "RESOURCE_FLUSH");
+ }
++
++bool NMXVirtioGPU::flushShown(uint32_t resourceId, uint32_t w, uint32_t h, uint64_t *shownAt)
++{
++    GpuResourceFlush c = {};
++    c.hdr.type = kCmdResourceFlush; c.hdr.flags = kFlagFence; c.r = { 0, 0, w, h }; c.resourceId = resourceId;
++    GpuHdr r;
++    IOLockLock(fLock); c.hdr.fenceId = ++fFenceId; IOLockUnlock(fLock);
++    uint32_t t = submit(&c, sizeof c, &r, sizeof r, shownAt);
++    if (t == kRespOkNoData) return true;
++    if (t) { fFailures++; VGLOG("RESOURCE_FLUSH (fenced): response 0x%x", t); }
++    return false;
++}
+diff --git a/kexts/NMXVGAFB/nmx_virtio_gpu.h b/kexts/NMXVGAFB/nmx_virtio_gpu.h
+index 7beb8e9..9f612b2 100644
+--- a/kexts/NMXVGAFB/nmx_virtio_gpu.h
++++ b/kexts/NMXVGAFB/nmx_virtio_gpu.h
+@@ -5,11 +5,16 @@
+ // guest pages, which QEMU exports to the host as a dmabuf (udmabuf) and its GL display shows without copying. A device
+ // reset puts QEMU back in VGA mode.
+ //
+-// One control queue, one command in flight, completion by polling: commands are rare (setup, then one flush per frame).
++// One control queue, one command in flight: commands are rare (setup, then a flush per frame). Completion comes by
++// MSI-X interrupt (the submitter sleeps), or by polling when the interrupt can't be set up.
+ #pragma once
+ #include <IOKit/pci/IOPCIDevice.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IOLocks.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOFilterInterruptEventSource.h>
++
++class NMXVirtioGPUIrq;
+ 
+ class NMXVirtioGPU {
+ public:
+@@ -36,12 +41,23 @@ public:
+     bool disableScanout();
+     // tells the host the rectangle changed
+     bool flush(uint32_t resourceId, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
++    // the same, fenced: QEMU (patch 0007) answers it once its display has drawn the frame and lets the guest go on,
++    // which with vblank-paced release is once per host refresh, at a fixed phase; a host without it answers at once.
++    // *shownAt: mach time of the answer (the interrupt's, when interrupts are on)
++    bool flushShown(uint32_t resourceId, uint32_t w, uint32_t h, uint64_t *shownAt);
++    bool interrupts() const { return fIrqOn; }
+ 
+     uint64_t commands() const { return fCommands; }
+     uint64_t failures() const { return fFailures; }
+-    // round-trip time per command kind (0 flush, 1 set scanout, 2 other): count, total and longest, in ns
++    // round-trip time per command kind (0 flush, 1 set scanout, 2 other, 3 fenced flush): count, total and longest, ns
++    static constexpr unsigned kTimings = 4;
+     struct Timing { uint64_t n, totalNs, maxNs; };
+-    Timing timing(unsigned kind) const { return kind < 3 ? fTiming[kind] : Timing{}; }
++    Timing timing(unsigned kind) const { return kind < kTimings ? fTiming[kind] : Timing{}; }
++    uint64_t irqs() const { return fIrqs; }
++
++    // from the interrupt event source (NMXVirtioGPUIrq)
++    void irqFilter();
++    void irqAction();
+ 
+ private:
+     IOPCIDevice *fPci = nullptr;
+@@ -58,12 +74,20 @@ private:
+     uint16_t fQSize = 0, fAvailIdx = 0, fUsedSeen = 0;
+     IOLock *fLock = nullptr;
+     bool fReady = false, fBlob = false, fEdid = false;
+-    uint64_t fCommands = 0, fFailures = 0;
+-    Timing fTiming[3] = {};
++    uint64_t fCommands = 0, fFailures = 0, fFenceId = 0;
++    Timing fTiming[kTimings] = {};
++    // MSI-X: vector 0 is the control queue's; the filter stamps the time, the action wakes the submitter
++    NMXVirtioGPUIrq *fIrqOwner = nullptr;
++    IOWorkLoop *fWl = nullptr;
++    IOFilterInterruptEventSource *fIrq = nullptr;
++    bool fIrqOn = false;
++    volatile uint64_t fIrqAt = 0, fIrqs = 0;
+ 
+     volatile uint8_t *mapCap(uint8_t bar, uint32_t offset, uint32_t length);
++    bool setupIrq();
++    void teardownIrq();
+     bool setupQueue();
+-    // sends cmd and waits for the response; returns the response type (0 on timeout)
+-    uint32_t submit(const void *cmd, uint32_t cmdLen, void *resp, uint32_t respLen);
++    // sends cmd and waits for the response; returns the response type (0 on timeout); *doneAt: when it came
++    uint32_t submit(const void *cmd, uint32_t cmdLen, void *resp, uint32_t respLen, uint64_t *doneAt = nullptr);
+     bool submitNoData(const void *cmd, uint32_t cmdLen, const char *what);
+ };

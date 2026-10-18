@@ -1,0 +1,153 @@
+From fe28ae589d5267fa23fe9e6226af5ea051d9202f Mon Sep 17 00:00:00 2001
+From: nm <nm@x>
+Date: Fri, 16 Oct 2026 07:33:39 +0200
+Subject: [PATCH 1/8] anv: map BOs through NMX_DRM_IOCTL_MMAP on Darwin
+
+Generated-by: LLM
+---
+ src/intel/vulkan/anv_allocator.c      | 93 +++++++++++++++++++++++++++
+ src/intel/vulkan/anv_private.h        |  4 ++
+ src/intel/vulkan/xe/anv_kmd_backend.c |  4 ++
+ 3 files changed, 101 insertions(+)
+
+diff --git a/src/intel/vulkan/anv_allocator.c b/src/intel/vulkan/anv_allocator.c
+index ade4a8c8894..fb93f35535c 100644
+--- a/src/intel/vulkan/anv_allocator.c
++++ b/src/intel/vulkan/anv_allocator.c
+@@ -1872,6 +1872,95 @@ anv_device_map_bo(struct anv_device *device,
+    return VK_SUCCESS;
+ }
+ 
++
++#ifdef __APPLE__
++#include <sys/ioctl.h>
++#include "util/simple_mtx.h"
++
++struct nmx_drm_mmap {
++   uint64_t offset;
++   uint64_t size;
++   uint32_t prot;
++   uint32_t flags;
++   uint64_t addr;
++};
++struct nmx_drm_munmap {
++   uint64_t addr;
++   uint64_t size;
++};
++#define NMX_DRM_MMAP_FIXED 0x1
++#define NMX_DRM_IOCTL_MMAP _IOWR('N', 0x40, struct nmx_drm_mmap)
++#define NMX_DRM_IOCTL_MUNMAP _IOW('N', 0x41, struct nmx_drm_munmap)
++
++struct anv_nmx_map {
++   void *ret;
++   uint64_t kaddr, ksize;
++   int fd;
++   struct anv_nmx_map *next;
++};
++static struct anv_nmx_map *anv_nmx_maps;
++static simple_mtx_t anv_nmx_maps_lock = SIMPLE_MTX_INITIALIZER;
++
++void *
++anv_nmx_mmap(int fd, uint64_t mmap_offset, uint64_t obj_offset, uint64_t size, void *placed_addr)
++{
++   struct nmx_drm_mmap req = {
++      .offset = mmap_offset,
++      .size = obj_offset + size,
++      .prot = PROT_READ | PROT_WRITE,
++   };
++   if (placed_addr != NULL) {
++      req.flags = NMX_DRM_MMAP_FIXED;
++      req.addr = (uintptr_t)placed_addr - obj_offset;
++   }
++   if (intel_ioctl(fd, NMX_DRM_IOCTL_MMAP, &req) != 0) {
++      if (errno == ENOTTY) {
++         void *p = mmap(placed_addr ? (void *)(uintptr_t)req.addr : NULL, req.size, PROT_READ | PROT_WRITE,
++                        (placed_addr ? MAP_FIXED : 0) | MAP_SHARED, fd, mmap_offset);
++         return p == MAP_FAILED ? p : (char *)p + obj_offset;
++      }
++      return MAP_FAILED;
++   }
++   struct anv_nmx_map *m = malloc(sizeof(*m));
++   if (m == NULL) {
++      struct nmx_drm_munmap un = { req.addr, req.size };
++      intel_ioctl(fd, NMX_DRM_IOCTL_MUNMAP, &un);
++      errno = ENOMEM;
++      return MAP_FAILED;
++   }
++   m->ret = (char *)(uintptr_t)req.addr + obj_offset;
++   m->kaddr = req.addr;
++   m->ksize = req.size;
++   m->fd = fd;
++   simple_mtx_lock(&anv_nmx_maps_lock);
++   m->next = anv_nmx_maps;
++   anv_nmx_maps = m;
++   simple_mtx_unlock(&anv_nmx_maps_lock);
++   return m->ret;
++}
++
++bool
++anv_nmx_munmap(void *addr)
++{
++   struct anv_nmx_map *m = NULL;
++   simple_mtx_lock(&anv_nmx_maps_lock);
++   for (struct anv_nmx_map **pp = &anv_nmx_maps; *pp; pp = &(*pp)->next) {
++      if ((*pp)->ret == addr) {
++         m = *pp;
++         *pp = m->next;
++         break;
++      }
++   }
++   simple_mtx_unlock(&anv_nmx_maps_lock);
++   if (m == NULL)
++      return false;
++   struct nmx_drm_munmap un = { m->kaddr, m->ksize };
++   intel_ioctl(m->fd, NMX_DRM_IOCTL_MUNMAP, &un);
++   free(m);
++   return true;
++}
++#endif
++
+ VkResult
+ anv_device_unmap_bo(struct anv_device *device,
+                     struct anv_bo *bo,
+@@ -1893,6 +1982,10 @@ anv_device_unmap_bo(struct anv_device *device,
+       assert(((uintptr_t)map & (page_size - 1)) == 0);
+    }
+ 
++#ifdef __APPLE__
++   if (anv_nmx_munmap(map) && !replace)
++      return VK_SUCCESS;
++#endif
+    if (replace) {
+       map = mmap(map, map_size, PROT_NONE,
+                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+diff --git a/src/intel/vulkan/anv_private.h b/src/intel/vulkan/anv_private.h
+index fc28d40e608..a30803242a8 100644
+--- a/src/intel/vulkan/anv_private.h
++++ b/src/intel/vulkan/anv_private.h
+@@ -3131,6 +3131,10 @@ VkResult anv_device_map_bo(struct anv_device *device,
+                            size_t size,
+                            void *placed_addr,
+                            void **map_out);
++#ifdef __APPLE__
++void *anv_nmx_mmap(int fd, uint64_t mmap_offset, uint64_t obj_offset, uint64_t size, void *placed_addr);
++bool anv_nmx_munmap(void *addr);
++#endif
+ VkResult anv_device_unmap_bo(struct anv_device *device,
+                              struct anv_bo *bo,
+                              void *map, size_t map_size,
+diff --git a/src/intel/vulkan/xe/anv_kmd_backend.c b/src/intel/vulkan/xe/anv_kmd_backend.c
+index 08252478ac2..96b60c6a210 100644
+--- a/src/intel/vulkan/xe/anv_kmd_backend.c
++++ b/src/intel/vulkan/xe/anv_kmd_backend.c
+@@ -158,6 +158,10 @@ xe_gem_mmap(struct anv_device *device, struct anv_bo *bo, uint64_t offset,
+    if (intel_ioctl(device->fd, DRM_IOCTL_XE_GEM_MMAP_OFFSET, &args))
+       return MAP_FAILED;
+ 
++#ifdef __APPLE__
++   return anv_nmx_mmap(device->fd, args.offset, offset, size, placed_addr);
++#endif
++
+    if (placed_addr != NULL) {
+       const uint64_t placed_num = (uintptr_t)placed_addr;
+ 

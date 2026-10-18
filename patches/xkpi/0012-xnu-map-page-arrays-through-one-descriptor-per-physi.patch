@@ -1,0 +1,72 @@
+From 74b1de6f39106bee85292fa429c8da27b8e88e35 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 04:21:30 +0200
+Subject: [PATCH 12/50] xnu: map page arrays through one descriptor per
+ physical run (multi-range physical descriptors mapped only the first run);
+ build-guest rt/xert modes
+
+---
+ build-guest.sh |  4 +++-
+ xnu/nmx_vm.cpp | 26 ++++++++++++++++++++++++--
+ 2 files changed, 27 insertions(+), 3 deletions(-)
+
+diff --git a/gpu-port/xkpi/build-guest.sh b/gpu-port/xkpi/build-guest.sh
+index 256acb3..900a9bf 100755
+--- a/gpu-port/xkpi/build-guest.sh
++++ b/gpu-port/xkpi/build-guest.sh
+@@ -23,8 +23,10 @@ t0=$(date +%s)
+ case "$WHAT" in
+     all)  ./all.sh 25; ./all-i915.sh 25; ./all-xe.sh 25; ./rt.sh ;;
+     xe)   ./all-xe.sh 25 ;;
++    rt)   ./rt.sh ;;
++    xert) ./all-xe.sh 25; ./rt.sh ;;
+     link) ;;
+-    *) echo "usage: $0 [all|xe|link] <out>"; exit 2 ;;
++    *) echo "usage: $0 [all|xe|rt|xert|link] <out>"; exit 2 ;;
+ esac
+ fail=$(( $(ls logs/*.failed 2>/dev/null | wc -l) + $(ls logs-i915/*.failed 2>/dev/null | wc -l) + $(find logs-xe -name '*.failed' | wc -l) ))
+ echo "compile failures: $fail ($(( $(date +%s) - t0 )) s)"
+diff --git a/gpu-port/xkpi/xnu/nmx_vm.cpp b/gpu-port/xkpi/xnu/nmx_vm.cpp
+index c820229..d290885 100644
+--- a/gpu-port/xkpi/xnu/nmx_vm.cpp
++++ b/gpu-port/xkpi/xnu/nmx_vm.cpp
+@@ -8,6 +8,7 @@
+  */
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOMultiMemoryDescriptor.h>
+ #include <IOKit/IOLib.h>
+ #include <libkern/OSAtomic.h>
+ #include "nmx_xnu.h"
+@@ -106,8 +107,29 @@ extern "C" void *nmx_xnu_map_pages(const uint64_t *pages, size_t npages, int cac
+             n++;
+         }
+     }
+-    IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRanges(ranges, (UInt32)n,
+-                                 kIODirectionInOut | kIOMemoryTypePhysical64, nullptr);
++    /*
++     * One physical descriptor per range, mapped back to back by an IOMultiMemoryDescriptor. A single multi-range
++     * kIOMemoryTypePhysical64 descriptor mapped only its first range into the kernel: xe's LRC copy (xe_lrc_init)
++     * faulted on the first page past the first physically contiguous run of a 9-page BO.
++     */
++    IOMemoryDescriptor *md = nullptr;
++    IOMemoryDescriptor **parts = (IOMemoryDescriptor **)IOMalloc(sizeof(*parts) * n);
++    size_t made = 0;
++    if (parts != nullptr) {
++        for (; made < n; made++) {
++            parts[made] = IOMemoryDescriptor::withAddressRanges(&ranges[made], 1,
++                              kIODirectionInOut | kIOMemoryTypePhysical64, nullptr);
++            if (parts[made] == nullptr)
++                break;
++        }
++        if (made == n)
++            md = n == 1 ? parts[0] : IOMultiMemoryDescriptor::withDescriptors(parts, (UInt32)n, kIODirectionInOut, false);
++        if (md != nullptr && n == 1)
++            md->retain();
++        for (size_t i = 0; i < made; i++)
++            parts[i]->release();
++        IOFree(parts, sizeof(*parts) * n);
++    }
+     IOFree(ranges, sizeof(IOAddressRange) * npages);
+     if (md == nullptr)
+         return nullptr;

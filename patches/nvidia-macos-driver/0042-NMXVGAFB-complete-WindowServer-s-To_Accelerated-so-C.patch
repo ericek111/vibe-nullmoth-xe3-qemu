@@ -1,0 +1,133 @@
+From e76dc7c75b18c155db56d1e4f4a806e9d7caa4c0 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 20:15:49 +0200
+Subject: [PATCH 42/47] NMXVGAFB: complete WindowServer's To_Accelerated so
+ CoreDisplay stops rebuilding its colour pipe
+
+CoreDisplay starts a display with kIOWSAA To_Accelerated (0x80000013) and moves it to Accelerated on a present
+(Display::UpdateWSAAState) only once setFramebufferActiveOnUpdate is set. Framebuffer::InitializeMPPriv leaves it
+false on this head although the IODisplay is attached (measured), so the head stayed in To_Accelerated. In that
+state DisplayPipe::Commit marks every colour stage dirty on each present, and BuildTransactions -> AddEOTF ran 256
+CombineLUTs on 8 threads per frame, contending on Display::CurrentHeadroom: ~7.7 s of a 25 s WindowServer sample
+during a window drag.
+
+A connect change that reconfigures the display sets the flag. The 'wsrv' attribute is now recorded; when a frame
+has been shown and the head is still in To_Accelerated, a thread call advertises the current size under a new mode
+ID and raises the connection-change interrupt, as a host resize does. A bare connect change, or one during
+WindowServer's initial configuration, leaves the state as it is, so it looks again after 1, 2, 4 and 8 s while the
+state holds. Tested on two boots: Accelerated (0x11) about 3 s after WindowServer starts, on the second change;
+AddEOTF 0 of 56 presents (was one per present).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ kexts/NMXVGAFB/nmxvgafb.cpp | 62 ++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 61 insertions(+), 1 deletion(-)
+
+diff --git a/kexts/NMXVGAFB/nmxvgafb.cpp b/kexts/NMXVGAFB/nmxvgafb.cpp
+index 161861a..b8c78a8 100644
+--- a/kexts/NMXVGAFB/nmxvgafb.cpp
++++ b/kexts/NMXVGAFB/nmxvgafb.cpp
+@@ -149,6 +149,17 @@ private:
+     static void displayEvent(void *p0);   // from the virtio interrupt: the host resized its window
+     static void hotplugFire(thread_call_param_t p0, thread_call_param_t);
+     bool switchMode();
++    // WindowServer's active state for this head (the 'wsrv' attribute, kIOWSAA_*). CoreDisplay starts a display with
++    // To_Accelerated and completes it (Accelerated) on a present only once setFramebufferActiveOnUpdate is set, which
++    // Framebuffer::InitializeMPPriv leaves false here (measured: the IODisplay is attached by then) and a reconfiguring
++    // connect change sets. Left in To_Accelerated, it rebuilt its colour pipe on every present (BuildTransactions ->
++    // AddEOTF -> 256 CombineLUTs on 8 threads, contending on CurrentHeadroom): ~30% of WindowServer during a drag.
++    static constexpr uint32_t kWsaaStateMask = 0xF, kWsaaToAccelerated = 3;
++    volatile UInt32 fWsaa = 0, fWsaaKicked = 0, fWsaaKicks = 0;
++    static constexpr uint32_t kWsaaKickMax = 5;
++    thread_call_t fWsaaKick = nullptr;
++    static void wsaaKickFire(thread_call_param_t p0, thread_call_param_t);
++    bool hasIODisplay();
+     // the host's EDID for scanout 0, handed to IOGraphics (the display shows up as what QEMU describes)
+     uint8_t fEdid[256] = {};
+     uint32_t fEdidLen = 0;
+@@ -304,7 +315,15 @@ public:
+         return kIOPMAckImplied;
+     }
+     IOReturn setAttribute(IOSelect attribute, uintptr_t value) override {
+-        if (attribute == kIOWindowServerActiveAttribute) return kIOReturnSuccess;
++        if (attribute == kIOWindowServerActiveAttribute) {
++            const UInt32 was = fWsaa;
++            fWsaa = (UInt32)value;
++            if ((value & kWsaaStateMask) == kWsaaToAccelerated) { fWsaaKicked = 0; fWsaaKicks = 0; }
++            if (was != (UInt32)value)
++                VFBLOG("WindowServer active state 0x%x -> 0x%x (IODisplay %s)", was, (UInt32)value,
++                       hasIODisplay() ? "attached" : "not attached");
++            return kIOReturnSuccess;
++        }
+         if (attribute == kIOPowerAttribute) {
+             if (value) { IOReturn r = IOFramebuffer::setAttribute(attribute, value); handleEvent(kIOFBNotifyDidPowerOn);
+                          return r == kIOReturnUnsupported ? kIOReturnSuccess : r; }
+@@ -630,6 +649,7 @@ bool NMXVGAFB::start(IOService *provider)
+     publishTiming();
+     if (fVirtioOn && (fHotplug = thread_call_allocate(hotplugFire, this)))
+         fVirtio.setDisplayEventHandler(displayEvent, this);
++    fWsaaKick = thread_call_allocate(wsaaKickFire, this);
+     if (fVirtioOn && OSCompareAndSwapPtr(nullptr, this, (void * volatile *)&gVtInst)) {
+         sysctl_register_oid(&sysctl__debug_nmxfb_vtiming);
+         sysctl_register_oid(&sysctl__debug_nmxfb_vtrace);
+@@ -677,6 +697,7 @@ void NMXVGAFB::stop(IOService *provider)
+     if (fHoldCap) { thread_call_cancel(fHoldCap); while (!thread_call_free(fHoldCap)) { thread_call_cancel(fHoldCap); IOSleep(5); } fHoldCap = nullptr; }
+     fVirtio.setDisplayEventHandler(nullptr, nullptr);
+     if (fHotplug) { thread_call_cancel(fHotplug); while (!thread_call_free(fHotplug)) { thread_call_cancel(fHotplug); IOSleep(5); } fHotplug = nullptr; }
++    if (fWsaaKick) { thread_call_cancel(fWsaaKick); while (!thread_call_free(fWsaaKick)) { thread_call_cancel(fWsaaKick); IOSleep(5); } fWsaaKick = nullptr; }
+     releaseHold("stopping");
+     OSSafeReleaseNULL(fAccel);
+     if (fVblThread) {
+@@ -948,6 +969,10 @@ IOReturn NMXVGAFB::scanoutSurface(NMXScanoutSurface *r)
+     }
+     IOLockUnlock(fScanLock);
+     if (host) hostLatch(shownAt);
++    // a frame was shown while WindowServer still has this head in To_Accelerated: its first update did not complete it
++    if (ret == kIOReturnSuccess && fCurFinal && fWsaaKick && (fWsaa & kWsaaStateMask) == kWsaaToAccelerated &&
++        OSCompareAndSwap(0, 1, &fWsaaKicked))
++        thread_call_enter(fWsaaKick);
+     uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+     r->ns = ns;
+     fSwitchN++; fSwitchNs += ns; if (ns > fSwitchMaxNs) fSwitchMaxNs = ns;
+@@ -1106,6 +1131,41 @@ void NMXVGAFB::hotplugFire(thread_call_param_t p0, thread_call_param_t)
+     if (me->fConnect.proc) me->fConnect.proc(me->fConnect.target, me->fConnect.ref);
+ }
+ 
++// the head's IODisplay (AppleDisplay under its IODisplayConnect): IOFBConnect's "online" bit, which WindowServer reads
++bool NMXVGAFB::hasIODisplay()
++{
++    bool found = false;
++    OSIterator *it = getChildIterator(gIOServicePlane);
++    if (!it) return false;
++    while (OSObject *o = it->getNextObject()) {
++        IOService *connect = OSDynamicCast(IOService, o);
++        if (!connect || !connect->metaCast("IODisplayConnect")) continue;
++        IORegistryEntry *disp = connect->getChildEntry(gIOServicePlane);
++        if (disp && disp->metaCast("IODisplay")) { found = true; break; }
++    }
++    it->release();
++    return found;
++}
++
++void NMXVGAFB::wsaaKickFire(thread_call_param_t p0, thread_call_param_t)
++{
++    NMXVGAFB *me = (NMXVGAFB *)p0;
++    if (me->fStopping || (me->fWsaa & kWsaaStateMask) != kWsaaToAccelerated) return;
++    if (!me->hasIODisplay()) { me->fWsaaKicked = 0; return; }   // the next shown frame asks again
++    const UInt32 k = ++me->fWsaaKicks;
++    // a connect change alone leaves it there; with a new mode (the current size under a new ID, as a host resize
++    // advertises one) CoreDisplay reconfigures the display and completes on the next present
++    me->fAdvW = me->fWidth; me->fAdvH = me->fHeight; me->fAdvID = me->fNextID++;
++    VFBLOG("WindowServer left this head in To_Accelerated (0x%x) after a shown frame - mode %d advertised, connect change %u",
++           me->fWsaa, (int)me->fAdvID, k);
++    if (me->fConnect.proc) me->fConnect.proc(me->fConnect.target, me->fConnect.ref);
++    // one that comes while WindowServer is still configuring the display changes nothing: look again, later each time
++    if (k < kWsaaKickMax) {
++        uint64_t d; clock_interval_to_deadline(1u << (k - 1), kSecondScale, &d);
++        thread_call_enter_delayed(me->fWsaaKick, d);
++    }
++}
++
+ IOReturn NMXVGAFB::setDisplayMode(IODisplayModeID mode, IOIndex depth)
+ {
+     if (depth != 0) return kIOReturnUnsupported;

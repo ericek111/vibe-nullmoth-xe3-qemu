@@ -1,0 +1,49 @@
+From 8ee357f7a39ab3c2a0dc8e3bd9aee200f85fc5e4 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 01:45:54 +0200
+Subject: [PATCH 47/50] xe fork: always dispatch VF memirq user and GUC2HOST
+ interrupts (7.2 backport)
+
+Intel's programming note says to assume an engine's MI_USER_INTERRUPT and
+the GuC's GUC2HOST status bytes are always set; 7.2's xe_memirq.c
+dispatches them unconditionally. 6.14 dispatched only on a non-zero byte,
+so a report whose source byte arrived without its status byte lost a
+fence signal or a GuC reply. The bytes are still cleared. 7.2's move to
+multiple IRQ pages is not part of this.
+
+Tested together on the VF (build b9acec2+-1017.014208): boot, login,
+GPU desktop, Metal compute exact.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fork_xe.py | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/gpu-port/xkpi/fork_xe.py b/gpu-port/xkpi/fork_xe.py
+index 212d9e0..b8860e6 100644
+--- a/gpu-port/xkpi/fork_xe.py
++++ b/gpu-port/xkpi/fork_xe.py
+@@ -142,6 +142,23 @@ edit("xe_gt.c", [("#include \"xe_sriov.h\"\n", "#include \"xe_sriov.h\"\n#includ
+                  ("static int do_gt_reset(struct xe_gt *gt)\n{\n\tint err;\n\n",
+                   "static int do_gt_reset(struct xe_gt *gt)\n{\n\tint err;\n\n"
+                   "\tif (IS_SRIOV_VF(gt_to_xe(gt)))\n\t\treturn xe_gt_sriov_vf_reset(gt);\n\n", 1)])
++# Memory-based interrupts on a VF (backport of upstream, as in Linux 7.2 xe_memirq.c): Intel's programming note says
++# to assume an engine's MI_USER_INTERRUPT and the GuC's GUC2HOST status bytes are always set. 6.14 handled them only
++# when the byte read non-zero, so a report whose source byte arrived without its status byte lost a fence signal or
++# a GuC reply (a stall until some later interrupt, or a G2H timeout). Both handlers are idempotent; the bytes are
++# still cleared.
++edit("xe_memirq.c", [
++    ("\tif (memirq_received(memirq, status, ilog2(GT_RENDER_USER_INTERRUPT), hwe->name))\n"
++     "\t\txe_hw_engine_handle_irq(hwe, GT_RENDER_USER_INTERRUPT);\n",
++     "\t/* the programming note says to assume GT_MI_USER_INTERRUPT is always set (backport) */\n"
++     "\tmemirq_received(memirq, status, ilog2(GT_RENDER_USER_INTERRUPT), hwe->name);\n"
++     "\txe_hw_engine_handle_irq(hwe, GT_RENDER_USER_INTERRUPT);\n", 1),
++    ("\tif (memirq_received(memirq, status, ilog2(GUC_INTR_GUC2HOST), name))\n"
++     "\t\txe_guc_irq_handler(guc, GUC_INTR_GUC2HOST);\n",
++     "\t/* the programming note says to assume GUC_INTR_GUC2HOST is always set (backport) */\n"
++     "\tmemirq_received(memirq, status, ilog2(GUC_INTR_GUC2HOST), name);\n"
++     "\txe_guc_irq_handler(guc, GUC_INTR_GUC2HOST);\n", 1),
++])
+ # --- NMX VF DIAGNOSTICS (temporary, for bring-up on the VF) ---
+ # count VF interrupts, and on a G2H timeout print both CT descriptors: tells "GuC never read the H2G" (DMA/GGTT) from
+ # "GuC answered but no interrupt arrived" (IRQ path)

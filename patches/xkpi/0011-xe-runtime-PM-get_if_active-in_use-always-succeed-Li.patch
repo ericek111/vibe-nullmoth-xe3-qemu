@@ -1,0 +1,32 @@
+From 7b5628fd01cb741851b2b5694eb2016d141367cb Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 04:09:07 +0200
+Subject: [PATCH 11/50] xe: runtime-PM get_if_active/in_use always succeed
+ (LinuxKPI stubs returned -EINVAL, so G2H was never processed)
+
+---
+ fork_xe.py | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/gpu-port/xkpi/fork_xe.py b/gpu-port/xkpi/fork_xe.py
+index 7817d78..5e4db0b 100644
+--- a/gpu-port/xkpi/fork_xe.py
++++ b/gpu-port/xkpi/fork_xe.py
+@@ -107,6 +107,17 @@ edit("xe_guc_ct.c", [("\tret = wait_event_timeout(ct->g2h_fence_wq, g2h_fence.do
+     "\t\t\tret = wait_event_timeout(ct->g2h_fence_wq, g2h_fence.done, msecs_to_jiffies(2));\n"
+     "\t\t} while (!ret && time_before(jiffies, nmx_end));\n"
+     "\t} else {\n\t\tret = wait_event_timeout(ct->g2h_fence_wq, g2h_fence.done, HZ);\n\t}\n", 1)])
++# Runtime PM: macOS never suspends the device under the driver, but LinuxKPI's pm_runtime_get_if_active() and
++# pm_runtime_get_if_in_use() are TODO stubs returning -EINVAL. xe's G2H worker and CT fast path bail out unless
++# get_if_active succeeds, so every GuC reply was dropped. The device is always awake here: say so.
++edit("xe_pm.c", [
++    ("\treturn pm_runtime_get_if_active(xe->drm.dev) > 0;\n",
++     "\t/* macOS port: no runtime PM, the device is always active (LinuxKPI's helper is a -EINVAL stub) */\n"
++     "\tpm_runtime_get_noresume(xe->drm.dev);\n\treturn true;\n", 1),
++    ("\treturn pm_runtime_get_if_in_use(xe->drm.dev) > 0;\n",
++     "\t/* macOS port: no runtime PM (see xe_pm_runtime_get_if_active) */\n"
++     "\tpm_runtime_get_noresume(xe->drm.dev);\n\treturn true;\n", 1),
++])
+ # --- NMX VF DIAGNOSTICS (temporary, for bring-up on the VF) ---
+ # count VF interrupts, and on a G2H timeout print both CT descriptors: tells "GuC never read the H2G" (DMA/GGTT) from
+ # "GuC answered but no interrupt arrived" (IRQ path)

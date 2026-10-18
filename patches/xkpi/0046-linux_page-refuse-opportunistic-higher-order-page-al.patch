@@ -1,0 +1,46 @@
+From b9acec2a6dbe7ea030613e74d3483636919725a8 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 01:24:57 +0200
+Subject: [PATCH 46/50] linux_page: refuse opportunistic higher-order page
+ allocations
+
+TTM fills a BO by asking for order 10, then 9, ... with __GFP_NORETRY
+before it takes single pages. Linux makes those attempts cheap. In the
+port, each one became a physically contiguous IOBufferMemoryDescriptor,
+which makes xnu walk physical memory under the page-queue lock. On a
+fresh boot the walk succeeds. After ~40 minutes of desktop use memory is
+fragmented and each 2-4 MB walk fails after ~350 ms. Creating an 8 MB BO
+then took 740 ms (vm/guest/tools/gemlat), and WindowServer creates one
+for most new Metal textures: under 1 fps, ordered flips timing out
+(frames shown unpublished), and stutter for everything else waiting on
+the page-queue lock.
+
+linux_alloc_pages now returns NULL for order > 0 with __GFP_NORETRY, so
+TTM takes single pages from the chunk pool right away. 8 MB create:
+740 ms -> 0.8 ms, and 0.9 ms with 6 GB of memory deliberately fragmented.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ override/src/linux_page.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/gpu-port/xkpi/override/src/linux_page.c b/gpu-port/xkpi/override/src/linux_page.c
+index ee6df73..cf39226 100644
+--- a/gpu-port/xkpi/override/src/linux_page.c
++++ b/gpu-port/xkpi/override/src/linux_page.c
+@@ -100,6 +100,15 @@ linux_alloc_pages(gfp_t flags, unsigned int order)
+ 	unsigned long npages = 1UL << order;
+ 	int req = VM_ALLOC_WIRED;
+ 
++	/*
++	 * __GFP_NORETRY marks an opportunistic higher order: TTM asks for 4 MB, then 2 MB, ... before taking single
++	 * pages. xnu has no cheap contiguous attempt. Every contiguous allocation walks physical memory under the
++	 * page-queue lock, and once memory is fragmented a 2-4 MB walk fails after ~350 ms (vm/guest/tools/gemlat: an
++	 * 8 MB BO took 740 ms, and WindowServer's frames waited on it). Refuse those orders, so the caller falls back
++	 * to single pages from the chunk pool.
++	 */
++	if (order > 0 && (flags & __GFP_NORETRY) != 0)
++		return (NULL);
+ 	if ((flags & M_ZERO) != 0)
+ 		req |= VM_ALLOC_ZERO;
+ 	if (order == 0 && (flags & GFP_DMA32) == 0)

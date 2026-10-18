@@ -1,0 +1,32 @@
+From 571826f73b2e4c46502ede3d5411bd2c74e69a08 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 04:55:56 +0200
+Subject: [PATCH 15/50] bus: a driver instance on a PCI function is a PCI
+ device (dev_is_pci on DRM devices was false; GET_PCIINFO failed)
+
+---
+ bsdcompat/src/nmx_bus.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/gpu-port/xkpi/bsdcompat/src/nmx_bus.c b/gpu-port/xkpi/bsdcompat/src/nmx_bus.c
+index fff1423..9a9f8dc 100644
+--- a/gpu-port/xkpi/bsdcompat/src/nmx_bus.c
++++ b/gpu-port/xkpi/bsdcompat/src/nmx_bus.c
+@@ -901,7 +901,16 @@ uint8_t pci_get_function(device_t dev) { return P(dev)->dinfo.cfg.func; }
+ uint8_t pci_get_irq(device_t dev) { return P(dev)->dinfo.cfg.intline; }
+ uint32_t pci_get_devid(device_t dev) { return ((uint32_t)P(dev)->dinfo.cfg.device << 16) | P(dev)->dinfo.cfg.vendor; }
+ struct pci_devinfo *nmx_pci_devinfo(device_t dev) { return &P(dev)->dinfo; }
+-bool is_pci_device(device_t dev) { return dev && dev->is_pci; }
++/*
++ * A PCI function's record, or a driver instance attached to one (a DRM child, which shares the function's PCI ivars):
++ * LinuxKPI's pdev->dev.bsddev is the driver instance, so dev_is_pci(drm->dev) asks about the child. Answering only
++ * for the function made every DRM "is this PCI" check fail - DRM_IOCTL_GET_PCIINFO said ENODEV, so libdrm and Mesa
++ * found no GPU.
++ */
++bool is_pci_device(device_t dev)
++{
++    return dev && (dev->is_pci || (dev->parent != NULL && dev->parent->is_pci && dev->ivars == dev->parent->ivars));
++}
+ 
+ int pci_enable_busmaster(device_t dev)
+ {

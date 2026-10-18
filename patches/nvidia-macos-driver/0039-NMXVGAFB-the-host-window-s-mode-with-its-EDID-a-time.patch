@@ -1,0 +1,391 @@
+From 87d205ba613046d4ba01e988ebfb028f7797181a Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 17:25:46 +0200
+Subject: [PATCH 39/47] NMXVGAFB: the host window's mode with its EDID; a
+ time-constraint VBL thread
+
+Mode: with virtio-gpu the one mode is the host's scanout 0 size (the QEMU
+window, 2880x1710 here), so QEMU shows the scan-out 1:1 instead of
+stretching the firmware's 1920x1080. Its timing is the EDID's first
+detailed timing when it describes that mode (QEMU 0002: reduced blanking,
+120.002 Hz); the VBL period and the reported refresh use it exactly.
+IOGraphics gets the EDID (hasDDCConnect/getDDCBlock; the HL-DDC sense
+question comes without a value pointer and was refused before), so the
+display is QEMU's 'RHT' 0x1234 rather than an unknown one.
+
+VBL: a kernel thread with a time-constraint policy sleeps until each
+deadline. A thread call fired 0-3 ms late, an IOTimerEventSource with zero
+leeway 0-2.6 ms (timer coalescing; the critical-urgency wait isn't
+exported to kexts): now p50 ~0.15 ms, p95 ~1 ms, mostly host vCPU wake-up.
+
+Flips to another blob use flipShown (one round trip). debug.nmxfb_vtrace
+'V' events carry how late the VBL fired.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ kexts/NMXVGAFB/nmxvgafb.cpp | 176 ++++++++++++++++++++++++++++--------
+ 1 file changed, 138 insertions(+), 38 deletions(-)
+
+diff --git a/kexts/NMXVGAFB/nmxvgafb.cpp b/kexts/NMXVGAFB/nmxvgafb.cpp
+index 570090e..06811fd 100644
+--- a/kexts/NMXVGAFB/nmxvgafb.cpp
++++ b/kexts/NMXVGAFB/nmxvgafb.cpp
+@@ -14,6 +14,8 @@
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IONVRAM.h>
+ #include <kern/thread_call.h>
++#include <kern/sched_prim.h>
++#include <mach/thread_policy.h>
+ #include <pexpert/pexpert.h>
+ #include "../NMIntelFB/nvrm_vram_abi.h"
+ #include "nmx_virtio_gpu.h"
+@@ -37,7 +39,14 @@ class NMXVGAFB : public IOFramebuffer {
+     IOMemoryMap *fSurfMap = nullptr;   // write-combined CPU view of the scan-out (NMXAccel's frames land here)
+     struct Irq { IOFBInterruptProc proc = nullptr; OSObject *target = nullptr; void *ref = nullptr; };
+     Irq fVbl, fConnect;
+-    thread_call_t fVblTimer = nullptr;
++    // The VBL timer: a kernel thread of its own (time-constraint policy) that sleeps until fVblNext. A thread call, or an IOTimerEventSource even with zero leeway, fired 0-3 ms late: the
++    // kernel coalesces non-critical timers. Re-arming (callers hold fVblLock and have set fVblNext) wakes the thread,
++    // which then waits for the new deadline.
++    thread_t fVblThread = nullptr;
++    bool fVblTimer = false;               // the thread runs
++    volatile bool fVblThreadDone = false;
++    void vblArm(uint64_t) { thread_wakeup((event_t)&fVblNext); }
++    static void vblThreadMain(void *p0, wait_result_t);
+     uint64_t fVblNext = 0;
+     // VBL phase: while frames flow, the host's answer to a flip's fenced flush is the vblank (QEMU releases the guest
+     // at a fixed phase of its panel's refresh); the timer runs on from the last one. fVblLock orders the two callers.
+@@ -91,7 +100,7 @@ public:
+     // VBLs, host answers taken as latch points, answers that moved the latch grid earlier
+     uint64_t fVblTimerN = 0, fLatchAnswers = 0, fLatchEarlier = 0;
+     // debug.nmxfb_vtrace: the last kTrace display events, times in us of the mach clock (ns on x86)
+-    // V vbl, L latch grid after a host answer (arg its phase in the period, us), S flip of a surface (arg id),
++    // V vbl (arg: us after its deadline), L latch grid after a host answer (arg its phase in the period, us), S flip of a surface (arg id),
+     // A host answer to its flush (arg round trip, us)
+     static constexpr unsigned kTrace = 512;
+     struct TraceEv { uint64_t us; uint32_t arg; char kind; };
+@@ -113,13 +122,20 @@ private:
+     IOReturn scanoutSurface(NMXScanoutSurface *r);
+     IOReturn scanoutHome();
+     void dropSurfBlob(SurfBlob &b);
+-    // the one mode's refresh rate: 120 Hz (the host panel's; QEMU's GTK display releases the guest once per host
+-    // refresh), boot-arg nmxvgafb_hz=<30..240> to change it. The VBL timer runs at this rate.
++    // The one mode: with virtio-gpu the host's scanout 0 size (the QEMU window), else the firmware's. Its timing is the
++    // EDID's first detailed timing when that is the mode's (QEMU 0002: reduced blanking at the host's 120 Hz), else
++    // a reduced-blanking one at fHz (120, the host panel's), and boot-arg nmxvgafb_hz=<30..240> forces the latter.
++    // WindowServer needs a timing to see a rate (0.00 Hz without); the VBL timer runs at it.
+     uint32_t fHz = 120;
++    bool fHzForced = false;
+     uint64_t fFrameNs = 8333333ull;
+-    // CEA-like timing for the one mode, so WindowServer sees the rate (it showed 0.00 Hz without timing information)
+-    uint32_t fHT = 0, fVT = 0;
++    uint32_t fRefreshMHz = 120000;
++    uint32_t fHT = 0, fVT = 0, fHSO = 48, fHSW = 32, fVSO = 3, fVSW = 5;
+     uint64_t fPclk = 0;
++    void setTiming();
++    // the host's EDID for scanout 0, handed to IOGraphics (the display shows up as what QEMU describes)
++    uint8_t fEdid[256] = {};
++    uint32_t fEdidLen = 0;
+     // the display hold: the registry stays busy from start() until the accelerator has armed this head (phase 1), so
+     // WindowServer, which waits for a quiet registry before it looks for displays, finds it ready to composite on
+     volatile UInt32 fHolding = 0;
+@@ -140,7 +156,7 @@ private:
+         me->releaseHold("cap");
+     }
+ 
+-    static void vblFire(thread_call_param_t p0, thread_call_param_t) {
++    static void vblFire(void *p0) {
+         NMXVGAFB *me = (NMXVGAFB *)p0;
+         if (me->fStopping) return;
+         // under the scan-out lock: QEMU refuses to flush a blob that is not on a scanout, which the one just
+@@ -208,7 +224,7 @@ public:
+         if (mode != 1 || !info) return kIOReturnBadArgument;
+         bzero(info, sizeof(*info));
+         info->maxDepthIndex = 0; info->nominalWidth = fWidth; info->nominalHeight = fHeight;
+-        info->refreshRate = fHz << 16; info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
++        info->refreshRate = (IOFixed1616)(((uint64_t)fRefreshMHz << 16) / 1000); info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
+         return kIOReturnSuccess;
+     }
+     UInt64 getPixelFormatsForDisplayMode(IODisplayModeID, IOIndex) override { return 0; }
+@@ -231,9 +247,9 @@ public:
+         IODetailedTimingInformationV2 &d = info->detailedInfo.v2;
+         d.pixelClock = d.minPixelClock = d.maxPixelClock = fPclk;
+         d.horizontalActive = fWidth; d.horizontalBlanking = fHT - fWidth;
+-        d.horizontalSyncOffset = 48; d.horizontalSyncPulseWidth = 32;
++        d.horizontalSyncOffset = fHSO; d.horizontalSyncPulseWidth = fHSW;
+         d.verticalActive = fHeight; d.verticalBlanking = fVT - fHeight;
+-        d.verticalSyncOffset = 3; d.verticalSyncPulseWidth = 5;
++        d.verticalSyncOffset = fVSO; d.verticalSyncPulseWidth = fVSW;
+         info->flags = kIODetailedTimingValid;
+         return kIOReturnSuccess;
+     }
+@@ -286,6 +302,8 @@ public:
+         }
+     }
+     IOReturn getAttributeForConnection(IOIndex idx, IOSelect attr, uintptr_t *value) override {
++        // a capability question, asked without a value pointer: the EDID is there to read
++        if (idx == 0 && attr == kConnectionSupportsHLDDCSense) return fEdidLen >= 128 ? kIOReturnSuccess : kIOReturnUnsupported;
+         if (idx != 0 || !value) return kIOReturnBadArgument;
+         switch (attr) {
+         case kConnectionEnable: case kConnectionCheckEnable: *value = 1; return kIOReturnSuccess;
+@@ -296,6 +314,13 @@ public:
+         default: return IOFramebuffer::getAttributeForConnection(idx, attr, value);
+         }
+     }
++    bool hasDDCConnect(IOIndex) override { return fEdidLen >= 128; }
++    IOReturn getDDCBlock(IOIndex, UInt32 blockNumber, IOSelect blockType, IOOptionBits, UInt8 *data, IOByteCount *length) override {
++        if (blockType != kIODDCBlockTypeEDID || blockNumber == 0 || blockNumber * 128 > fEdidLen) return kIOReturnUnsupported;
++        if (!data || !length || *length < 128) return kIOReturnBadArgument;
++        memcpy(data, fEdid + (blockNumber - 1) * 128, 128); *length = 128;
++        return kIOReturnSuccess;
++    }
+     IOReturn connectFlags(IOIndex, IODisplayModeID, IOOptionBits *flags) override {
+         if (flags) *flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
+         return kIOReturnSuccess;
+@@ -343,12 +368,31 @@ void NMXVGAFB::hostLatch(uint64_t at)
+     uint64_t next = fLatch - lead;
+     if (next <= served) next += ((served - next) / p + 1) * p;
+     else next -= ((next - served - 1) / p) * p;
+-    if (next != fVblNext) { fVblNext = next; if (!fStopping) thread_call_enter_delayed(fVblTimer, next); }
++    if (next != fVblNext) { fVblNext = next; if (!fStopping) vblArm(next); }
+     trace('L', fLatch, (uint32_t)((fLatch % p) / 1000));
+     IOLockUnlock(fVblLock);
+ }
+ 
+ // the VBL timer: one VBL per refresh on the phase hostLatch set (or the one it had), skipping ticks it missed
++void NMXVGAFB::vblThreadMain(void *p0, wait_result_t)
++{
++    NMXVGAFB *me = (NMXVGAFB *)p0;
++    IOLockLock(me->fVblLock);
++    while (!me->fStopping) {
++        // (assert_wait_deadline_with_leeway, critical urgency, isn't exported to kexts; a time-constraint thread's
++        // timers are not coalesced)
++        assert_wait_deadline((event_t)&me->fVblNext, THREAD_UNINT, me->fVblNext);
++        IOLockUnlock(me->fVblLock);
++        const wait_result_t w = thread_block(THREAD_CONTINUE_NULL);
++        if (w == THREAD_TIMED_OUT && !me->fStopping) vblFire(me);
++        IOLockLock(me->fVblLock);
++    }
++    me->fVblThreadDone = true;
++    IOLockWakeup(me->fVblLock, (void *)&me->fVblThreadDone, false);
++    IOLockUnlock(me->fVblLock);
++    thread_terminate(current_thread());
++}
++
+ void NMXVGAFB::vblTick(uint64_t at)
+ {
+     if (!fVblLock || !fVblTimer) return;
+@@ -356,18 +400,20 @@ void NMXVGAFB::vblTick(uint64_t at)
+     const uint64_t p = fPeriodAbs;
+     if (fVblNext && at + p / 4 < fVblNext) {
+         // a host answer moved the VBL since this tick was armed
+-        thread_call_enter_delayed(fVblTimer, fVblNext);
++        vblArm(fVblNext);
+         IOLockUnlock(fVblLock);
+         return;
+     }
+     fVblTimerN++;
++    const uint64_t due = fVblNext;
+     uint64_t next = fVblNext ? fVblNext + p : at + p;
+     if (next <= at) next += ((at - next) / p + 1) * p;
+     fLastVbl = at;
+     if (fVbl.proc) fVbl.proc(fVbl.target, fVbl.ref);
+-    trace('V', at, 0);
++    uint64_t lateNs = 0; if (due && at > due) absolutetime_to_nanoseconds(at - due, &lateNs);
++    trace('V', at, (uint32_t)(lateNs / 1000));       // arg: how late the timer fired, us
+     fVblNext = next;
+-    if (!fStopping) thread_call_enter_delayed(fVblTimer, next);
++    if (!fStopping) vblArm(next);
+     IOLockUnlock(fVblLock);
+ }
+ 
+@@ -414,7 +460,7 @@ static int nmxVtraceSysctl(struct sysctl_oid *, void *, int, struct sysctl_req *
+     return r;
+ }
+ SYSCTL_PROC(_debug, OID_AUTO, nmxfb_vtrace, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, nmxVtraceSysctl, "A",
+-            "NMXVGAFB: the last display events (us, V/M/S/A, argument)");
++            "NMXVGAFB: the last display events (us, V/L/S/A, argument)");
+ 
+ SYSCTL_PROC(_debug, OID_AUTO, nmxfb_vtiming, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, nmxVtimingSysctl, "A",
+             "NMXVGAFB: present gaps, scan-out switch and virtio-gpu command times");
+@@ -495,10 +541,8 @@ bool NMXVGAFB::start(IOService *provider)
+     fWidth = (uint32_t)v.v_width; fHeight = (uint32_t)v.v_height; fRowBytes = (uint32_t)v.v_rowBytes;
+     {
+         uint32_t hz = 0;
+-        if (PE_parse_boot_argn("nmxvgafb_hz", &hz, sizeof hz) && hz >= 30 && hz <= 240) fHz = hz;
+-        fFrameNs = 1000000000ull / fHz;
++        if (PE_parse_boot_argn("nmxvgafb_hz", &hz, sizeof hz) && hz >= 30 && hz <= 240) { fHz = hz; fHzForced = true; }
+     }
+-    fHT = fWidth + 160; fVT = fHeight + 35; fPclk = (uint64_t)fHT * fVT * fHz;
+     // the framebuffer must lie in one of the device's memory BARs, or it is not this device's
+     IOPCIDevice *pci = (IOPCIDevice *)provider;
+     bool inBar = false;
+@@ -533,7 +577,9 @@ bool NMXVGAFB::start(IOService *provider)
+         if (PE_parse_boot_argn("-nmxvgafbnovirtio", &off, sizeof(off))) VFBLOG("start: virtio-gpu off (-nmxvgafbnovirtio)");
+         else if (!startVirtio(pci, fBase)) VFBLOG("start: no virtio-gpu scan-out - the VGA BAR stays the scan-out");
+     }
+-    VFBLOG("start: %ux%u pitch %u at 0x%llx, calling IOFramebuffer::start", fWidth, fHeight, fRowBytes, (unsigned long long)fBase);
++    setTiming();
++    VFBLOG("start: %ux%u pitch %u at 0x%llx, %u.%03u Hz, calling IOFramebuffer::start", fWidth, fHeight, fRowBytes,
++           (unsigned long long)fBase, fRefreshMHz / 1000, fRefreshMHz % 1000);
+     if (!IOFramebuffer::start(provider)) { VFBLOG("start: IOFramebuffer::start failed"); return false; }
+     VFBLOG("start: IOFramebuffer::start returned");
+     if (fVirtioOn) {
+@@ -552,8 +598,8 @@ bool NMXVGAFB::start(IOService *provider)
+     // the timing AGDC link-config answers read (NMXAGDC, from NVRMAGDC: NVRMFB publishes the same record); the same
+     // numbers as getTimingInfoForDisplayMode: pixel clock in Hz, refresh in mHz, sync polarity positive
+     {
+-        UInt32 k5[13] = { 0x4b350001u, (UInt32)fPclk, fWidth, fWidth + 48, fWidth + 80, fHT, fHeight, fHeight + 3,
+-                          fHeight + 8, fVT, fHz * 1000u, 1u, 1u };
++        UInt32 k5[13] = { 0x4b350001u, (UInt32)fPclk, fWidth, fWidth + fHSO, fWidth + fHSO + fHSW, fHT, fHeight,
++                          fHeight + fVSO, fHeight + fVSO + fVSW, fVT, fRefreshMHz, 1u, 1u };
+         if (OSData *k5d = OSData::withBytes(k5, sizeof k5)) { setProperty("NVRMTiming", k5d); k5d->release(); }
+     }
+     if (fVirtioOn && OSCompareAndSwapPtr(nullptr, this, (void * volatile *)&gVtInst)) {
+@@ -564,15 +610,21 @@ bool NMXVGAFB::start(IOService *provider)
+     }
+     nanoseconds_to_absolutetime(fFrameNs, &fPeriodAbs);
+     fVblLock = IOLockAlloc();
+-    fVblTimer = fVblLock ? thread_call_allocate(vblFire, this) : nullptr;
+-    if (fVblTimer) {
++    if (fVblLock && kernel_thread_start(&NMXVGAFB::vblThreadMain, this, &fVblThread) == KERN_SUCCESS) {
++        fVblTimer = true;
++        // a display refresh: about 50 us of work each period, due within 1 ms
++        uint64_t comp, cons; nanoseconds_to_absolutetime(50000, &comp); nanoseconds_to_absolutetime(1000000, &cons);
++        thread_time_constraint_policy_data_t tc = { (uint32_t)fPeriodAbs, (uint32_t)comp, (uint32_t)cons, TRUE };
++        kern_return_t pr = thread_policy_set(fVblThread, THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&tc,
++                                             THREAD_TIME_CONSTRAINT_POLICY_COUNT);
++        if (pr != KERN_SUCCESS) VFBLOG("VBL thread: time-constraint policy refused (0x%x)", pr);
+         uint64_t d; clock_interval_to_deadline((uint32_t)(fFrameNs / 1000), kMicrosecondScale, &d);
+-        fVblNext = d; thread_call_enter_delayed(fVblTimer, d);
++        fVblNext = d; vblArm(d);
+     }
+     // No registerPowerDriver here (NMIntelFB has one): IOFramebuffer::start sets up power management with its own
+     // power states, and a second registration with two states panicked in a power-change callout (read at 0x120).
+     VFBLOG("%ux%u pitch %u at 0x%llx adopted from the firmware, %u Hz%s", fWidth, fHeight, fRowBytes,
+-           (unsigned long long)fBase, fHz, fVblTimer ? " (VBL timer)" : ", NO VBL TIMER");
++           (unsigned long long)fBase, fHz, fVblTimer ? " (VBL thread, time-constraint)" : ", NO VBL TIMER");
+     if (fSurfMap && (fHoldCap = thread_call_allocate(holdCapFire, this))) {
+         fHolding = 1; adjustBusy(1);
+         uint64_t d; clock_interval_to_deadline(kHoldCapSec, kSecondScale, &d);
+@@ -597,7 +649,14 @@ void NMXVGAFB::stop(IOService *provider)
+     if (fHoldCap) { thread_call_cancel(fHoldCap); while (!thread_call_free(fHoldCap)) { thread_call_cancel(fHoldCap); IOSleep(5); } fHoldCap = nullptr; }
+     releaseHold("stopping");
+     OSSafeReleaseNULL(fAccel);
+-    if (fVblTimer) { thread_call_cancel(fVblTimer); while (!thread_call_free(fVblTimer)) { thread_call_cancel(fVblTimer); IOSleep(5); } fVblTimer = nullptr; }
++    if (fVblThread) {
++        IOLockLock(fVblLock);
++        thread_wakeup((event_t)&fVblNext);
++        while (!fVblThreadDone) IOLockSleep(fVblLock, (void *)&fVblThreadDone, THREAD_UNINT);
++        IOLockUnlock(fVblLock);
++        thread_deallocate(fVblThread);
++        fVblThread = nullptr; fVblTimer = false;
++    }
+     if (fVblLock) { IOLockFree(fVblLock); fVblLock = nullptr; }
+     OSSafeReleaseNULL(fSurfMap);
+     // QEMU back in VGA mode (the firmware's framebuffer) before the blobs' memory goes
+@@ -628,12 +687,24 @@ bool NMXVGAFB::startVirtio(IOPCIDevice *pci, IOPhysicalAddress vgaBase)
+         fVirtio.reset();
+         return false;
+     }
++    if (fVirtio.edid(fEdid, sizeof fEdid, &fEdidLen))
++        VFBLOG("virtio-gpu: EDID %u bytes, '%c%c%c' product 0x%04x", fEdidLen, '@' + ((fEdid[8] >> 2) & 31),
++               '@' + (((fEdid[8] & 3) << 3) | (fEdid[9] >> 5)), '@' + (fEdid[9] & 31), fEdid[10] | fEdid[11] << 8);
++    else fEdidLen = 0;
++    // the mode is the host window's size: QEMU then shows the scan-out 1:1 (the firmware's mode was stretched)
++    const uint32_t vgaW = fWidth, vgaH = fHeight, vgaPitch = fRowBytes;
++    if (en && hw >= 1024 && hh >= 600 && hw <= 7680 && hh <= 4320) {
++        fWidth = hw; fHeight = hh; fRowBytes = (hw * 4 + 63) & ~63u;
++    } else VFBLOG("virtio-gpu: keeping the firmware's %ux%u", fWidth, fHeight);
+     const uint64_t bytes = ((uint64_t)fRowBytes * fHeight + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+     fScanBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+         kIODirectionInOut | kIOMemoryPhysicallyContiguous, bytes, 0x000000FFFFFFF000ull);
+     if (!fScanBuf) { VFBLOG("virtio-gpu: no %llu bytes of contiguous memory for the scan-out", bytes); fVirtio.reset(); return false; }
+     const uint64_t phys = fScanBuf->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+-    if (IODeviceMemory *vm = IODeviceMemory::withRange(vgaBase, (IOPhysicalLength)fRowBytes * fHeight)) {
++    bzero(fScanBuf->getBytesNoCopy(), bytes);
++    if (fWidth != vgaW || fHeight != vgaH || fRowBytes != vgaPitch) {
++        // a different mode: the firmware's picture doesn't fit, the scan-out starts black
++    } else if (IODeviceMemory *vm = IODeviceMemory::withRange(vgaBase, (IOPhysicalLength)fRowBytes * fHeight)) {
+         if (IOMemoryMap *m = vm->map(kIOMapReadOnly)) {
+             memcpy(fScanBuf->getBytesNoCopy(), (const void *)m->getVirtualAddress(), (size_t)fRowBytes * fHeight);
+             m->release();
+@@ -802,7 +873,8 @@ IOReturn NMXVGAFB::scanoutSurface(NMXScanoutSurface *r)
+             if (fSwitchLogs < 8) VFBLOG("virtio-gpu: surface 0x%x is blob %u (%u ranges, %llu bytes)", r->surfaceId, res, n, bytes);
+         } else {
+             if (prepared) md->complete();
+-            if (fSwitchLogs < 8) VFBLOG("virtio-gpu: surface 0x%x: no blob (%u ranges%s)", r->surfaceId, n, fits ? ", refused by the host" : ", not describable");
++            if (fSwitchLogs < 8) VFBLOG("virtio-gpu: surface 0x%x: no blob (%u ranges of at most %u%s)", r->surfaceId, n, NMXVirtioGPU::kMaxEntries,
++                                     fits ? ", refused by the host" : ", not describable");
+             ret = kIOReturnUnsupported;
+         }
+         if (rg) IOFree(rg, sizeof(NMXVirtioGPU::Range) * NMXVirtioGPU::kMaxEntries);
+@@ -815,23 +887,30 @@ IOReturn NMXVGAFB::scanoutSurface(NMXScanoutSurface *r)
+             fPresentHist[k]++;
+         }
+         fLastPresent = t0;
+-        if (hit->res != fCurRes && !fVirtio.setScanoutBlob(hit->res, hit->w, hit->h, hit->pitch)) ret = kIOReturnIOError;
+-        else {
+-            fCurRes = hit->res; fCurW = hit->w; fCurH = hit->h;
+-            fCurFinal = r->version >= 2 && (r->flags & NMX_SCANOUT_FINAL);
++        const bool final = r->version >= 2 && (r->flags & NMX_SCANOUT_FINAL);
++        if (final) {
+             // A final frame's flush is fenced: the host answers once it has shown it, so the flip (and the
+-            // accelerator's transaction) completes then, and the answer is this display's vblank.
+-            if (fCurFinal) {
+-                const uint64_t f0 = mach_absolute_time();
+-                trace('S', t0, r->surfaceId);
+-                if (fVirtio.flushShown(fCurRes, fCurW, fCurH, &shownAt) && fVirtio.interrupts()) {
++            // accelerator's transaction) completes then, and the answer is this display's vblank. Switching to
++            // another blob sends SET_SCANOUT_BLOB with it, in one round trip.
++            const uint64_t f0 = mach_absolute_time();
++            trace('S', t0, r->surfaceId);
++            const bool ok = hit->res != fCurRes ? fVirtio.flipShown(hit->res, hit->w, hit->h, hit->pitch, &shownAt)
++                                                : fVirtio.flushShown(hit->res, hit->w, hit->h, &shownAt);
++            if (!ok) ret = kIOReturnIOError;
++            else {
++                fCurRes = hit->res; fCurW = hit->w; fCurH = hit->h; fCurFinal = true;
++                if (fVirtio.interrupts()) {
+                     uint64_t rt = 0; absolutetime_to_nanoseconds(shownAt - f0, &rt);
+                     trace('A', shownAt, (uint32_t)(rt / 1000));
+                     if (fDeferredSeen < kPacedSeen && rt > kPacedNs && ++fDeferredSeen == kPacedSeen)
+                         VFBLOG("virtio-gpu: the host answers fenced flushes when it has shown the frame - VBL follows its latch points");
+                     host = fDeferredSeen >= kPacedSeen;
+                 }
+-            } else fVirtio.flush(fCurRes, 0, 0, fCurW, fCurH);
++            }
++        } else if (hit->res != fCurRes && !fVirtio.setScanoutBlob(hit->res, hit->w, hit->h, hit->pitch)) ret = kIOReturnIOError;
++        else {
++            fCurRes = hit->res; fCurW = hit->w; fCurH = hit->h; fCurFinal = false;
++            fVirtio.flush(fCurRes, 0, 0, fCurW, fCurH);
+         }
+     }
+     IOLockUnlock(fScanLock);
+@@ -920,6 +999,27 @@ IOReturn NMXVGAFB::setCursorState(SInt32 x, SInt32 y, bool visible)
+     return kIOReturnSuccess;
+ }
+ 
++// the mode's timing: the EDID's first detailed timing when it describes this mode, else reduced blanking at fHz
++void NMXVGAFB::setTiming()
++{
++    auto d = [this](unsigned i) -> uint32_t { return fEdid[54 + i]; };     // the first detailed timing descriptor
++    const uint64_t pclk = (uint64_t)(d(0) | d(1) << 8) * 10000;
++    const uint32_t ha = d(2) | (d(4) & 0xf0) << 4, hb = d(3) | (d(4) & 0x0f) << 8;
++    const uint32_t va = d(5) | (d(7) & 0xf0) << 4, vb = d(6) | (d(7) & 0x0f) << 8;
++    if (!fHzForced && fEdidLen >= 128 && pclk && ha == fWidth && va == fHeight && hb && vb) {
++        fHT = ha + hb; fVT = va + vb; fPclk = pclk;
++        fHSO = d(8) | (d(11) & 0xc0) << 2; fHSW = d(9) | (d(11) & 0x30) << 4;
++        fVSO = d(10) >> 4 | (d(11) & 0x0c) << 2; fVSW = (d(10) & 0x0f) | (d(11) & 0x03) << 4;
++    } else {
++        fHT = fWidth + 160; fVT = fHeight + 35; fPclk = (uint64_t)fHT * fVT * fHz;
++        fHSO = 48; fHSW = 32; fVSO = 3; fVSW = 5;
++    }
++    const uint64_t frame = (uint64_t)fHT * fVT;
++    fFrameNs = frame * 1000000000ull / fPclk;
++    fRefreshMHz = (uint32_t)((fPclk * 1000 + frame / 2) / frame);
++    fHz = (fRefreshMHz + 500) / 1000;
++}
++
+ IOReturn NMXVGAFB::snapshot(void *dst, size_t cap, size_t *len)
+ {
+     if (!fVirtioOn || !fScanLock) return kIOReturnNotReady;

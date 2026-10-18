@@ -1,0 +1,80 @@
+From 622c9e77041ce4ebd2b36b74feb48b931ed8464b Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 21:41:47 +0200
+Subject: [PATCH 43/50] bsdcompat: a process record whose pid changed belongs
+ to an exited process
+
+Process records are keyed by xnu's proc pointer and never freed, so a new
+process allocated at an exited one's proc found its record: the old pid,
+name and LinuxKPI mm (and through it the dead Mach task). Unlink such a
+record on lookup and start a fresh one; it stays allocated, since objects of
+the dead process may still point at it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ bsdcompat/src/nmx_kernel.c | 30 +++++++++++++++++++++++++++---
+ 1 file changed, 27 insertions(+), 3 deletions(-)
+
+diff --git a/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c b/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c
+index 27ab6bc..96a5ae6 100644
+--- a/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c
++++ b/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c
+@@ -100,14 +100,35 @@ static unsigned bucket_of(const void *p, unsigned n)
+     return (unsigned)((v >> 4) ^ (v >> 12)) & (n - 1);
+ }
+ 
++/*
++ * A record is keyed by xnu's proc pointer, which a later process can be allocated at once the first one is gone (a
++ * relaunched WindowServer was): a record whose pid differs belongs to a dead process and is unlinked, so the new
++ * process starts clean. Its p_lkpi_mm named the dead task, and wiring user pages through that task's destroyed map
++ * panicked in vm_map_copy_extract. The stale record itself stays allocated: objects of the dead process may still
++ * point at it (records were never freed before either).
++ */
++static pid_t nmx_proc_unlink_stale(unsigned b, void *xnu, pid_t pid)
++{
++    pid_t stale = 0;
++    for (struct nmx_proc_rec **pp = &nmx_procs[b]; *pp; ) {
++        if ((*pp)->xnu == xnu && (*pp)->p.p_pid != pid) {
++            stale = (*pp)->p.p_pid;
++            *pp = (*pp)->next;
++        } else
++            pp = &(*pp)->next;
++    }
++    return stale;
++}
++
+ static struct proc *nmx_proc_for(void *xnu)
+ {
+     if (xnu == NULL)
+         return nmx_kernproc;
++    const pid_t pid = proc_pid(xnu);
+     unsigned b = bucket_of(xnu, NMX_PROC_BUCKETS);
+     lck_spin_lock(nmx_thread_lock);
+     for (struct nmx_proc_rec *r = nmx_procs[b]; r; r = r->next)
+-        if (r->xnu == xnu) { lck_spin_unlock(nmx_thread_lock); return &r->p; }
++        if (r->xnu == xnu && r->p.p_pid == pid) { lck_spin_unlock(nmx_thread_lock); return &r->p; }
+     lck_spin_unlock(nmx_thread_lock);
+ 
+     struct nmx_proc_rec *nr = IOMallocZero(sizeof(*nr));
+@@ -115,15 +136,18 @@ static struct proc *nmx_proc_for(void *xnu)
+         return nmx_kernproc;
+     nr->xnu = xnu;
+     nr->p.nmx_xnu = xnu;
+-    nr->p.p_pid = proc_pid(xnu);
++    nr->p.p_pid = pid;
+     proc_name(nr->p.p_pid, nr->p.p_comm, sizeof(nr->p.p_comm));
+ 
+     lck_spin_lock(nmx_thread_lock);
+     for (struct nmx_proc_rec *r = nmx_procs[b]; r; r = r->next)
+-        if (r->xnu == xnu) { lck_spin_unlock(nmx_thread_lock); IOFree(nr, sizeof(*nr)); return &r->p; }
++        if (r->xnu == xnu && r->p.p_pid == pid) { lck_spin_unlock(nmx_thread_lock); IOFree(nr, sizeof(*nr)); return &r->p; }
++    const pid_t stale = nmx_proc_unlink_stale(b, xnu, pid);
+     nr->next = nmx_procs[b];
+     nmx_procs[b] = nr;
+     lck_spin_unlock(nmx_thread_lock);
++    if (stale)
++        printf("NullMoth xkpi: pid %d took over the process record of exited pid %d - a fresh record\n", pid, stale);
+     return &nr->p;
+ }
+ 

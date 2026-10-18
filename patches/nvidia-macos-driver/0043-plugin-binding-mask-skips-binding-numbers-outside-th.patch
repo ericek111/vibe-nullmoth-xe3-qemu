@@ -1,0 +1,34 @@
+From af58058d68409a1c96a6e488c391bee83fc91221 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 21:06:27 +0200
+Subject: [PATCH 43/47] plugin: binding mask skips binding numbers outside the
+ set layout
+
+CoreAnimation's fragment modules declare [[color(0..2)]] framebuffer fetch
+(bindings 192-194) behind a function constant. nvmtl_spirv_bmask gave up on
+any number outside the layout, so those pipelines wrote all ~290 bindings of
+every descriptor set. Nothing can be written for a binding the layout lacks,
+so it is skipped instead. WindowServer drag: 1-15 writes per set instead of
+~290, bind_set 13.7 -> 5-8 us per call, ~12% less CPU per frame.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugin/nvmtl_vk.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/plugin/nvmtl_vk.c b/plugin/nvmtl_vk.c
+index 4a7b990..4244905 100644
+--- a/plugin/nvmtl_vk.c
++++ b/plugin/nvmtl_vk.c
+@@ -2002,7 +2002,10 @@ static int nvmtl_spirv_bmask(const void *p, size_t n, uint64_t out[4])
+             uint32_t b = w[i + 3];
+             if (b == NVMTL_ADDRESS_BINDING_NUMBER) out[NVMTL_ADDRESS_BINDING >> 6] |= 1ull << (NVMTL_ADDRESS_BINDING & 63);
+             else if (b < NVMTL_ADDRESS_BINDING) out[b >> 6] |= 1ull << (b & 63);
+-            else if (!(b >= NVMTL_STEX_BINDING_NUMBER && b < NVMTL_STEX_BINDING_NUMBER + NVMTL_NSTEX)) return 0;
++            /* Any other number (192-199 [[color(n)]] framebuffer fetch, 200-479 tile memory) is not a binding of the set
++               layout, so there is nothing to write for it whatever the mask says. Giving up here sent every pipeline of
++               CoreAnimation's fragment modules, which declare color(0..2) behind a function constant, down the write-all
++               path: ~290 descriptor writes per set, most of WindowServer's per-draw CPU. */
+         }
+         i += wc;
+     }

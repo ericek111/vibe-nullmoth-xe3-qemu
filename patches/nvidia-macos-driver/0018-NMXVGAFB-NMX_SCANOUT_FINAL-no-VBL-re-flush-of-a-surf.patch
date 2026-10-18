@@ -1,0 +1,74 @@
+From 8675d8618276b6085100bb69728bdbd58b2b46e6 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 23:24:53 +0200
+Subject: [PATCH 18/47] NMXVGAFB: NMX_SCANOUT_FINAL - no VBL re-flush of a
+ surface whose pixels are final
+
+Scan-out ABI version 2 adds flags. NMXAccel sets NMX_SCANOUT_FINAL when it
+ordered the flip after the surface's pixels; such a surface is flushed once
+when it goes on the panel and not again on later VBLs (a re-flush would show
+whatever is written into it while it is still on the panel).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ kexts/NMXVGAFB/nmx_scanout_abi.h | 6 +++++-
+ kexts/NMXVGAFB/nmxvgafb.cpp      | 9 +++++++--
+ 2 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/kexts/NMXVGAFB/nmx_scanout_abi.h b/kexts/NMXVGAFB/nmx_scanout_abi.h
+index 7b940dc..d8e7c7e 100644
+--- a/kexts/NMXVGAFB/nmx_scanout_abi.h
++++ b/kexts/NMXVGAFB/nmx_scanout_abi.h
+@@ -2,7 +2,7 @@
+ // framebuffer's own buffer. Called with callPlatformFunction on the framebuffer.
+ #pragma once
+ 
+-#define NMX_SCANOUT_ABI_VERSION 1u
++#define NMX_SCANOUT_ABI_VERSION 2u
+ #define NMX_SCANOUT_FN_SURFACE  "nmxScanoutSurface"   // p1 = struct NMXScanoutSurface *
+ #define NMX_SCANOUT_FN_HOME     "nmxScanoutHome"      // no arguments
+ 
+@@ -13,4 +13,8 @@ struct NMXScanoutSurface {
+     unsigned int width, height, pitch;
+     unsigned int format;        // 'BGRA' (0x42475241); only that is accepted
+     unsigned long long ns;      // out: how long the switch took
++    unsigned int flags;         // version 2: NMX_SCANOUT_*
+ };
++// the surface's pixels are final (the accelerator ordered the flip after them): one flush now, none on later VBLs -
++// a re-flush would show whatever a later frame writes into the surface while it is still on the panel
++#define NMX_SCANOUT_FINAL 0x1u
+diff --git a/kexts/NMXVGAFB/nmxvgafb.cpp b/kexts/NMXVGAFB/nmxvgafb.cpp
+index 206665e..b910569 100644
+--- a/kexts/NMXVGAFB/nmxvgafb.cpp
++++ b/kexts/NMXVGAFB/nmxvgafb.cpp
+@@ -56,6 +56,7 @@ class NMXVGAFB : public IOFramebuffer {
+     uint32_t fNextRes = 16;
+     volatile uint32_t fCurRes = 0;        // the resource on scanout 0 (kScanResource or a surface's)
+     uint32_t fCurW = 0, fCurH = 0;
++    bool fCurFinal = false;               // the surface on scanout 0 came with NMX_SCANOUT_FINAL: no VBL re-flush
+     uint64_t fLastPresent = 0;            // mach time of the last scanoutSurface (a present)
+ public:
+     // present pacing, read through debug.nmxfb_vtiming: intervals between presents (ms buckets), time in scanoutSurface
+@@ -112,7 +113,7 @@ private:
+             IOLockLock(me->fScanLock);
+             uint64_t sinceNs = 0;
+             if (me->fCurRes != kScanResource) absolutetime_to_nanoseconds(now - me->fLastPresent, &sinceNs);
+-            const bool flush = sinceNs < kSurfFlushNs;
++            const bool flush = sinceNs < kSurfFlushNs && !(me->fCurRes != kScanResource && me->fCurFinal);
+             if (flush) me->fVirtio.flush(me->fCurRes, 0, 0, me->fCurW, me->fCurH);
+             if (!flush && me->fFlushing && me->fIdleLogs < 3) {
+                 me->fIdleLogs++;
+@@ -645,7 +646,11 @@ IOReturn NMXVGAFB::scanoutSurface(NMXScanoutSurface *r)
+         }
+         fLastPresent = t0;
+         if (hit->res != fCurRes && !fVirtio.setScanoutBlob(hit->res, hit->w, hit->h, hit->pitch)) ret = kIOReturnIOError;
+-        else { fCurRes = hit->res; fCurW = hit->w; fCurH = hit->h; fVirtio.flush(fCurRes, 0, 0, fCurW, fCurH); }
++        else {
++            fCurRes = hit->res; fCurW = hit->w; fCurH = hit->h;
++            fCurFinal = r->version >= 2 && (r->flags & NMX_SCANOUT_FINAL);
++            fVirtio.flush(fCurRes, 0, 0, fCurW, fCurH);
++        }
+     }
+     IOLockUnlock(fScanLock);
+     uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);

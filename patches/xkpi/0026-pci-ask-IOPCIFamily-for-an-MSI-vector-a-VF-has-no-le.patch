@@ -1,0 +1,77 @@
+From 31ccc70454a157b625c42940992f266dd1773d46 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 07:45:49 +0200
+Subject: [PATCH 26/50] pci: ask IOPCIFamily for an MSI vector; a VF has no
+ legacy interrupt line
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ xnu/nmx_pci.cpp | 32 ++++++++++++++++++++++++++------
+ 1 file changed, 26 insertions(+), 6 deletions(-)
+
+diff --git a/gpu-port/xkpi/xnu/nmx_pci.cpp b/gpu-port/xkpi/xnu/nmx_pci.cpp
+index 52e5cb6..bd31bed 100644
+--- a/gpu-port/xkpi/xnu/nmx_pci.cpp
++++ b/gpu-port/xkpi/xnu/nmx_pci.cpp
+@@ -102,15 +102,19 @@ public:
+     IOInterruptEventSource *es;
+     void (*handler)(void *);
+     void *arg;
+-    bool initIrq() { return init(); }
++    volatile SInt32 delivered;
++    bool initIrq() { delivered = 0; return init(); }
+ };
+ OSDefineMetaClassAndStructors(NMXIrq, OSObject)
+ 
+ static void irq_action(OSObject *owner, IOInterruptEventSource *src, int count)
+ {
+     NMXIrq *irq = OSDynamicCast(NMXIrq, owner);
+-    if (irq)
++    if (irq) {
++        if (OSIncrementAtomic(&irq->delivered) == 0)
++            IOLog("NullMoth GPU: first interrupt delivered\n");
+         irq->handler(irq->arg);
++    }
+ }
+ 
+ /* the IOKit interrupt index of the n-th message-signalled vector (vector >= 0) or of the legacy line (vector < 0) */
+@@ -132,11 +136,8 @@ static int interrupt_index(IOPCIDevice *d, int vector)
+     return vector < 0 ? legacy : -1;
+ }
+ 
+-extern "C" int nmx_xnu_pci_msi_count(void *pci)
++static int count_messaged(IOPCIDevice *d)
+ {
+-    IOPCIDevice *d = (IOPCIDevice *)pci;
+-    if (d == nullptr)
+-        return 0;
+     int n = 0;
+     for (int index = 0; ; index++) {
+         int type = 0;
+@@ -148,6 +149,25 @@ extern "C" int nmx_xnu_pci_msi_count(void *pci)
+     return n;
+ }
+ 
++/*
++ * IOPCIFamily publishes only the legacy line until a driver asks for message-signalled vectors. An SR-IOV virtual
++ * function has no legacy line at all (its INTx pin is hard-wired to 0), so without this a VF never interrupts: GuC
++ * replies were polled and no fence ever signalled. One MSI vector is asked for, which is what Linux's xe uses.
++ */
++extern "C" int nmx_xnu_pci_msi_count(void *pci)
++{
++    IOPCIDevice *d = (IOPCIDevice *)pci;
++    if (d == nullptr)
++        return 0;
++    int n = count_messaged(d);
++    if (n == 0 && d->findPCICapability(kIOPCIMSICapability) != 0) {
++        IOReturn r = d->configureInterrupts(kIOInterruptTypePCIMessaged, 1, 1);
++        n = count_messaged(d);
++        IOLog("NullMoth GPU: MSI requested (configureInterrupts 0x%x): %d message-signalled vector(s)\n", r, n);
++    }
++    return n;
++}
++
+ extern "C" int nmx_xnu_pci_irq_setup(void *pci, int vector, void (*handler)(void *), void *arg, void **cookie)
+ {
+     IOPCIDevice *d = (IOPCIDevice *)pci;

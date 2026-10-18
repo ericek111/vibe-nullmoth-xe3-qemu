@@ -1,0 +1,178 @@
+From b7f102a8335c1e60540d652b33262b9f6faed077 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 03:30:30 +0200
+Subject: [PATCH 25/47] plugin: IOSurface textures on an integrated GPU are
+ images over the surface's own pages
+
+On NMXAccel (Intel/AMD) an IOSurface texture was a private optimal image, copied in from the surface before GPU use
+and copied out after every GPU write (3 ms per 1920x1080 frame), with IOSurface seeds deciding when a copy was due.
+Now the surface's CPU mapping is imported (VK_EXT_external_memory_host) and a linear image (explicit DRM-linear row
+pitch) is bound over it: no copies, and every process sees the same pixels as soon as a command buffer completes.
+Single-plane surfaces with a page-aligned base and a 64-byte-multiple row only; anything else, or a refused import,
+keeps the private image. NVMTL_NO_HOST_SURFACE=1 or /var/db/nvmtl-no-host-surface turns it off.
+
+CoreAnimation re-wraps the same surfaces in new textures every frame, so the 48 most recent host images (at most
+192 MB) stay referenced; without that each wrapper was a fresh userptr VM_BIND (12% of WindowServer's main thread
+during a window drag).
+
+Measured (window drag, 10 s): 54 -> 68 presents/s; WindowServer still ~1.3 cores (other costs). typetest.py: 0
+glitching frames of 600 in both modes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugin/NVMTLDevice.m  | 70 +++++++++++++++++++++++++++++++++++++++++++
+ plugin/NVMTLObjects.h |  1 +
+ plugin/NVMTLObjects.m |  5 ++--
+ 3 files changed, 74 insertions(+), 2 deletions(-)
+
+diff --git a/plugin/NVMTLDevice.m b/plugin/NVMTLDevice.m
+index 3f0a130..8fe8bc8 100644
+--- a/plugin/NVMTLDevice.m
++++ b/plugin/NVMTLDevice.m
+@@ -729,6 +729,53 @@ static void nvmtl_vram_tag_set(IOSurfaceRef surf, NSUInteger plane, uint32_t see
+     CFDataRef d = CFDataCreate(NULL, (const UInt8 *)&t, sizeof t); CFStringRef k = nvmtl_vram_tag_key(plane);
+     IOSurfaceSetValue(surf, k, d); CFRelease(k); CFRelease(d);
+ }
++/* An integrated GPU (NMXAccel: Intel/AMD) reads and writes system memory as fast as its own allocations, so an IOSurface
++   texture is a linear image over the surface's own pages (imported host memory) instead of a private image that is
++   copied in before GPU use and out after every GPU write. That removes two CPU copies per surface per frame, and the
++   seed bookkeeping that decided when a copy was due: the GPU sees the surface's current pixels, and other processes
++   (WindowServer, CoreDisplay, the display scan-out) see the GPU's writes once the command buffer completes.
++   NVMTL_NO_HOST_SURFACE=1, or the file /var/db/nvmtl-no-host-surface, turns it off (private images and copies). */
++static unsigned long long g_surf_host, g_surf_host_refused;
++static int nvmtl_surface_host_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("NVMTL_NO_HOST_SURFACE");
++        const int off = (e && e[0] == '1') || access("/var/db/nvmtl-no-host-surface", F_OK) == 0;
++        on = nvmtl_vk_vendor() != 0x10de && !off;
++        nvlog("IOSurface textures %s (vendor 0x%04x%s)", on ? "are images over the surface's own pages (no copies)"
++              : "are private images, copied in and out", nvmtl_vk_vendor(), off ? ", turned off" : "");
++    }
++    return on;
++}
++static int nvmtl_surface_host_image(NVMTLTexture *t, IOSurfaceRef surf, uint32_t w, uint32_t h, uint32_t vkf, uint32_t bpp,
++                                    int a8, int stex)
++{
++    void *base = IOSurfaceGetBaseAddress(surf);
++    const size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf);
++    const size_t len = (IOSurfaceGetAllocSize(surf) + 4095) & ~(size_t)4095;
++    const char *why = !base ? "no CPU mapping" : ((uintptr_t)base & 4095) ? "base not page-aligned"
++                    : (size_t)w * (bpp ? bpp : 4) > row || h > sh ? "image larger than the surface"
++                    : row % 64 ? "row not a multiple of 64 bytes" : row * (h - 1) + (size_t)w * (bpp ? bpp : 4) > len ? "rows pass the allocation" : NULL;
++    nvk_buffer hb;
++    if (!why && nvmtl_vk_buffer_import_host(base, len, &hb)) why = "host import refused";
++    if (!why) {
++        if (nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, 1, 1, &hb, 0, row, &t->_i)) { why = "no linear image over it"; nvmtl_vk_buffer_destroy(&hb); }
++        else if (stex && !t->_i.storage) { why = "ShaderWrite asked, linear storage refused"; nvmtl_vk_image_destroy(&t->_i); nvmtl_vk_buffer_destroy(&hb); }
++    }
++    if (why) {
++        g_surf_host_refused++;
++        static unsigned n; if (n++ < 16 || n % 1000 == 0)
++            nvlog("host surface %u %ux%u (row %zu, fmt %u): %s - private image + copies (%llu host, %llu refused)",
++                  (unsigned)IOSurfaceGetID(surf), w, h, row, vkf, why, g_surf_host, g_surf_host_refused);
++        return -1;
++    }
++    t->_hostBuf = hb; t->_hostOn = YES; g_surf_host++;
++    static unsigned n; if (n++ < 8 || n % 2000 == 0)
++        nvlog("host surface %u %ux%u row %zu fmt %u: image over its own pages (%llu host, %llu refused)",
++              (unsigned)IOSurfaceGetID(surf), w, h, row, vkf, g_surf_host, g_surf_host_refused);
++    return 0;
++}
+ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
+                                       uint32_t vkf, uint32_t bpp, int a8, int stex)
+ {
+@@ -751,6 +798,9 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
+             }
+         }
+     }
++    if (surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1 && nvmtl_surface_host_on()) {
++        if (!nvmtl_surface_host_image(t, surf, w, h, vkf, bpp, a8, stex)) return 0;
++    }
+     g_surf_private++;
+     // A private image stands for the whole surface: wrappers that read it and wrappers that write it must share ONE image
+     // (nvmtlNewSurfaceTexture caches it), or what one writes the other never sees. So it is made writable whenever the
+@@ -767,6 +817,24 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
+ }
+ 
+ static char nvmtl_surface_cache_key;
++/* CoreAnimation wraps the same IOSurfaces in new textures every frame (its flatten cache, layer contents) and drops
++   them right after; with the weak cache alone each wrapper was a fresh host import (a userptr VM_BIND, 12% of
++   WindowServer's main thread while dragging a window). The most recently used host images stay alive here, which also
++   keeps their surfaces: at most 48 of them and 192 MB. Called under the device lock. */
++static char nvmtl_host_keep_key;
++static void nvmtl_host_keep(NVMTLDevice *dev, NVMTLTexture *t)
++{
++    NSMutableArray *keep = objc_getAssociatedObject(dev, &nvmtl_host_keep_key);
++    if (!keep) { keep = [NSMutableArray new]; objc_setAssociatedObject(dev, &nvmtl_host_keep_key, keep, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
++    if (keep.count && keep.lastObject == t) return;
++    [keep removeObjectIdenticalTo:t];
++    [keep addObject:t];
++    size_t bytes = 0;
++    for (NVMTLTexture *k in keep) bytes += k->_hostBuf.size;
++    while (keep.count > 1 && (keep.count > 48 || bytes > (192u << 20))) {
++        NVMTLTexture *old = keep.firstObject; bytes -= old->_hostBuf.size; [keep removeObjectAtIndex:0];
++    }
++}
+ - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surf plane:(NSUInteger)plane {
+     @synchronized(self) {
+         NSMapTable *cache = objc_getAssociatedObject(self, &nvmtl_surface_cache_key);
+@@ -798,6 +866,7 @@ static char nvmtl_surface_cache_key;
+     // whether a wrapper reads it or writes it (the image is made writable).
+     // Weak entries do not pin the image after the application's last wrapper.
+     if (backing && !backing->_vramOn) {
++        if (backing->_hostOn) nvmtl_host_keep(self, backing);
+         NVMTLTexture *alias = (NVMTLTexture *)[backing newTextureViewWithPixelFormat:d.pixelFormat];
+         if (alias) {
+             alias->_viewParent = nil; alias->_usage = d.usage; alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
+@@ -815,6 +884,7 @@ static char nvmtl_surface_cache_key;
+     t->_usage = d.usage;
+     nvmtl_texture_desc_swizzle(t, d);
+     if (key && !t->_vramOn) [cache setObject:t forKey:key];
++    if (key && t->_hostOn) nvmtl_host_keep(self, t);
+     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
+           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);
+     return t; }
+diff --git a/plugin/NVMTLObjects.h b/plugin/NVMTLObjects.h
+index 83c149c..de9ec5a 100644
+--- a/plugin/NVMTLObjects.h
++++ b/plugin/NVMTLObjects.h
+@@ -45,6 +45,7 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); return
+   uint32_t _baseSlice, _baseLevel;
+   uint32_t _surfSeed, _surfGen; BOOL _surfSynced, _surfOwned;
+   nvk_buffer _vramBuf; BOOL _vramOn;
++  nvk_buffer _hostBuf; BOOL _hostOn;   // an integrated GPU's image over the IOSurface's own pages: no copies
+   BOOL _stex;
+   uint64_t _resid;
+   NSUInteger _usage;
+diff --git a/plugin/NVMTLObjects.m b/plugin/NVMTLObjects.m
+index f99eefb..f71198b 100644
+--- a/plugin/NVMTLObjects.m
++++ b/plugin/NVMTLObjects.m
+@@ -1153,6 +1153,7 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d) {
+     if (!_parent) nvmtl_vk_image_destroy(&_i);
+     if (_stTwin.img) nvmtl_vk_image_destroy(&_stTwin);
+     if (!_parent && _vramOn) { nvmtl_vk_buffer_destroy(&_vramBuf); _vramOn = NO; }
++    if (!_parent && _hostOn) { nvmtl_vk_buffer_destroy(&_hostBuf); _hostOn = NO; }
+     if (_surfOwned && _surf) CFRelease(_surf);
+     if (_subHeap) { NVMTLHeap *h = _subHeap; NSUInteger c = _subCharge; _subHeap = nil; _subCharge = 0;
+                     if (_subPlaced && c) { _subPlaced = NO; [h nvmtlGiveRange:_heapOffset length:c]; }
+@@ -1203,7 +1204,7 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
+ }
+ - (void)nvmtlSurfaceIn {
+     NVMTLTexture *r = _parent ? _parent : self;
+-    if (!r->_surf) return;
++    if (!r->_surf || r->_hostOn) return;   // a host image is the surface: nothing to copy in
+     @synchronized (nvmtl_surface_sync(r)) {
+     const uint32_t vgen = r->_vramOn ? 0 : nvmtl_vram_gen(r->_surf, r->_plane);
+     if (r->_surfSynced && IOSurfaceGetSeed(r->_surf) == r->_surfSeed && (r->_vramOn || vgen == r->_surfGen)) return;
+@@ -1228,7 +1229,7 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
+ }
+ - (BOOL)nvmtlSurfaceOut {
+     NVMTLTexture *r = _parent ? _parent : self;
+-    if (!r->_surf) return YES;
++    if (!r->_surf || r->_hostOn) return YES;   // the GPU wrote the surface's own pages
+     @synchronized (nvmtl_surface_sync(r)) {
+     if (![r nvmtlSurfaceCopyable]) return NO;
+     if (r->_vramOn && !nvmtl_vk_surface_dirty((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)r->_plane)) {

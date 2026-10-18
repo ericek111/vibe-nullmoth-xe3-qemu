@@ -1,0 +1,108 @@
+From 372d5681bf58c16b1f9fa6a647037546bad4d4a8 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 22:10:54 +0200
+Subject: [PATCH 7/8] vulkan: entrypoint stubs on Apple instead of
+ flat-namespace weak imports
+
+Generated-by: LLM
+---
+ src/vulkan/util/vk_dispatch_table_gen.py | 29 ++++++++++++++++++++----
+ src/vulkan/util/vk_entrypoints_gen.py    | 10 ++++++--
+ 2 files changed, 33 insertions(+), 6 deletions(-)
+
+diff --git a/src/vulkan/util/vk_dispatch_table_gen.py b/src/vulkan/util/vk_dispatch_table_gen.py
+index c2776d26083..979c3a1ba35 100644
+--- a/src/vulkan/util/vk_dispatch_table_gen.py
++++ b/src/vulkan/util/vk_dispatch_table_gen.py
+@@ -65,7 +65,14 @@ TEMPLATE_H = Template(COPYRIGHT + """\
+ extern "C" {
+ #endif
+ 
+-#ifdef _MSC_VER
++#if defined(_MSC_VER) || defined(__APPLE__)
++#define VK_ENTRYPOINT_STUBS 1
++#endif
++#ifdef __APPLE__
++#define VK_ENTRYPOINT_STUB_SECTION "__TEXT,__vk_ep_stubs,regular,pure_instructions"
++#endif
++
++#ifdef VK_ENTRYPOINT_STUBS
+ VKAPI_ATTR void VKAPI_CALL vk_entrypoint_stub(void);
+ #endif
+ 
+@@ -567,7 +574,21 @@ vk_device_entrypoint_is_enabled(int index, uint32_t core_version,
+    }
+ }
+ 
+-#ifdef _MSC_VER
++#ifdef __APPLE__
++VKAPI_ATTR __attribute__ ((section(VK_ENTRYPOINT_STUB_SECTION))) void VKAPI_CALL vk_entrypoint_stub(void)
++{
++   __builtin_trap();
++}
++
++extern const char vk_entrypoint_stubs_start __asm("section$start$__TEXT$__vk_ep_stubs");
++extern const char vk_entrypoint_stubs_end __asm("section$end$__TEXT$__vk_ep_stubs");
++
++static bool vk_function_is_stub(PFN_vkVoidFunction func)
++{
++   const char *f = (const char *)func;
++   return f >= &vk_entrypoint_stubs_start && f < &vk_entrypoint_stubs_end;
++}
++#elif defined(_MSC_VER)
+ VKAPI_ATTR void VKAPI_CALL vk_entrypoint_stub(void)
+ {
+    UNREACHABLE("Entrypoint not implemented");
+@@ -609,7 +630,7 @@ void vk_${type}_dispatch_table_from_entrypoints(
+     if (overwrite) {
+         memset(dispatch_table, 0, sizeof(*dispatch_table));
+         for (unsigned i = 0; i < ARRAY_SIZE(${type}_compaction_table); i++) {
+-#ifdef _MSC_VER
++#ifdef VK_ENTRYPOINT_STUBS
+             assert(entry[i] != NULL);
+             if (vk_function_is_stub(entry[i]))
+ #else
+@@ -623,7 +644,7 @@ void vk_${type}_dispatch_table_from_entrypoints(
+     } else {
+         for (unsigned i = 0; i < ARRAY_SIZE(${type}_compaction_table); i++) {
+             unsigned disp_index = ${type}_compaction_table[i];
+-#ifdef _MSC_VER
++#ifdef VK_ENTRYPOINT_STUBS
+             assert(entry[i] != NULL);
+             if (disp[disp_index] == NULL && !vk_function_is_stub(entry[i]))
+ #else
+diff --git a/src/vulkan/util/vk_entrypoints_gen.py b/src/vulkan/util/vk_entrypoints_gen.py
+index 9dbe00eefbe..ff32879d74f 100644
+--- a/src/vulkan/util/vk_entrypoints_gen.py
++++ b/src/vulkan/util/vk_entrypoints_gen.py
+@@ -186,6 +186,12 @@ TEMPLATE_C = Template(COPYRIGHT + """
+ #endif
+ #endif
+ #else
++#ifdef __APPLE__
++    VKAPI_ATTR __attribute__ ((weak, section(VK_ENTRYPOINT_STUB_SECTION))) ${e.return_type} VKAPI_CALL ${p}_${e.name}(${e.decl_params()})
++    {
++        __builtin_trap();
++    }
++#endif
+     % if entrypoints == device_entrypoints:
+       % for v in tmpl_variants:
+     extern template
+@@ -209,7 +215,7 @@ const struct vk_${type}_entrypoint_table ${p}_${type}_entrypoints = {
+     % endif
+     .${e.name} = ${p}_${e.name},
+     % if e.guard is not None:
+-#elif defined(_MSC_VER)
++#elif defined(VK_ENTRYPOINT_STUBS)
+     .${e.name} = (PFN_vkVoidFunction)vk_entrypoint_stub,
+ #endif // ${e.guard}
+     % endif
+@@ -226,7 +232,7 @@ const struct vk_${type}_entrypoint_table ${tmpl_prefix}_${type}_entrypoints_${en
+     % endif
+     .${e.name} = ${tmpl_prefix}_${e.name}${v},
+     % if e.guard is not None:
+-#elif defined(_MSC_VER)
++#elif defined(VK_ENTRYPOINT_STUBS)
+     .${e.name} = (PFN_vkVoidFunction)vk_entrypoint_stub,
+ #endif // ${e.guard}
+     % endif

@@ -1,0 +1,24 @@
+From 56e86f514fa0d9ca2081574a2181bb1d9368fd96 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 16:38:46 +0200
+Subject: [PATCH 37/47] NMXVGAFB: debug.nmxfb_vtrace slot index without a
+ signed modulo
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ kexts/NMXVGAFB/nmxvgafb.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/kexts/NMXVGAFB/nmxvgafb.cpp b/kexts/NMXVGAFB/nmxvgafb.cpp
+index 326127f..570090e 100644
+--- a/kexts/NMXVGAFB/nmxvgafb.cpp
++++ b/kexts/NMXVGAFB/nmxvgafb.cpp
+@@ -98,7 +98,7 @@ public:
+     TraceEv fTrace[kTrace] = {};
+     volatile uint32_t fTraceN = 0;
+     void trace(char kind, uint64_t at, uint32_t arg) {
+-        const uint32_t i = OSIncrementAtomic((volatile SInt32 *)&fTraceN) % kTrace;
++        const uint32_t i = (uint32_t)OSIncrementAtomic((volatile SInt32 *)&fTraceN) % kTrace;
+         fTrace[i] = { at / 1000, arg, kind };
+     }
+     NMXVirtioGPU &virtio() { return fVirtio; }

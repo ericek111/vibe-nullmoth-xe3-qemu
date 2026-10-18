@@ -1,0 +1,250 @@
+From 630a03a6284c0399530ced3ad932c732c953beb5 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 23:14:19 +0200
+Subject: [PATCH 5/5] Darwin: token fds where pipe() is denied; log sandbox
+ fallback failures
+
+WebKit's GPU process may neither call pipe() (syscall-unix 42) nor read
+/dev/null, so drmNmxOpen got no token and ANV no device. The token is now
+the read end of a pipe, else a read-only open of libdrm's own file (which
+a process that loaded it can read), else /dev/null. Token entries are
+flagged, and identified by st_dev/st_ino for pipes and regular files, so
+drmGetDevice2 recognizes them by registration rather than by file type.
+Failures of the IOKit client, the token and DRM_IOCTL_GET_PCIINFO go to the
+unified log (subsystem org.nullmoth.libdrm): the sandboxed process that hit
+them has no other way to say why it found no device.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ xf86drm.c | 109 ++++++++++++++++++++++++++++++++++++++++++------------
+ 1 file changed, 85 insertions(+), 24 deletions(-)
+
+diff --git a/xf86drm.c b/xf86drm.c
+index 31c88528..43aa2ac5 100644
+--- a/xf86drm.c
++++ b/xf86drm.c
+@@ -4868,8 +4868,12 @@ drm_public int drmGetDevice2(int fd, uint32_t flags, drmDevicePtr *device)
+         return -errno;
+ 
+ #ifdef __APPLE__
+-    if (S_ISFIFO(sbuf.st_mode))
+-        return drm_darwin_token_device(fd, flags, device);
++    {
++        int ret = drm_darwin_token_device(fd, flags, device);
++
++        if (ret != -ENOENT)
++            return ret;
++    }
+ #endif
+     if (!S_ISCHR(sbuf.st_mode))
+         return -EINVAL;
+@@ -5387,6 +5391,8 @@ drmGetFormatName(uint32_t format)
+ }
+ 
+ #ifdef __APPLE__
++#include <dlfcn.h>
++#include <os/log.h>
+ #include <pthread.h>
+ #include <sys/ioctl.h>
+ #include <IOKit/IOKitLib.h>
+@@ -5401,10 +5407,14 @@ drmGetFormatName(uint32_t format)
+  *  - a read-only open of the node whose ioctl failed with EPERM: matched to its client by the clone minor, as every
+  *    open of a NullMoth node is its own device number, so a reused fd number never inherits another file's client;
+  *  - when the node can't be opened at all, drmNmxOpen returns a token instead: the read end of a pipe, matched by the
+- *    pipe's inode. drmGetDevices2 and drmGetDevice2 describe the render node through the client then.
++ *    pipe's inode. WebKit's GPU process may neither call pipe() nor read /dev/null, but it can read this library's
++ *    own file (it mapped it), so the token is a read-only open of that then (/dev/null as a last resort). Those have
++ *    no identity of their own; only a new token reuses such an fd number for a DRM client.
++ *    drmGetDevices2 and drmGetDevice2 describe the render node through the client then.
+  */
+ struct nmx_uc {
+     int fd;
++    bool token;
+     dev_t dev;
+     ino_t ino;
+     io_connect_t conn;
+@@ -5420,7 +5430,7 @@ static bool nmx_uc_ident(const struct stat *st, dev_t *dev, ino_t *ino)
+         *ino = 0;
+         return true;
+     }
+-    if (S_ISFIFO(st->st_mode)) {
++    if (S_ISFIFO(st->st_mode) || S_ISREG(st->st_mode)) {
+         *dev = st->st_dev;
+         *ino = st->st_ino;
+         return true;
+@@ -5428,6 +5438,22 @@ static bool nmx_uc_ident(const struct stat *st, dev_t *dev, ino_t *ino)
+     return false;
+ }
+ 
++/* failures of the sandbox fallbacks, in the unified log (subsystem org.nullmoth.libdrm) */
++static os_log_t nmx_log_handle;
++
++static void nmx_log_init(void)
++{
++    nmx_log_handle = os_log_create("org.nullmoth.libdrm", "sandbox");
++}
++
++static os_log_t nmx_log(void)
++{
++    static pthread_once_t once = PTHREAD_ONCE_INIT;
++
++    pthread_once(&once, nmx_log_init);
++    return nmx_log_handle;
++}
++
+ static io_connect_t nmx_uc_connect(void)
+ {
+     static const char *const providers[] = { "NMXAccel", "NMXGPU" };
+@@ -5439,10 +5465,15 @@ static io_connect_t nmx_uc_connect(void)
+ 
+         if (!svc)
+             continue;
+-        if (IOServiceOpen(svc, mach_task_self(), 'NMXD', &conn) != KERN_SUCCESS)
++        kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 'NMXD', &conn);
++        if (kr != KERN_SUCCESS) {
++            os_log_error(nmx_log(), "DRM client on %{public}s: IOServiceOpen 0x%x", providers[i], kr);
+             conn = 0;
++        }
+         IOObjectRelease(svc);
+     }
++    if (!conn)
++        os_log_error(nmx_log(), "no DRM client: NMXAccel and NMXGPU refused or absent");
+     return conn;
+ }
+ 
+@@ -5461,13 +5492,14 @@ static void nmx_uc_forget_locked(int fd)
+     }
+ }
+ 
+-static bool nmx_uc_add_locked(int fd, dev_t dev, ino_t ino, io_connect_t conn)
++static bool nmx_uc_add_locked(int fd, bool token, dev_t dev, ino_t ino, io_connect_t conn)
+ {
+     struct nmx_uc *u = malloc(sizeof(*u));
+ 
+     if (!u)
+         return false;
+     u->fd = fd;
++    u->token = token;
+     u->dev = dev;
+     u->ino = ino;
+     u->conn = conn;
+@@ -5502,7 +5534,7 @@ static io_connect_t nmx_uc_get(int fd, int create)
+     }
+     if (!conn && create && S_ISCHR(st.st_mode)) {
+         conn = nmx_uc_connect();
+-        if (conn && !nmx_uc_add_locked(fd, dev, ino, conn)) {
++        if (conn && !nmx_uc_add_locked(fd, false, dev, ino, conn)) {
+             IOServiceClose(conn);
+             conn = 0;
+         }
+@@ -5549,11 +5581,34 @@ drm_public int drmNmxIoctl(int fd, unsigned long request, void *arg)
+ /* the node the IOKit client opens (IOAccelNMXDRMClient::start) */
+ #define NMX_UC_NODE DRM_DIR_NAME "/renderD128"
+ 
++/* a fd that stands for nothing but its number: the read end of a pipe at EOF, else a read-only open of a file */
++static int nmx_token_fd(int cloexec)
++{
++    int flags = O_RDONLY | (cloexec ? O_CLOEXEC : 0);
++    Dl_info self;
++    int ends[2], fd;
++
++    if (pipe(ends) == 0) {
++        close(ends[1]);
++        if (cloexec && fcntl(ends[0], F_SETFD, FD_CLOEXEC) < 0) {
++            int err = errno;
++
++            close(ends[0]);
++            errno = err;
++            return -1;
++        }
++        return ends[0];
++    }
++    if (dladdr((const void *)nmx_token_fd, &self) && self.dli_fname && (fd = open(self.dli_fname, flags)) >= 0)
++        return fd;
++    return open("/dev/null", flags);
++}
++
+ static int nmx_token_open(int cloexec)
+ {
+     io_connect_t conn = nmx_uc_connect();
+     struct stat st;
+-    int ends[2], err;
++    int fd, err;
+     dev_t dev;
+     ino_t ino;
+ 
+@@ -5561,32 +5616,27 @@ static int nmx_token_open(int cloexec)
+         errno = EACCES;
+         return -1;
+     }
+-    if (pipe(ends)) {
+-        err = errno;
+-        IOServiceClose(conn);
+-        errno = err;
+-        return -1;
+-    }
+-    close(ends[1]);
+-    if ((cloexec && fcntl(ends[0], F_SETFD, FD_CLOEXEC) < 0) || (fstat)(ends[0], &st) != 0 ||
+-        !nmx_uc_ident(&st, &dev, &ino)) {
++    fd = nmx_token_fd(cloexec);
++    if (fd < 0 || (fstat)(fd, &st) != 0 || !nmx_uc_ident(&st, &dev, &ino)) {
+         err = errno;
+-        close(ends[0]);
++        os_log_error(nmx_log(), "no token fd for the DRM client (fd %d, errno %d)", fd, err);
++        if (fd >= 0)
++            close(fd);
+         IOServiceClose(conn);
+         errno = err ? err : EIO;
+         return -1;
+     }
+     pthread_mutex_lock(&nmx_ucs_lock);
+-    nmx_uc_forget_locked(ends[0]);
+-    if (!nmx_uc_add_locked(ends[0], dev, ino, conn)) {
++    nmx_uc_forget_locked(fd);
++    if (!nmx_uc_add_locked(fd, true, dev, ino, conn)) {
+         pthread_mutex_unlock(&nmx_ucs_lock);
+-        close(ends[0]);
++        close(fd);
+         IOServiceClose(conn);
+         errno = ENOMEM;
+         return -1;
+     }
+     pthread_mutex_unlock(&nmx_ucs_lock);
+-    return ends[0];
++    return fd;
+ }
+ 
+ drm_public int drmNmxOpen(const char *path, int flags)
+@@ -5609,8 +5659,10 @@ static int drm_darwin_uc_device(io_connect_t conn, drmDevicePtr *device)
+     drmDevicePtr dev;
+     char *addr;
+ 
+-    if (nmx_uc_call(conn, DRM_IOCTL_GET_PCIINFO, &pinfo))
++    if (nmx_uc_call(conn, DRM_IOCTL_GET_PCIINFO, &pinfo)) {
++        os_log_error(nmx_log(), "DRM_IOCTL_GET_PCIINFO through the DRM client: errno %d", errno);
+         return -errno;
++    }
+     dev = drmDeviceAlloc(DRM_NODE_RENDER, node, sizeof(drmPciBusInfo), sizeof(drmPciDeviceInfo), &addr);
+     if (!dev)
+         return -ENOMEM;
+@@ -5654,10 +5706,19 @@ static int drm_darwin_sandbox_devices(uint32_t flags, drmDevicePtr devices[], in
+ static int drm_darwin_token_device(int fd, uint32_t flags, drmDevicePtr *device)
+ {
+     io_connect_t conn = nmx_uc_get(fd, 0);
++    struct nmx_uc *u;
++    bool token = false;
+ 
+     (void)flags;
+     if (!conn)
+-        return -EINVAL;
++        return -ENOENT;
++    pthread_mutex_lock(&nmx_ucs_lock);
++    for (u = nmx_ucs; u != NULL; u = u->next)
++        if (u->fd == fd && u->conn == conn)
++            token = u->token;
++    pthread_mutex_unlock(&nmx_ucs_lock);
++    if (!token)
++        return -ENOENT;
+     return drm_darwin_uc_device(conn, device);
+ }
+ 

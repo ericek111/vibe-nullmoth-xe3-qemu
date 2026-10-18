@@ -1,0 +1,133 @@
+From 3a0b3cedd11911fa10b840641ea99793963c1f10 Mon Sep 17 00:00:00 2001
+From: erik <eb.skola@gmail.com>
+Date: Fri, 16 Oct 2026 15:00:27 +0200
+Subject: [PATCH 03/47] NMXVGAFB: Intel-named class for CoreDisplay's
+ IOPresentment vendor check, VF framebuffer claim, real scanout address,
+ IOFBMemorySize
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ kexts/NMXVGAFB/Info.plist   | 12 +++++++-
+ kexts/NMXVGAFB/nmxvgafb.cpp | 61 ++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 71 insertions(+), 2 deletions(-)
+
+diff --git a/kexts/NMXVGAFB/Info.plist b/kexts/NMXVGAFB/Info.plist
+index 9cb2ed3..05169d8 100644
+--- a/kexts/NMXVGAFB/Info.plist
++++ b/kexts/NMXVGAFB/Info.plist
+@@ -11,7 +11,7 @@
+   <key>IOKitPersonalities</key><dict>
+     <key>NMXVGAFB</key><dict>
+       <key>CFBundleIdentifier</key><string>com.nullmoth.NMXVGAFB</string>
+-      <key>IOClass</key><string>NMXVGAFB</string>
++      <key>IOClass</key><string>NMXIntelVGAFB</string>
+       <key>IOProviderClass</key><string>IOPCIDevice</string>
+       <!-- QEMU virtio-vga and std VGA (bochs) -->
+       <key>IOPCIMatch</key><string>0x10501af4 0x11111234</string>
+@@ -21,6 +21,16 @@
+       <key>IOMatchCategory</key><string>IOFramebuffer</string>
+       <key>IOProbeScore</key><integer>60000</integer>
+     </dict>
++    <key>NMXVFFramebufferClaim</key><dict>
++      <key>CFBundleIdentifier</key><string>com.nullmoth.NMXVGAFB</string>
++      <key>IOClass</key><string>NMXVFFramebufferClaim</string>
++      <key>IOProviderClass</key><string>IOPCIDevice</string>
++      <!-- an Intel display device (the SR-IOV VF NMXGPU drives); probe() skips the firmware's display device -->
++      <key>IOPCIMatch</key><string>0x00008086&amp;0x0000ffff</string>
++      <key>IOPCIClassMatch</key><string>0x03000000&amp;0xff000000</string>
++      <key>IOProbeScore</key><integer>60000</integer>
++      <key>IOMatchCategory</key><string>IOFramebuffer</string>
++    </dict>
+   </dict>
+   <key>OSBundleLibraries</key><dict>
+     <key>com.apple.kpi.iokit</key><string>8.0</string>
+diff --git a/kexts/NMXVGAFB/nmxvgafb.cpp b/kexts/NMXVGAFB/nmxvgafb.cpp
+index d38cc6a..ad13dbb 100644
+--- a/kexts/NMXVGAFB/nmxvgafb.cpp
++++ b/kexts/NMXVGAFB/nmxvgafb.cpp
+@@ -167,7 +167,15 @@ OSDefineMetaClassAndStructors(NMXVGAFB, IOFramebuffer)
+ 
+ // Opt-in, as NMXGPU is: boot-arg nmxvgafb=1, or the one-shot NVRAM variable nullmoth-vgafb-once (consumed here, so a
+ // start that hangs is followed by one with the firmware framebuffer). Declining leaves the display to IONDRVFramebuffer.
++static int g_opted = -1;      /* the decision, made once: the NVRAM variable is consumed by the first ask */
++static bool opted_in_once();
+ static bool opted_in()
++{
++    if (g_opted < 0)
++        g_opted = opted_in_once() ? 1 : 0;
++    return g_opted == 1;
++}
++static bool opted_in_once()
+ {
+     int v = 0;
+     if (PE_parse_boot_argn("-nmxvgafboff", &v, sizeof(v))) return false;
+@@ -256,6 +264,8 @@ bool NMXVGAFB::start(IOService *provider)
+         // head 0 of the GPU's accelerator (NMXAccel watches for this class)
+         setProperty("IOFBDependentID", 0x4E4D58560000001ull, 64);
+         setProperty("IOFBDependentIndex", 0ull, 32);
++        // what WindowServer may place its flip surfaces in (NVRMFB reports its VRAM here); system memory backs them
++        setProperty("IOFBMemorySize", (unsigned long long)(1ull << 30), 64);
+     } else VFBLOG("the framebuffer would not map write-combined: no accelerated frames for it");
+     setProperty("built-in", kOSBooleanTrue);
+     // the timing AGDC link-config answers read (NMXAGDC, from NVRMAGDC: NVRMFB publishes the same record); the same
+@@ -293,9 +303,58 @@ IOReturn NMXVGAFB::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1,
+         if (!r || r->version != NVRM_VRAM_ABI_VERSION) return kIOReturnBadArgument;
+         if (!fSurfMap) return kIOReturnNotReady;
+         r->kva = (void *)fSurfMap->getVirtualAddress();
+-        r->phys = 0; r->actualSize = 0;
++        // The address is real CPU-physical memory (the VM display's BAR), not another GPU's VRAM: reported, the
++        // accelerator's display pipe gets a framebuffer resource over it (its "live scanout" path), which
++        // WindowServer needs to set up page flipping. With phys 0 ("CPU-only, frames are copied") CoreDisplay
++        // failed MPAccessSurfaceForDisplayDevice and WindowServer composited on the CPU.
++        r->phys = fBase; r->actualSize = (unsigned long long)fRowBytes * fHeight;
+         r->width = fWidth; r->height = fHeight; r->pitch = fRowBytes;
+         return kIOReturnSuccess;
+     }
+     return IOFramebuffer::callPlatformFunction(fn, wait, p1, p2, p3, p4);
+ }
++
++/*
++ * CoreDisplay sorts every framebuffer into a GPU vendor by its class name ("Intel", "AMD", "AppleParavirt", "NVDA" -
++ * NullMoth's NVIDIA framebuffer is NVRMNVDAFramebuffer for this reason) and uses IOPresentment, the display-pipe path
++ * NMXAccel serves, only when every framebuffer's vendor allows it; any other name counts as unknown, which never
++ * does. WindowServer then took the legacy page-flip path, failed it ("Failed to set up surface for page flip mode")
++ * and composited on the CPU. The VM display is the Intel GPU's head, so its class says so.
++ */
++class NMXIntelVGAFB : public NMXVGAFB {
++    OSDeclareDefaultStructors(NMXIntelVGAFB)
++};
++OSDefineMetaClassAndStructors(NMXIntelVGAFB, NMXVGAFB)
++
++/*
++ * The firmware framebuffer driver (IONDRVFramebuffer) also takes a display-class device with no outputs, an SR-IOV VF;
++ * as an unknown-vendor framebuffer it keeps IOPresentment off (see above), and a framebuffer cannot be stopped once
++ * started (IOFramebuffer::stop panicked). This service holds the IOFramebuffer match category on such an Intel device
++ * instead, at a higher score, as NullMoth's NVRMFBClaim does on an NVIDIA card. Only with the VM display opted in,
++ * and never on the device that holds the firmware's framebuffer (a real Intel display stays with its own driver).
++ */
++class NMXVFFramebufferClaim : public IOService {
++    OSDeclareDefaultStructors(NMXVFFramebufferClaim)
++public:
++    IOService *probe(IOService *provider, SInt32 *score) override {
++        IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
++        if (!pci || !opted_in()) return nullptr;
++        PE_Video v; bzero(&v, sizeof(v));
++        IOPlatformExpert *pe = getPlatform();
++        if (pe && pe->getConsoleInfo(&v) == kIOReturnSuccess && v.v_baseAddr) {
++            uint64_t base = v.v_baseAddr & ~0xFFFul;
++            for (UInt32 i = 0; i < pci->getDeviceMemoryCount(); i++) {
++                IODeviceMemory *m = pci->getDeviceMemoryWithIndex(i);
++                if (m && base >= m->getPhysicalAddress() && base < m->getPhysicalAddress() + m->getLength()) return nullptr;
++            }
++        }
++        return IOService::probe(provider, score);
++    }
++    bool start(IOService *provider) override {
++        if (!IOService::start(provider)) return false;
++        VFBLOG("holding the IOFramebuffer category on %s (an Intel display device without the firmware framebuffer)",
++               provider->getName());
++        return true;
++    }
++};
++OSDefineMetaClassAndStructors(NMXVFFramebufferClaim, IOService)

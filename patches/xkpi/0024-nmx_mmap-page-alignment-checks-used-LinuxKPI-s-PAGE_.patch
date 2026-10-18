@@ -1,0 +1,25 @@
+From 76580257aebd9668cf5ab60be8c235b2482ef22c Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 06:24:03 +0200
+Subject: [PATCH 24/50] nmx_mmap: page-alignment checks used LinuxKPI's
+ PAGE_MASK (~0xfff) and rejected every BO offset
+
+---
+ override/src/nmx_linux_cdev.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/gpu-port/xkpi/override/src/nmx_linux_cdev.c b/gpu-port/xkpi/override/src/nmx_linux_cdev.c
+index 944c7d1..88b644e 100644
+--- a/gpu-port/xkpi/override/src/nmx_linux_cdev.c
++++ b/gpu-port/xkpi/override/src/nmx_linux_cdev.c
+@@ -524,8 +524,8 @@ static int nmx_mmap(struct nmx_open *o, struct nmx_drm_mmap *req)
+ {
+     uint64_t fixed = (req->flags & NMX_DRM_MMAP_FIXED) ? req->addr : 0;
+     req->addr = 0;
+-    if ((req->flags & ~NMX_DRM_MMAP_FIXED) != 0 || (req->offset & PAGE_MASK) != 0 || req->size == 0 ||
+-        req->size > (1ULL << 40) || (fixed & PAGE_MASK) != 0 || ((req->flags & NMX_DRM_MMAP_FIXED) && fixed == 0))
++    if ((req->flags & ~NMX_DRM_MMAP_FIXED) != 0 || (req->offset & (PAGE_SIZE - 1)) != 0 || req->size == 0 ||
++        req->size > (1ULL << 40) || (fixed & (PAGE_SIZE - 1)) != 0 || ((req->flags & NMX_DRM_MMAP_FIXED) && fixed == 0))
+         return EINVAL;
+     struct linux_file *filp = o->fp->f_data;
+     if (o->fp->f_ops == NULL || filp == NULL || filp->f_op == NULL || filp->f_op->mmap == NULL)

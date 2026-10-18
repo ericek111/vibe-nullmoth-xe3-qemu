@@ -1,0 +1,123 @@
+From 139e467c674f85d77ac4be798c20938d6243b836 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 18:37:41 +0200
+Subject: [PATCH 40/47] NMXVGAFB: virtio-gpu display events; ride out host
+ stalls instead of giving up
+
+Config changes (VIRTIO_GPU_EVENT_DISPLAY: QEMU's window was resized)
+interrupt on vector 0 with the control queue; the work loop acks them and
+calls the framebuffer's handler.
+
+A command without an answer for 1 s disabled virtio-gpu for good, so a
+transient host stall cost the zero-copy display until a reboot (seen
+once while the QEMU window was maximised during a flip stream). The
+submitter now logs after 1 s and keeps waiting up to 30 s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ kexts/NMXVGAFB/nmx_virtio_gpu.cpp | 37 ++++++++++++++++++++++++-------
+ kexts/NMXVGAFB/nmx_virtio_gpu.h   |  5 +++++
+ 2 files changed, 34 insertions(+), 8 deletions(-)
+
+diff --git a/kexts/NMXVGAFB/nmx_virtio_gpu.cpp b/kexts/NMXVGAFB/nmx_virtio_gpu.cpp
+index 864bd9a..87ca0ca 100644
+--- a/kexts/NMXVGAFB/nmx_virtio_gpu.cpp
++++ b/kexts/NMXVGAFB/nmx_virtio_gpu.cpp
+@@ -96,10 +96,18 @@ void NMXVirtioGPU::irqFilter()
+     fIrqs++;
+ }
+ 
+-// the work loop: wake the submitter, which sleeps on fLock until the used ring moves
++// the work loop: wake the submitter, which sleeps on fLock until the used ring moves; pass on display events
+ void NMXVirtioGPU::irqAction()
+ {
+     if (!fLock) return;
++    // virtio_gpu_config: events_read, events_clear (5.7.4)
++    if (fDevCfg && fReady) {
++        const uint32_t ev = rd32(fDevCfg, 0);
++        if (ev) {
++            wr32(fDevCfg, 4, ev);
++            if ((ev & 1) && fEventCb) fEventCb(fEventCtx);
++        }
++    }
+     IOLockLock(fLock);
+     IOLockWakeup(fLock, this, false);
+     IOLockUnlock(fLock);
+@@ -231,8 +239,8 @@ bool NMXVirtioGPU::setupQueue()
+     if (!fCmd) { VGLOG("no memory for the command area"); return false; }
+     fCmdKva = (uint8_t *)fCmd->getBytesNoCopy();
+     fCmdPhys = fCmd->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+-    // the control queue interrupts on vector 0 when there is one; config changes don't interrupt
+-    wr16(fCommon, kMsixConfig, kNoVector);
++    // the control queue and config changes (display events) interrupt on vector 0 when there is one
++    wr16(fCommon, kMsixConfig, fIrq ? 0 : kNoVector);
+     wr16(fCommon, kQueueMsix, fIrq ? 0 : kNoVector);
+     fIrqOn = fIrq && rd16(fCommon, kQueueMsix) == 0;
+     wr64(fCommon, kQueueDesc, fRingPhys + kOffDesc);
+@@ -369,9 +377,12 @@ uint32_t NMXVirtioGPU::submitBatch(Cmd *c, unsigned n, uint64_t *doneAt)
+     const uint16_t want = (uint16_t)(fUsedSeen + n);
+     const uint64_t t0 = mach_absolute_time();
+     uint64_t done = 0;
+-    bool answered = false;
+-    // up to 1 s: the host's GL display can take a frame or two to take a new scanout
+-    uint64_t deadline; clock_interval_to_deadline(1, kSecondScale, &deadline);
++    bool answered = false, slow = false;
++    // Answers normally take under a refresh. A host busy elsewhere (QEMU's GTK display re-creating its window
++    // surface on a resize) can hold commands longer: wait up to 30 s, telling after 1 s, before giving virtio up.
++    uint64_t slowAt, deadline;
++    clock_interval_to_deadline(1, kSecondScale, &slowAt);
++    clock_interval_to_deadline(30, kSecondScale, &deadline);
+     for (;;) {
+         mb();
+         if (used[1] == want) {
+@@ -387,8 +398,14 @@ uint32_t NMXVirtioGPU::submitBatch(Cmd *c, unsigned n, uint64_t *doneAt)
+             answered = true;
+             break;
+         }
+-        if (mach_absolute_time() >= deadline) break;
+-        if (fIrqOn) { AbsoluteTime dl; memcpy(&dl, &deadline, sizeof dl); IOLockSleepDeadline(fLock, this, dl, THREAD_UNINT); }
++        const uint64_t now = mach_absolute_time();
++        if (now >= deadline) break;
++        if (!slow && now >= slowAt) {
++            slow = true;
++            VGLOG("command 0x%x: no answer for 1 s - waiting (the host is stalled)", ((const GpuHdr *)c[0].cmd)->type);
++        }
++        const uint64_t until = slow ? deadline : slowAt;
++        if (fIrqOn) { AbsoluteTime dl; memcpy(&dl, &until, sizeof dl); IOLockSleepDeadline(fLock, this, dl, THREAD_UNINT); }
+         else IODelay(10);
+     }
+     if (doneAt) *doneAt = done;
+@@ -399,6 +416,10 @@ uint32_t NMXVirtioGPU::submitBatch(Cmd *c, unsigned n, uint64_t *doneAt)
+         uint64_t ns = 0; absolutetime_to_nanoseconds((done ? done : mach_absolute_time()) - t0, &ns);
+         tm.n++; tm.totalNs += ns; if (ns > tm.maxNs) tm.maxNs = ns;
+     }
++    if (answered && slow) {
++        uint64_t ns = 0; absolutetime_to_nanoseconds(done - t0, &ns);
++        VGLOG("command 0x%x answered after %llu ms", ((const GpuHdr *)c[0].cmd)->type, ns / 1000000);
++    }
+     const uint32_t type = answered ? c[n - 1].type : 0;
+     if (!answered) {
+         fFailures++;
+diff --git a/kexts/NMXVGAFB/nmx_virtio_gpu.h b/kexts/NMXVGAFB/nmx_virtio_gpu.h
+index b5188db..4628989 100644
+--- a/kexts/NMXVGAFB/nmx_virtio_gpu.h
++++ b/kexts/NMXVGAFB/nmx_virtio_gpu.h
+@@ -51,6 +51,9 @@ public:
+     // host takes both in one pass instead of the guest waking for the first answer (~1.2 ms, measured)
+     bool flipShown(uint32_t resourceId, uint32_t w, uint32_t h, uint32_t stride, uint64_t *shownAt);
+     bool interrupts() const { return fIrqOn; }
++    // VIRTIO_GPU_EVENT_DISPLAY (the host's display configuration changed: QEMU's window was resized) calls cb from
++    // the interrupt's work loop; config changes interrupt on vector 0 too
++    void setDisplayEventHandler(void (*cb)(void *), void *ctx) { fEventCtx = ctx; fEventCb = cb; }
+     // The cursor queue: the host draws scanout 0's cursor from a 64x64 ARGB32 resource (QEMU's GTK display makes it
+     // the window's own pointer). Fire and forget, never sleeps (IOGraphics moves the cursor from contexts that can't);
+     // a move finding the queue full is dropped, an image update is not (it waits for a slot).
+@@ -100,6 +103,8 @@ private:
+     IOWorkLoop *fWl = nullptr;
+     IOFilterInterruptEventSource *fIrq = nullptr;
+     bool fIrqOn = false;
++    void (*volatile fEventCb)(void *) = nullptr;
++    void *fEventCtx = nullptr;
+     volatile uint64_t fIrqAt = 0, fIrqs = 0;
+ 
+     volatile uint8_t *mapCap(uint8_t bar, uint32_t offset, uint32_t length);

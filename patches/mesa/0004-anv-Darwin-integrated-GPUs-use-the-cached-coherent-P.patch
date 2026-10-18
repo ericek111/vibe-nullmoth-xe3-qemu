@@ -1,0 +1,52 @@
+From ee134acb342b687322a485edb2573b0f008d0ae1 Mon Sep 17 00:00:00 2001
+From: nm <nm@x>
+Date: Fri, 16 Oct 2026 14:22:40 +0200
+Subject: [PATCH 4/8] anv: Darwin integrated GPUs use the cached coherent PAT;
+ Xe2 compression opt-in
+
+Generated-by: LLM
+---
+ src/intel/vulkan/anv_device.c    | 5 +++++
+ src/intel/vulkan/xe/anv_device.c | 5 +++++
+ 2 files changed, 10 insertions(+)
+
+diff --git a/src/intel/vulkan/anv_device.c b/src/intel/vulkan/anv_device.c
+index 94624ddfe73..efa126040e4 100644
+--- a/src/intel/vulkan/anv_device.c
++++ b/src/intel/vulkan/anv_device.c
+@@ -2576,6 +2576,11 @@ anv_device_get_pat_entry(struct anv_device *device,
+    if (alloc_flags & ANV_BO_ALLOC_IMPORTED)
+       return &device->info->pat.cached_coherent;
+ 
++#ifdef __APPLE__
++   if (!anv_physical_device_has_vram(device->physical))
++      return &device->info->pat.cached_coherent;
++#endif
++
+    if (alloc_flags & (ANV_BO_ALLOC_EXTERNAL | ANV_BO_ALLOC_SCANOUT))
+       return &device->info->pat.scanout;
+ 
+diff --git a/src/intel/vulkan/xe/anv_device.c b/src/intel/vulkan/xe/anv_device.c
+index 33d43ae654d..d2abd22b396 100644
+--- a/src/intel/vulkan/xe/anv_device.c
++++ b/src/intel/vulkan/xe/anv_device.c
+@@ -21,6 +21,7 @@
+  */
+ 
+ #include "xe/anv_device.h"
++#include <stdlib.h>
+ #include "anv_private.h"
+ #include "vk_debug_utils.h"
+ 
+@@ -157,7 +158,11 @@ anv_xe_physical_device_init_memory_types(struct anv_physical_device *device)
+       device->memory.types[device->memory.type_count++] = (struct anv_memory_type) {
+          .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+          .heapIndex = 0,
++#ifdef __APPLE__
++         .compressed = device->info.ver >= 20 && getenv("ANV_XE2_COMPRESS") != NULL,
++#else
+          .compressed = device->info.ver >= 20,
++#endif
+       };
+       device->memory.types[device->memory.type_count++] = (struct anv_memory_type) {
+          .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |

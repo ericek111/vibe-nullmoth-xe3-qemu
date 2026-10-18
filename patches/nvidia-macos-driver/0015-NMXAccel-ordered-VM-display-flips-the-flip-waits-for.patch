@@ -1,0 +1,177 @@
+From 02a61d778d19aa18cdbf213ab440e29bbcaddc9a Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 22:15:49 +0200
+Subject: [PATCH 15/47] NMXAccel: ordered VM-display flips - the flip waits for
+ the surface's pixels, not WindowServer
+
+WindowServer waited for the GPU to finish each frame
+(commitAndWaitUntilSubmitted -> waitUntilCompleted in the plugin, twice per
+frame: MetalContext::Flush and CoreDisplay's AccessComplete) so that the
+blob flip found the copied-out pixels in place; its main thread spent ~35%
+of a window drag blocked there and CPU and GPU work never overlapped.
+
+The flip now runs on a thread call: a presented surface goes on the panel
+once its IOSurface lock seed moved since it was last shown (the plugin's
+copy-out of the new frame unlocks it for writing), capped at 100 ms; the
+transaction completes through signalTransactionInterrupt. Sysctls
+debug.nmxfb_blob_ordered (1; the plugin reads it), nmxfb_ord_waited,
+nmxfb_ord_timeout, nmxfb_ord_wait_us. Three refusals in a row turn it off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ kexts/NVRM/accel/nvrm-accel.cpp | 102 ++++++++++++++++++++++++++++++++
+ 1 file changed, 102 insertions(+)
+
+diff --git a/kexts/NVRM/accel/nvrm-accel.cpp b/kexts/NVRM/accel/nvrm-accel.cpp
+index 49ca5ac..3cb27ca 100644
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -1125,6 +1125,9 @@ static int nmxIopBlobFlip(IOService *fb, unsigned head, IOSurface *s)
+ #endif
+ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe);
+ static void nvAccelIopHome(IOService *fb, unsigned head);
++#ifdef NMX_ACCEL
++static bool nmxOrderedStart(void *pipe, IOService *fb, unsigned head, IOSurface *s);
++#endif
+ IOReturn NVDisplayPipe::performTransactionCopy(IOAccelDisplayPipeTransaction2 *txn)
+ {
+     if (!gNvIop) return (IOReturn)0xe00002c7;
+@@ -1162,6 +1165,8 @@ IOReturn NVDisplayPipe::performTransactionCopy(IOAccelDisplayPipeTransaction2 *t
+         if ((unsigned long long)h * pitch > vm->fBytes) NVIOP_FAIL(kIOReturnOverrun, "resource %ux%u pitch %u exceeds its %llu bytes", w, h, pitch, (unsigned long long)vm->fBytes);
+         src = (const volatile unsigned int *)vm->fKva; fromRes = true;
+ #ifdef NMX_ACCEL
++    } else if (s && fb->getProperty("NMXVirtioScanout") && nmxOrderedStart(this, fb, head, s)) {
++        return kIOReturnSuccess;
+     } else if (int b = s ? nmxIopBlobFlip(fb, head, s) : 0) {
+         if (b == 1) { OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]); }
+         return kIOReturnSuccess;
+@@ -1360,6 +1365,14 @@ SYSCTL_INT(_debug, OID_AUTO, nmxfb_blob, CTLFLAG_RW | CTLFLAG_LOCKED, &gNmxBlobS
+            "VM display: 1 = scan presented surfaces out of their own memory (virtio-gpu blobs), 0 = copy every frame");
+ NVACCEL_CNT(nmxfb_blob_flips, gCntNmxBlobFlips, "VM display: frames scanned out of their surface (no copy)");
+ NVACCEL_CNT(nmxfb_blob_refused, gCntNmxBlobRefused, "VM display: surfaces the framebuffer would not scan out (copied instead)");
++static int gNmxBlobOrdered = 1;
++static SInt64 gCntNmxOrdWaited, gCntNmxOrdTimeout, gCntNmxOrdNs;
++SYSCTL_INT(_debug, OID_AUTO, nmxfb_blob_ordered, CTLFLAG_RW | CTLFLAG_LOCKED, &gNmxBlobOrdered, 0,
++           "VM display: 1 = a presented surface goes on the panel once its pixels are in its memory (the flip waits on a "
++           "thread call; WindowServer's commit does not wait for the GPU), 0 = flip at once (WindowServer waits)");
++NVACCEL_CNT(nmxfb_ord_waited, gCntNmxOrdWaited, "VM display: ordered flips that waited for the surface's pixels");
++NVACCEL_CNT(nmxfb_ord_timeout, gCntNmxOrdTimeout, "VM display: ordered flips that gave up waiting (flipped anyway)");
++NVACCEL_CNT(nmxfb_ord_wait_us, gCntNmxOrdNs, "VM display: total time ordered flips waited, us");
+ static void nmxInstallVmSysctls(void)
+ {
+     if (gVmSysctlInstalled) return;
+@@ -1367,6 +1380,8 @@ static void nmxInstallVmSysctls(void)
+     sysctl_register_oid(&sysctl__debug_nmxfb_front_copies);  sysctl_register_oid(&sysctl__debug_nmxfb_front_hz);
+     sysctl_register_oid(&sysctl__debug_nmxfb_blob);
+     sysctl_register_oid(&sysctl__debug_nmxfb_blob_flips);    sysctl_register_oid(&sysctl__debug_nmxfb_blob_refused);
++    sysctl_register_oid(&sysctl__debug_nmxfb_blob_ordered);  sysctl_register_oid(&sysctl__debug_nmxfb_ord_waited);
++    sysctl_register_oid(&sysctl__debug_nmxfb_ord_timeout);   sysctl_register_oid(&sysctl__debug_nmxfb_ord_wait_us);
+ #else
+     sysctl_register_oid(&sysctl__debug_nvaccel_headless);
+ #endif
+@@ -1787,10 +1802,16 @@ int thread_call_enter(struct thread_call *call);
+ struct NVIopAsync { void *pipe; IOService *fb; IOSurface *s; struct NVRMFlipRequest f; volatile SInt32 busy; struct thread_call *call; };
+ static NVIopAsync gIopAs[kNvMaxFB];
+ static SInt32 gIopAsyncRefuseRun;
++#ifdef NMX_ACCEL
++static bool nmxOrderedBusy(const void *pipe);
++#endif
+ static bool nvAccelIopAsyncBusy(const void *pipe)
+ {
+     for (unsigned h = 0; h < kNvMaxFB; h++)
+         if (gIopAs[h].pipe == pipe && __atomic_load_n(&gIopAs[h].busy, __ATOMIC_ACQUIRE)) return true;
++#ifdef NMX_ACCEL
++    if (nmxOrderedBusy(pipe)) return true;
++#endif
+     return false;
+ }
+ static void nvAccelIopAsyncRun(void *p0, void *)
+@@ -1839,6 +1860,87 @@ static bool nvAccelIopAsyncStart(void *pipe, IOService *fb, unsigned head, IOSur
+     thread_call_enter(e->call);
+     return true;
+ }
++#ifdef NMX_ACCEL
++/*
++ * Ordered VM-display flips. The Metal plugin renders a frame into a private image and copies it into the presented
++ * IOSurface once the GPU is done, under a write lock, which moves the surface's lock seed. WindowServer used to wait
++ * for the GPU (commitAndWaitUntilSubmitted -> waitUntilCompleted) so that the flip, which follows at once, found the
++ * pixels in place; that serialized every frame's CPU and GPU work on its main thread. Now the flip waits instead, on
++ * a thread call: a surface is ready once its seed moved since it was last put on the panel (each present carries one
++ * new frame, so the copy-out of this frame is that move; if it came before the transaction, the seed has already
++ * moved). The transaction completes (signalTransactionInterrupt) when the surface is on the panel, which also paces
++ * WindowServer. Waits are capped: a surface whose seed never moves goes on the panel after kNmxOrdMaxMs anyway.
++ */
++extern "C" uint32_t _ZNK9IOSurface11getLockSeedEv(const void *s);
++static constexpr unsigned kNmxOrdMaxMs = 100;
++struct NMXOrdered { void *pipe; IOService *fb; unsigned head; IOSurface *s; volatile SInt32 busy; struct thread_call *call; };
++static NMXOrdered gNmxOrd[kNvMaxFB];
++static struct { unsigned id; uint32_t seed; } gNmxSeen[16];   // a surface's lock seed when it last went on the panel
++static unsigned gNmxSeenNext;
++static SInt32 gNmxOrdRefuseRun;
++static bool nmxOrderedBusy(const void *pipe)
++{
++    for (unsigned h = 0; h < kNvMaxFB; h++)
++        if (gNmxOrd[h].pipe == pipe && __atomic_load_n(&gNmxOrd[h].busy, __ATOMIC_ACQUIRE)) return true;
++    return false;
++}
++static int nmxSeenFind(unsigned id)
++{
++    for (unsigned i = 0; i < 16; i++) if (gNmxSeen[i].id == id) return (int)i;
++    return -1;
++}
++static void nmxOrderedRun(void *p0, void *)
++{
++    NMXOrdered *e = (NMXOrdered *)p0;
++    IOSurface *s = e->s; e->s = nullptr;
++    const unsigned id = s->getSurfaceID();
++    int k = nmxSeenFind(id);
++    const uint64_t t0 = mach_absolute_time();
++    unsigned waited = 0;
++    if (k >= 0) {
++        const uint32_t last = gNmxSeen[k].seed;
++        while (_ZNK9IOSurface11getLockSeedEv(s) == last && waited < kNmxOrdMaxMs) { IOSleep(1); waited++; }
++        if (waited) {
++            OSAddAtomic64(1, waited >= kNmxOrdMaxMs ? &gCntNmxOrdTimeout : &gCntNmxOrdWaited);
++            OSAddAtomic64((SInt64)((mach_absolute_time() - t0) / 1000), &gCntNmxOrdNs);   // x86: the timebase is ns
++        }
++    } else {
++        k = (int)(gNmxSeenNext++ % 16);
++        gNmxSeen[k].id = id;
++    }
++    gNmxSeen[k].seed = _ZNK9IOSurface11getLockSeedEv(s);
++    if (gNmxFrontLock) IOLockLock(gNmxFrontLock);      // nmxIopBlobFlip ends the front-buffer recopy (gNmxFront)
++    const int b = nmxIopBlobFlip(e->fb, e->head, s);
++    if (gNmxFrontLock) IOLockUnlock(gNmxFrontLock);
++    if (b == 1) {
++        gNmxOrdRefuseRun = 0;
++        OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[e->head]);
++    } else if (b == 0 && ++gNmxOrdRefuseRun >= 3 && gNmxBlobOrdered) {
++        // that frame stayed off the panel; the copy path (synchronous) takes over
++        gNmxBlobOrdered = 0;
++        ALOG("iop: 3 ordered blob flips refused in a row -- debug.nmxfb_blob_ordered=0 (WindowServer waits again, copy fallback)");
++    }
++    ((OSObject *)s)->release();
++    __atomic_store_n(&e->busy, 0, __ATOMIC_RELEASE);
++    _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(e->pipe, nullptr);
++}
++// true when the flip was handed to the thread call (the transaction completes later)
++static bool nmxOrderedStart(void *pipe, IOService *fb, unsigned head, IOSurface *s)
++{
++    if (!gNmxBlobOrdered || !pipe || head >= kNvMaxFB || !gCntNmxBlobFlips) return false;   // after one direct flip worked
++    NMXOrdered *e = &gNmxOrd[head];
++    // the family sends a pipe's next transaction only after the last one completed; wait out a stray overlap
++    for (unsigned i = 0; i < 200 && __atomic_load_n(&e->busy, __ATOMIC_ACQUIRE); i++) IOSleep(1);
++    if (__atomic_load_n(&e->busy, __ATOMIC_ACQUIRE)) return false;
++    if (!e->call) e->call = thread_call_allocate(nmxOrderedRun, e);
++    if (!e->call) return false;
++    ((OSObject *)s)->retain();
++    e->pipe = pipe; e->fb = fb; e->head = head; e->s = s;
++    __atomic_store_n(&e->busy, 1, __ATOMIC_RELEASE);
++    thread_call_enter(e->call);
++    return true;
++}
++#endif
+ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe)
+ {
+     if (!gIopFlip || !fb || !s || head >= kNvMaxFB) return false;

@@ -1,0 +1,51 @@
+From 1d7e4153a3cfb44d53b1b0a81497a3f8eb778090 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 09:36:00 +0200
+Subject: [PATCH 31/50] kext: forward a power-on as resume only after a suspend
+
+IOKit sets the initial power state (on) as soon as registerPowerDriver runs. setPowerState passed that to
+the driver as device_resume, restarting a running GPU: xe restarted the GT and started GuC submission a
+second time, leaving submission_state.stopped at -1. Every exec queue created afterwards was paused
+(pause_submit), so user jobs never reached the GuC; only the kernel queue, created before, ran.
+(NMXNPU's setPowerState has the same shape.)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ xnu/nmx_kext.cpp | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/gpu-port/xkpi/xnu/nmx_kext.cpp b/gpu-port/xkpi/xnu/nmx_kext.cpp
+index a6c8dbf..3bbf517 100644
+--- a/gpu-port/xkpi/xnu/nmx_kext.cpp
++++ b/gpu-port/xkpi/xnu/nmx_kext.cpp
+@@ -43,6 +43,7 @@ class NMXGPU : public IOService {
+     IOPCIDevice *pci_;
+     volatile int attach_;   /* 0 = attach pending on its thread, 1 = attached, -1 = not attached */
+     bool pm_;
++    bool suspended_;        /* the driver was told to suspend; only then does a power-on mean resume */
+     static void attachThread(void *arg, wait_result_t);
+     void attachNow();
+ public:
+@@ -283,10 +284,18 @@ void NMXGPU::stop(IOService *provider)
+ /* state 0 = sleep, 1 = on */
+ IOReturn NMXGPU::setPowerState(unsigned long state, IOService *device)
+ {
+-    if (dev_ != nullptr) {
+-        int err = nmx_port_power(dev_, state != 0);
++    /*
++     * IOKit sets the initial power state ("on") as soon as registerPowerDriver runs, and repeats a state the device is
++     * already in. Forwarding those as device_resume restarted a running GPU: xe's resume path restarts the GT and
++     * starts GuC submission a second time, which left its stopped count at -1, and every exec queue created afterwards
++     * started paused (its jobs never reached the GuC). Only a power-on after a suspend this driver did is a resume.
++     */
++    bool on = state != 0;
++    if (dev_ != nullptr && on == suspended_) {
++        int err = nmx_port_power(dev_, on);
+         if (err)
+-            IOLog("NullMoth GPU: %s returned %d\n", state ? "resume" : "suspend", err);
++            IOLog("NullMoth GPU: %s returned %d\n", on ? "resume" : "suspend", err);
++        suspended_ = !on;
+     }
+     return kIOPMAckImplied;
+ }

@@ -1,0 +1,231 @@
+From 73341bf0b00cebcef557f41c6e3eaeca4d3ae20a Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 17:25:46 +0200
+Subject: [PATCH 38/47] NMXVGAFB: virtio-gpu EDID, 16000-entry blobs,
+ two-command batches
+
+- edid(): GET_EDID for scanout 0 (VIRTIO_GPU_F_EDID).
+- A blob's scatter list may have 16000 entries (QEMU takes 16384, as does
+  the host's udmabuf list_limit); a 2880x1710 surface needs 4810 ranges,
+  over the old 4000, and every flip fell back to the copy path.
+- submitBatch() puts up to two commands on the ring with one notify and
+  one wait. flipShown() sends SET_SCANOUT_BLOB with the fenced flush that
+  way: the guest no longer wakes for the first answer before sending the
+  second (QEMU saw them 1.2 ms apart, p50).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ kexts/NMXVGAFB/nmx_virtio_gpu.cpp | 98 ++++++++++++++++++++++++-------
+ kexts/NMXVGAFB/nmx_virtio_gpu.h   | 11 +++-
+ 2 files changed, 87 insertions(+), 22 deletions(-)
+
+diff --git a/kexts/NMXVGAFB/nmx_virtio_gpu.cpp b/kexts/NMXVGAFB/nmx_virtio_gpu.cpp
+index c48e335..864bd9a 100644
+--- a/kexts/NMXVGAFB/nmx_virtio_gpu.cpp
++++ b/kexts/NMXVGAFB/nmx_virtio_gpu.cpp
+@@ -27,14 +27,14 @@ enum { kDescNext = 1, kDescWrite = 2 };
+ static constexpr uint16_t kMaxQ = 64;
+ // offsets in the ring buffer: descriptors, avail ring, used ring, then the response buffer; commands have their own
+ enum : uint32_t { kOffDesc = 0, kOffAvail = 1024, kOffUsed = 2048, kOffResp = 4096, kRingBytes = 8192 };
+-static constexpr uint32_t kCmdMax = 65536, kRespMax = 4096;
++static constexpr uint32_t kCmdMax = 262144, kRespMax = 4096;    // a 16000-entry blob scatter list fits
+ 
+ // ---- GPU device (5.7.6) -------------------------------------------------------------------------------------------
+ enum : uint32_t {
+     kCmdUpdateCursor = 0x0300, kCmdMoveCursor = 0x0301,
+     kCmdGetDisplayInfo = 0x0100, kCmdResourceUnref = 0x0102, kCmdSetScanout = 0x0103, kCmdResourceFlush = 0x0104,
+-    kCmdResourceCreateBlob = 0x010c, kCmdSetScanoutBlob = 0x010d,
+-    kRespOkNoData = 0x1100, kRespOkDisplayInfo = 0x1101,
++    kCmdGetEdid = 0x010a, kCmdResourceCreateBlob = 0x010c, kCmdSetScanoutBlob = 0x010d,
++    kRespOkNoData = 0x1100, kRespOkDisplayInfo = 0x1101, kRespOkEdid = 0x1104,
+ };
+ enum : uint32_t { kBlobMemGuest = 1, kFormatB8G8R8X8 = 2, kFlagFence = 1 };
+ static constexpr uint16_t kNoVector = 0xffff;
+@@ -43,6 +43,8 @@ struct GpuHdr { uint32_t type, flags; uint64_t fenceId; uint32_t ctxId; uint8_t
+ struct GpuRect { uint32_t x, y, w, h; };
+ struct GpuDisplayInfo { GpuHdr hdr; struct { GpuRect r; uint32_t enabled, flags; } pmodes[16]; };
+ struct GpuResourceUnref { GpuHdr hdr; uint32_t resourceId, pad; };
++struct GpuGetEdid { GpuHdr hdr; uint32_t scanout, pad; };
++struct GpuRespEdid { GpuHdr hdr; uint32_t size, pad; uint8_t edid[1024]; };
+ struct GpuSetScanout { GpuHdr hdr; GpuRect r; uint32_t scanoutId, resourceId; };
+ struct GpuResourceFlush { GpuHdr hdr; GpuRect r; uint32_t resourceId, pad; };
+ struct GpuMemEntry { uint64_t addr; uint32_t length, pad; };
+@@ -335,34 +337,54 @@ void NMXVirtioGPU::reset()
+ 
+ uint32_t NMXVirtioGPU::submit(const void *cmd, uint32_t cmdLen, void *resp, uint32_t respLen, uint64_t *doneAt)
+ {
+-    if (!fReady || cmdLen > kCmdMax || respLen > kRespMax) return 0;
++    Cmd c = { cmd, cmdLen, resp, respLen, 0 };
++    return submitBatch(&c, 1, doneAt);
++}
++
++// command i at fCmdKva + i * kCmd1Off, its response at kOffResp + i * kResp1Off; descriptors 2i and 2i + 1
++static constexpr uint32_t kCmd1Off = kCmdMax - 4096, kResp1Off = 2048;
++
++uint32_t NMXVirtioGPU::submitBatch(Cmd *c, unsigned n, uint64_t *doneAt)
++{
++    if (!fReady || n < 1 || n > 2) return 0;
++    for (unsigned i = 0; i < n; i++)
++        if (c[i].len > (n == 1 ? kCmdMax : i ? 4096 : kCmd1Off) || c[i].respLen > (n == 1 ? kRespMax : kResp1Off)) return 0;
+     IOLockLock(fLock);
+-    if (cmd != fCmdKva) memcpy(fCmdKva, cmd, cmdLen);
+-    bzero(fRingKva + kOffResp, respLen);
+     VqDesc *d = (VqDesc *)(fRingKva + kOffDesc);
+-    d[0] = { fCmdPhys, cmdLen, kDescNext, 1 };
+-    d[1] = { fRingPhys + kOffResp, respLen, kDescWrite, 0 };
+     volatile uint16_t *avail = (volatile uint16_t *)(fRingKva + kOffAvail);   // flags, idx, ring[]
+-    avail[2 + (fAvailIdx % fQSize)] = 0;
++    for (unsigned i = 0; i < n; i++) {
++        uint8_t *ca = fCmdKva + i * kCmd1Off;
++        if (c[i].cmd != ca) memcpy(ca, c[i].cmd, c[i].len);
++        bzero(fRingKva + kOffResp + i * kResp1Off, c[i].respLen);
++        d[2 * i] = { fCmdPhys + i * kCmd1Off, c[i].len, kDescNext, (uint16_t)(2 * i + 1) };
++        d[2 * i + 1] = { fRingPhys + kOffResp + i * kResp1Off, c[i].respLen, kDescWrite, 0 };
++        avail[2 + ((fAvailIdx + i) % fQSize)] = (uint16_t)(2 * i);
++    }
+     mb();
+-    avail[1] = ++fAvailIdx;
++    fAvailIdx = (uint16_t)(fAvailIdx + n);
++    avail[1] = fAvailIdx;
+     mb();
+     *fNotify = 0;
+     volatile uint16_t *used = (volatile uint16_t *)(fRingKva + kOffUsed);     // flags, idx, ring[]
+-    uint32_t type = 0;
++    const uint16_t want = (uint16_t)(fUsedSeen + n);
+     const uint64_t t0 = mach_absolute_time();
+     uint64_t done = 0;
++    bool answered = false;
+     // up to 1 s: the host's GL display can take a frame or two to take a new scanout
+     uint64_t deadline; clock_interval_to_deadline(1, kSecondScale, &deadline);
+     for (;;) {
+         mb();
+-        if (used[1] != fUsedSeen) {
+-            fUsedSeen = used[1];
+-            if (resp) memcpy(resp, fRingKva + kOffResp, respLen);
+-            type = ((GpuHdr *)(fRingKva + kOffResp))->type;
+-            // the interrupt's time when it is this answer's (it came after the command went out)
++        if (used[1] == want) {
++            fUsedSeen = want;
++            for (unsigned i = 0; i < n; i++) {
++                const uint8_t *ra = fRingKva + kOffResp + i * kResp1Off;
++                if (c[i].resp) memcpy(c[i].resp, ra, c[i].respLen);
++                c[i].type = ((const GpuHdr *)ra)->type;
++            }
++            // the interrupt's time when it is this answer's (it came after the commands went out)
+             const uint64_t at = fIrqAt;
+             done = fIrqOn && at >= t0 ? at : mach_absolute_time();
++            answered = true;
+             break;
+         }
+         if (mach_absolute_time() >= deadline) break;
+@@ -370,18 +392,19 @@ uint32_t NMXVirtioGPU::submit(const void *cmd, uint32_t cmdLen, void *resp, uint
+         else IODelay(10);
+     }
+     if (doneAt) *doneAt = done;
+-    fCommands++;
++    fCommands += n;
+     {
+-        const GpuHdr *h = (const GpuHdr *)fCmdKva;
++        const GpuHdr *h = (const GpuHdr *)(fCmdKva + (n - 1) * kCmd1Off);
+         Timing &tm = fTiming[h->type == kCmdResourceFlush ? (h->flags & kFlagFence ? 3 : 0) : h->type == kCmdSetScanoutBlob ? 1 : 2];
+         uint64_t ns = 0; absolutetime_to_nanoseconds((done ? done : mach_absolute_time()) - t0, &ns);
+         tm.n++; tm.totalNs += ns; if (ns > tm.maxNs) tm.maxNs = ns;
+     }
+-    if (!type) {
++    const uint32_t type = answered ? c[n - 1].type : 0;
++    if (!answered) {
+         fFailures++;
+-        // the device still owns descriptors 0 and 1: no further command is safe
++        // the device still owns the descriptors: no further command is safe
+         fReady = false;
+-        VGLOG("command 0x%x timed out; virtio-gpu disabled", ((const GpuHdr *)cmd)->type);
++        VGLOG("command 0x%x timed out; virtio-gpu disabled", ((const GpuHdr *)c[0].cmd)->type);
+     }
+     IOLockUnlock(fLock);
+     return type;
+@@ -405,6 +428,18 @@ bool NMXVirtioGPU::displayInfo(uint32_t *w, uint32_t *h, bool *enabled)
+     return true;
+ }
+ 
++bool NMXVirtioGPU::edid(uint8_t *buf, uint32_t cap, uint32_t *len)
++{
++    if (!fEdid) return false;
++    GpuGetEdid c = {}; c.hdr.type = kCmdGetEdid; c.scanout = 0;
++    GpuRespEdid *r = (GpuRespEdid *)IOMalloc(sizeof(GpuRespEdid));
++    if (!r) return false;
++    bool ok = submit(&c, sizeof c, r, sizeof *r) == kRespOkEdid && r->size >= 128 && r->size <= sizeof r->edid;
++    if (ok) { *len = r->size < cap ? r->size : cap; memcpy(buf, r->edid, *len); }
++    IOFree(r, sizeof(GpuRespEdid));
++    return ok;
++}
++
+ bool NMXVirtioGPU::createBlob(uint32_t resourceId, uint64_t phys, uint64_t size)
+ {
+     GpuCreateBlob c = {};
+@@ -439,6 +474,27 @@ bool NMXVirtioGPU::unrefResource(uint32_t resourceId)
+     return submitNoData(&c, sizeof c, "RESOURCE_UNREF");
+ }
+ 
++bool NMXVirtioGPU::flipShown(uint32_t resourceId, uint32_t w, uint32_t h, uint32_t stride, uint64_t *shownAt)
++{
++    GpuSetScanoutBlob ss = {};
++    ss.hdr.type = kCmdSetScanoutBlob;
++    ss.r = { 0, 0, w, h };
++    ss.scanoutId = 0; ss.resourceId = resourceId; ss.width = w; ss.height = h; ss.format = kFormatB8G8R8X8;
++    ss.strides[0] = stride;
++    GpuResourceFlush fl = {};
++    fl.hdr.type = kCmdResourceFlush; fl.hdr.flags = kFlagFence; fl.r = { 0, 0, w, h }; fl.resourceId = resourceId;
++    IOLockLock(fLock); fl.hdr.fenceId = ++fFenceId; IOLockUnlock(fLock);
++    GpuHdr r0, r1;
++    Cmd c[2] = { { &ss, sizeof ss, &r0, sizeof r0, 0 }, { &fl, sizeof fl, &r1, sizeof r1, 0 } };
++    if (!submitBatch(c, 2, shownAt)) return false;
++    if (c[0].type != kRespOkNoData || c[1].type != kRespOkNoData) {
++        fFailures++;
++        VGLOG("flip: SET_SCANOUT_BLOB 0x%x, RESOURCE_FLUSH (fenced) 0x%x", c[0].type, c[1].type);
++        return false;
++    }
++    return true;
++}
++
+ bool NMXVirtioGPU::setScanoutBlob(uint32_t resourceId, uint32_t w, uint32_t h, uint32_t stride)
+ {
+     GpuSetScanoutBlob c = {};
+diff --git a/kexts/NMXVGAFB/nmx_virtio_gpu.h b/kexts/NMXVGAFB/nmx_virtio_gpu.h
+index cddf8b5..b5188db 100644
+--- a/kexts/NMXVGAFB/nmx_virtio_gpu.h
++++ b/kexts/NMXVGAFB/nmx_virtio_gpu.h
+@@ -28,11 +28,13 @@ public:
+ 
+     // scanout 0's preferred size (the host window), 0 x 0 when the host reports none
+     bool displayInfo(uint32_t *w, uint32_t *h, bool *enabled);
++    // scanout 0's EDID (VIRTIO_GPU_F_EDID): up to cap bytes into buf, *len the size the host gave
++    bool edid(uint8_t *buf, uint32_t cap, uint32_t *len);
+     // a guest-memory blob resource over one physically contiguous range
+     bool createBlob(uint32_t resourceId, uint64_t phys, uint64_t size);
+     // the same over a scatter list (addr/len pairs, page-aligned); at most kMaxEntries
+     struct Range { uint64_t addr; uint32_t len; };
+-    static constexpr uint32_t kMaxEntries = 4000;
++    static constexpr uint32_t kMaxEntries = 16000;     // QEMU takes up to 16384 (and the host udmabuf list_limit)
+     bool createBlobSG(uint32_t resourceId, const Range *r, uint32_t n, uint64_t size);
+     bool unrefResource(uint32_t resourceId);
+     // shows the blob on scanout 0 (XRGB8888, little-endian: memory order B G R X)
+@@ -45,6 +47,9 @@ public:
+     // which with vblank-paced release is once per host refresh, at a fixed phase; a host without it answers at once.
+     // *shownAt: mach time of the answer (the interrupt's, when interrupts are on)
+     bool flushShown(uint32_t resourceId, uint32_t w, uint32_t h, uint64_t *shownAt);
++    // a flip to another blob: SET_SCANOUT_BLOB and the fenced flush go out together (one notify, one wait), so the
++    // host takes both in one pass instead of the guest waking for the first answer (~1.2 ms, measured)
++    bool flipShown(uint32_t resourceId, uint32_t w, uint32_t h, uint32_t stride, uint64_t *shownAt);
+     bool interrupts() const { return fIrqOn; }
+     // The cursor queue: the host draws scanout 0's cursor from a 64x64 ARGB32 resource (QEMU's GTK display makes it
+     // the window's own pointer). Fire and forget, never sleeps (IOGraphics moves the cursor from contexts that can't);
+@@ -105,5 +110,9 @@ private:
+     bool cursorSubmit(uint32_t type, uint32_t resourceId, uint32_t hotX, uint32_t hotY, uint32_t x, uint32_t y, bool mustSend);
+     // sends cmd and waits for the response; returns the response type (0 on timeout); *doneAt: when it came
+     uint32_t submit(const void *cmd, uint32_t cmdLen, void *resp, uint32_t respLen, uint64_t *doneAt = nullptr);
++    // the same for up to two commands at once (the second small); the answers' types go to type[], the result is the
++    // last one's (0 on timeout); *doneAt: when the last answer came
++    struct Cmd { const void *cmd; uint32_t len; void *resp; uint32_t respLen; uint32_t type; };
++    uint32_t submitBatch(Cmd *c, unsigned n, uint64_t *doneAt);
+     bool submitNoData(const void *cmd, uint32_t cmdLen, const char *what);
+ };

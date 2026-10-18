@@ -1,0 +1,170 @@
+From 2e46881591dc4c66c25e740cd7218c79f579994e Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 22:15:49 +0200
+Subject: [PATCH 14/47] NMXVGAFB: debug.nmxfb_vtiming - present gaps, scan-out
+ switch and virtio-gpu round trips
+
+A histogram of the intervals between presents (12/20/28/37/45/60/100 ms
+buckets), the time scanoutSurface takes, and per-kind virtio-gpu command
+round trips (flush, set scanout, other). Measured: WindowServer presents
+at ~60 Hz at the login window, switches take ~0.9 ms, flushes ~50-100 us -
+the display path does not limit the frame rate.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ kexts/NMXVGAFB/nmx_virtio_gpu.cpp |  8 ++++++
+ kexts/NMXVGAFB/nmx_virtio_gpu.h   |  4 +++
+ kexts/NMXVGAFB/nmxvgafb.cpp       | 42 +++++++++++++++++++++++++++++++
+ 3 files changed, 54 insertions(+)
+
+diff --git a/kexts/NMXVGAFB/nmx_virtio_gpu.cpp b/kexts/NMXVGAFB/nmx_virtio_gpu.cpp
+index e6ee424..c99b061 100644
+--- a/kexts/NMXVGAFB/nmx_virtio_gpu.cpp
++++ b/kexts/NMXVGAFB/nmx_virtio_gpu.cpp
+@@ -2,6 +2,7 @@
+ // virtqueues, 5.7 GPU device).
+ 
+ #include "nmx_virtio_gpu.h"
++#include <mach/mach_time.h>
+ #include <IOKit/IOLib.h>
+ #include <libkern/OSAtomic.h>
+ 
+@@ -185,6 +186,7 @@ uint32_t NMXVirtioGPU::submit(const void *cmd, uint32_t cmdLen, void *resp, uint
+     *fNotify = 0;
+     volatile uint16_t *used = (volatile uint16_t *)(fRingKva + kOffUsed);     // flags, idx, ring[]
+     uint32_t type = 0;
++    const uint64_t t0 = mach_absolute_time();
+     // up to 1 s: the host's GL display can take a frame or two to take a new scanout
+     for (int i = 0; i < 100000; i++) {
+         mb();
+@@ -197,6 +199,12 @@ uint32_t NMXVirtioGPU::submit(const void *cmd, uint32_t cmdLen, void *resp, uint
+         IODelay(10);
+     }
+     fCommands++;
++    {
++        const uint32_t ct = ((const GpuHdr *)fCmdKva)->type;
++        Timing &tm = fTiming[ct == kCmdResourceFlush ? 0 : ct == kCmdSetScanoutBlob ? 1 : 2];
++        uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++        tm.n++; tm.totalNs += ns; if (ns > tm.maxNs) tm.maxNs = ns;
++    }
+     if (!type) {
+         fFailures++;
+         // the device still owns descriptors 0 and 1: no further command is safe
+diff --git a/kexts/NMXVGAFB/nmx_virtio_gpu.h b/kexts/NMXVGAFB/nmx_virtio_gpu.h
+index a2a0fbb..7beb8e9 100644
+--- a/kexts/NMXVGAFB/nmx_virtio_gpu.h
++++ b/kexts/NMXVGAFB/nmx_virtio_gpu.h
+@@ -39,6 +39,9 @@ public:
+ 
+     uint64_t commands() const { return fCommands; }
+     uint64_t failures() const { return fFailures; }
++    // round-trip time per command kind (0 flush, 1 set scanout, 2 other): count, total and longest, in ns
++    struct Timing { uint64_t n, totalNs, maxNs; };
++    Timing timing(unsigned kind) const { return kind < 3 ? fTiming[kind] : Timing{}; }
+ 
+ private:
+     IOPCIDevice *fPci = nullptr;
+@@ -56,6 +59,7 @@ private:
+     IOLock *fLock = nullptr;
+     bool fReady = false, fBlob = false, fEdid = false;
+     uint64_t fCommands = 0, fFailures = 0;
++    Timing fTiming[3] = {};
+ 
+     volatile uint8_t *mapCap(uint8_t bar, uint32_t offset, uint32_t length);
+     bool setupQueue();
+diff --git a/kexts/NMXVGAFB/nmxvgafb.cpp b/kexts/NMXVGAFB/nmxvgafb.cpp
+index 92e4863..5690b66 100644
+--- a/kexts/NMXVGAFB/nmxvgafb.cpp
++++ b/kexts/NMXVGAFB/nmxvgafb.cpp
+@@ -19,6 +19,7 @@
+ #include "nmx_virtio_gpu.h"
+ #include "nmx_scanout_abi.h"
+ #include <mach/mach_time.h>
++#include <sys/sysctl.h>
+ 
+ // IOLog and kprintf both: a hang during start leaves only the serial console
+ #define VFBLOG(fmt, ...) do { IOLog("NMXVGAFB: " fmt "\n", ##__VA_ARGS__); kprintf("NMXVGAFB: " fmt "\n", ##__VA_ARGS__); } while (0)
+@@ -56,6 +57,14 @@ class NMXVGAFB : public IOFramebuffer {
+     volatile uint32_t fCurRes = 0;        // the resource on scanout 0 (kScanResource or a surface's)
+     uint32_t fCurW = 0, fCurH = 0;
+     uint64_t fLastPresent = 0;            // mach time of the last scanoutSurface (a present)
++public:
++    // present pacing, read through debug.nmxfb_vtiming: intervals between presents (ms buckets), time in scanoutSurface
++    static constexpr unsigned kHist = 8;
++    static constexpr uint32_t kHistMs[kHist - 1] = { 12, 20, 28, 37, 45, 60, 100 };
++    uint64_t fPresentHist[kHist] = {};
++    uint64_t fSwitchN = 0, fSwitchNs = 0, fSwitchMaxNs = 0;
++    NMXVirtioGPU &virtio() { return fVirtio; }
++private:
+     bool fFlushing = true;
+     unsigned fIdleLogs = 0;
+     static constexpr uint64_t kSurfFlushNs = 1000000000ull;
+@@ -252,6 +261,29 @@ public:
+ 
+ OSDefineMetaClassAndStructors(NMXVGAFB, IOFramebuffer)
+ 
++// debug.nmxfb_vtiming: present pacing and virtio-gpu round trips (see fPresentHist and NMXVirtioGPU::timing)
++static NMXVGAFB *volatile gVtInst;
++static int nmxVtimingSysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
++{
++    char buf[640];
++    NMXVGAFB *f = gVtInst;
++    if (!f) { snprintf(buf, sizeof buf, "no virtio display"); return SYSCTL_OUT(req, buf, strlen(buf) + 1); }
++    const uint64_t *h = f->fPresentHist;
++    int n = snprintf(buf, sizeof buf, "present gaps ms <12:%llu <20:%llu <28:%llu <37:%llu <45:%llu <60:%llu <100:%llu >=100:%llu"
++                     " | switch n %llu avg %llu us max %llu us",
++                     h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], f->fSwitchN,
++                     f->fSwitchN ? f->fSwitchNs / f->fSwitchN / 1000 : 0, f->fSwitchMaxNs / 1000);
++    static const char *const kName[3] = { "flush", "set_scanout", "other" };
++    for (unsigned k = 0; k < 3 && n > 0 && n < (int)sizeof buf; k++) {
++        NMXVirtioGPU::Timing t = f->virtio().timing(k);
++        n += snprintf(buf + n, sizeof buf - (size_t)n, " | %s n %llu avg %llu us max %llu us", kName[k], t.n,
++                      t.n ? t.totalNs / t.n / 1000 : 0, t.maxNs / 1000);
++    }
++    return SYSCTL_OUT(req, buf, strlen(buf) + 1);
++}
++SYSCTL_PROC(_debug, OID_AUTO, nmxfb_vtiming, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, nmxVtimingSysctl, "A",
++            "NMXVGAFB: present gaps, scan-out switch and virtio-gpu command times");
++
+ // Opt-in, as NMXGPU is: boot-arg nmxvgafb=1, or the one-shot NVRAM variable nullmoth-vgafb-once (consumed here, so a
+ // start that hangs is followed by one with the firmware framebuffer). Declining leaves the display to IONDRVFramebuffer.
+ static int g_opted = -1;      /* the decision, made once: the NVRAM variable is consumed by the first ask */
+@@ -364,6 +396,8 @@ bool NMXVGAFB::start(IOService *provider)
+                           fHeight + 8, fVT, 60000u, 1u, 1u };
+         if (OSData *k5d = OSData::withBytes(k5, sizeof k5)) { setProperty("NVRMTiming", k5d); k5d->release(); }
+     }
++    if (fVirtioOn && OSCompareAndSwapPtr(nullptr, this, (void * volatile *)&gVtInst))
++        sysctl_register_oid(&sysctl__debug_nmxfb_vtiming);
+     fVblTimer = thread_call_allocate(vblFire, this);
+     if (fVblTimer) {
+         uint64_t d; clock_interval_to_deadline((uint32_t)(kFrameNs / 1000), kMicrosecondScale, &d);
+@@ -385,6 +419,8 @@ bool NMXVGAFB::start(IOService *provider)
+ void NMXVGAFB::stop(IOService *provider)
+ {
+     fStopping = true;
++    if (OSCompareAndSwapPtr(this, nullptr, (void * volatile *)&gVtInst))
++        sysctl_unregister_oid(&sysctl__debug_nmxfb_vtiming);
+     if (fHoldCap) { thread_call_cancel(fHoldCap); while (!thread_call_free(fHoldCap)) { thread_call_cancel(fHoldCap); IOSleep(5); } fHoldCap = nullptr; }
+     releaseHold("stopping");
+     OSSafeReleaseNULL(fAccel);
+@@ -594,6 +630,11 @@ IOReturn NMXVGAFB::scanoutSurface(NMXScanoutSurface *r)
+     } else if (!hit) ret = kIOReturnNoResources;
+     if (hit) {
+         hit->lastUse = t0;
++        if (fLastPresent) {
++            uint64_t gap = 0; absolutetime_to_nanoseconds(t0 - fLastPresent, &gap);
++            unsigned k = 0; while (k < kHist - 1 && gap >= kHistMs[k] * 1000000ull) k++;
++            fPresentHist[k]++;
++        }
+         fLastPresent = t0;
+         if (hit->res != fCurRes && !fVirtio.setScanoutBlob(hit->res, hit->w, hit->h, hit->pitch)) ret = kIOReturnIOError;
+         else { fCurRes = hit->res; fCurW = hit->w; fCurH = hit->h; fVirtio.flush(fCurRes, 0, 0, fCurW, fCurH); }
+@@ -601,6 +642,7 @@ IOReturn NMXVGAFB::scanoutSurface(NMXScanoutSurface *r)
+     IOLockUnlock(fScanLock);
+     uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+     r->ns = ns;
++    fSwitchN++; fSwitchNs += ns; if (ns > fSwitchMaxNs) fSwitchMaxNs = ns;
+     if (fSwitchLogs < 8) { fSwitchLogs++; VFBLOG("virtio-gpu: scan-out -> surface 0x%x: 0x%x in %llu us", r->surfaceId, ret, ns / 1000); }
+     return ret;
+ }

@@ -1,0 +1,255 @@
+From 777608f3447244626ca115999d7bad0862968e00 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 15:50:25 +0200
+Subject: [PATCH 05/47] VM display: frames reach the screen - NMXVGAFB grants
+ system memory as VRAM, NMXAccel re-copies the front buffer at 60 Hz
+
+- NMXVGAFB answers nvAllocVram/nvFreeVram with physically contiguous system memory (512 MB budget). IOAcceleratorFamily2
+  wires WindowServer's display surfaces into video memory before a transaction may present them; without a grant
+  every transaction failed (0xe00002be, "failed to wire down video map").
+- NMXAccel (VM display only): the last presented surface is copied onto the panel at debug.nmxfb_front_hz (60)
+  besides each transaction. The Metal plugin copies a frame out to the IOSurface after the GPU signals, while
+  WindowServer presents on that signal, so a transaction could copy an empty frame and a static screen never sent
+  another. Counter: debug.nmxfb_front_copies.
+
+Result: WindowServer composites on the Xe VF and the login window and desktop show and update.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ kexts/NMXVGAFB/nmxvgafb.cpp      | 55 ++++++++++++++++++
+ kexts/NVRM/accel/nvaccel_stubs.h |  1 +
+ kexts/NVRM/accel/nvrm-accel.cpp  | 98 +++++++++++++++++++++++++++++++-
+ 3 files changed, 153 insertions(+), 1 deletion(-)
+
+diff --git a/kexts/NMXVGAFB/nmxvgafb.cpp b/kexts/NMXVGAFB/nmxvgafb.cpp
+index ad13dbb..ce36ddd 100644
+--- a/kexts/NMXVGAFB/nmxvgafb.cpp
++++ b/kexts/NMXVGAFB/nmxvgafb.cpp
+@@ -11,6 +11,7 @@
+ #include <IOKit/pci/IOPCIDevice.h>
+ #include <IOKit/graphics/IOFramebuffer.h>
+ #include <IOKit/IODeviceMemory.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IONVRAM.h>
+ #include <kern/thread_call.h>
+ #include <pexpert/pexpert.h>
+@@ -295,9 +296,63 @@ void NMXVGAFB::stop(IOService *provider)
+     IOFramebuffer::stop(provider);
+ }
+ 
++/*
++ * "VRAM" for NMXAccel's video resources (WindowServer's display surfaces): IOAcceleratorFamily2 wires each one into
++ * video memory before a display-pipe transaction may present it, and NMXAccel asks the head's framebuffer for that
++ * memory, as NVRMFB grants BAR1 VRAM. A VM display has no VRAM; physically contiguous system memory stands in (the
++ * resource's aperture descriptor is a single physical range, and the pipe copies from the kernel address).
++ */
++static constexpr unsigned long long kVramBudget = 512ull << 20;
++static volatile SInt64 gVramUsed = 0;
++static volatile SInt64 gVramCookie = 0;
++static unsigned gVramLogs = 0;
++
++static IOReturn nmxVramAlloc(NVRMVramRequest *r)
++{
++    const unsigned long long want = (r->size + PAGE_SIZE - 1) & ~(unsigned long long)(PAGE_SIZE - 1);
++    if (!want) return kIOReturnBadArgument;
++    if ((unsigned long long)OSAddAtomic64((SInt64)want, &gVramUsed) + want > kVramBudget) {
++        OSAddAtomic64(-(SInt64)want, &gVramUsed);
++        VFBLOG("nvAllocVram(%llu): REFUSED, budget of %llu bytes spent", want, kVramBudget);
++        return kIOReturnNoSpace;
++    }
++    IOBufferMemoryDescriptor *b = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++        kIODirectionInOut | kIOMemoryPhysicallyContiguous, want, 0x000000FFFFFFF000ull);
++    if (!b) {
++        OSAddAtomic64(-(SInt64)want, &gVramUsed);
++        VFBLOG("nvAllocVram(%llu): no contiguous system memory", want);
++        return kIOReturnNoMemory;
++    }
++    bzero(b->getBytesNoCopy(), want);
++    r->handle = b; r->kva = b->getBytesNoCopy();
++    r->phys = b->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
++    r->actualSize = want;
++    r->mappedTotal = (unsigned long long)gVramUsed;
++    r->allocationCookie = (unsigned long long)OSAddAtomic64(1, &gVramCookie) + 1;
++    if (gVramLogs < 16) { gVramLogs++;
++        VFBLOG("nvAllocVram(%llu): system memory phys 0x%llx kva %p [%llu of %llu]", want, r->phys, r->kva,
++               r->mappedTotal, kVramBudget); }
++    return kIOReturnSuccess;
++}
++
++static IOReturn nmxVramFree(NVRMVramRequest *r)
++{
++    IOBufferMemoryDescriptor *b = OSDynamicCast(IOBufferMemoryDescriptor, (OSObject *)r->handle);
++    if (!b) return kIOReturnBadArgument;
++    OSAddAtomic64(-(SInt64)b->getLength(), &gVramUsed);
++    b->release();
++    r->handle = nullptr; r->kva = nullptr; r->phys = 0; r->actualSize = 0; r->allocationCookie = 0;
++    return kIOReturnSuccess;
++}
++
+ // NMXAccel's display pipe asks its heads for their scan-out: a CPU mapping and no GPU address, so frames arrive by copy
+ IOReturn NMXVGAFB::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4)
+ {
++    if (fn && (fn->isEqualTo(NVRM_VRAM_FN_ALLOC) || fn->isEqualTo(NVRM_VRAM_FN_FREE))) {
++        NVRMVramRequest *r = (NVRMVramRequest *)p1;
++        if (!r || r->version != NVRM_VRAM_ABI_VERSION) return kIOReturnBadArgument;
++        return fn->isEqualTo(NVRM_VRAM_FN_ALLOC) ? nmxVramAlloc(r) : nmxVramFree(r);
++    }
+     if (fn && fn->isEqualTo(NVRM_VRAM_FN_SCANOUT)) {
+         NVRMVramRequest *r = (NVRMVramRequest *)p1;
+         if (!r || r->version != NVRM_VRAM_ABI_VERSION) return kIOReturnBadArgument;
+diff --git a/kexts/NVRM/accel/nvaccel_stubs.h b/kexts/NVRM/accel/nvaccel_stubs.h
+index eb24b3b..e7d5ced 100644
+--- a/kexts/NVRM/accel/nvaccel_stubs.h
++++ b/kexts/NVRM/accel/nvaccel_stubs.h
+@@ -139,6 +139,7 @@ public:
+     IOAccelMemory *initFramebufferResource(unsigned int index, IOAccelResource2 *res) APPLE_KEXT_OVERRIDE;
+     IOReturn validateTransaction(IOAccelDisplayPipeTransaction2 *txn) APPLE_KEXT_OVERRIDE;
+     IOReturn performTransaction(IOAccelDisplayPipeTransaction2 *txn) APPLE_KEXT_OVERRIDE;
++    IOReturn performTransactionCopy(IOAccelDisplayPipeTransaction2 *txn);
+     bool     isTransactionComplete(IOAccelDisplayPipeTransaction2 *txn) APPLE_KEXT_OVERRIDE;
+     void     free() APPLE_KEXT_OVERRIDE;
+     enum { kIopSrcSlots = 4 };
+diff --git a/kexts/NVRM/accel/nvrm-accel.cpp b/kexts/NVRM/accel/nvrm-accel.cpp
+index 90f1c2f..3297e45 100644
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -42,6 +42,7 @@ static void               nvAccelWriteStamp(int index, unsigned int value);
+ #include <libkern/c++/OSSymbol.h>
+ #include "nvrm_vram_abi.h"
+ #include <IOKit/IODeviceMemory.h>
++#include <kern/thread_call.h>
+ #include "tahoe_fwd.h"   // macOS 26: inherited slots Apple no longer exports, forwarded through its vtables
+ #include "nvaccel_stubs.h"
+ #include "nvkms-kapi.h"
+@@ -942,8 +943,91 @@ void NVDisplayPipe::iopDropSources()
+     }
+ }
+ 
++#ifdef NMX_ACCEL
++/*
++ * VM display front buffer. NMXVGAFB's scan-out is plain memory that QEMU shows as it is, so the pipe's copy is the
++ * only way a frame gets there - and a transaction can arrive before the frame is in the surface's memory: the Metal
++ * plugin renders into a private image and copies it out to the IOSurface after the GPU signals, while WindowServer
++ * presents on that signal. A static screen sends no further transaction, so the panel kept an empty frame. Like a
++ * display engine scanning out its front buffer, the last presented surface is copied again at 60 Hz. The mapping
++ * stays valid while it is the front: it sits in one of the pipe's source slots, which only performTransaction
++ * (under gNmxFrontLock) recycles.
++ */
++static IOLock *gNmxFrontLock = nullptr;
++static thread_call_t gNmxFrontTimer = nullptr;
++static struct { const NVDisplayPipe *pipe; const volatile unsigned *src; unsigned w, h, pitch;
++                volatile unsigned *dst; unsigned dpitch; } gNmxFront;
++static SInt64 gCntNmxFrontCopies;
++static int gNmxFrontHz = 60;
++static constexpr unsigned kNmxFrontMaxHz = 240;
++
++static void nmxFrontCopyLocked()
++{
++    if (!gNmxFront.src || !gNmxFront.dst) return;
++    const unsigned words = (((gNmxFront.pitch < gNmxFront.dpitch) ? gNmxFront.pitch : gNmxFront.dpitch) & ~3u) / 4;
++    const unsigned spr = gNmxFront.pitch / 4, dpr = gNmxFront.dpitch / 4;
++    for (unsigned y = 0; y < gNmxFront.h; y++) {
++        const volatile unsigned *sp = gNmxFront.src + (unsigned long)y * spr;
++        volatile unsigned *dp = gNmxFront.dst + (unsigned long)y * dpr;
++        for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
++    }
++    OSAddAtomic64(1, &gCntNmxFrontCopies);
++}
++
++static void nmxFrontArm()
++{
++    const int hz = gNmxFrontHz;
++    if (!gNmxFrontTimer || hz <= 0) return;
++    uint64_t d; clock_interval_to_deadline(1000000u / (unsigned)(hz < (int)kNmxFrontMaxHz ? hz : kNmxFrontMaxHz),
++                                           kMicrosecondScale, &d);
++    thread_call_enter_delayed(gNmxFrontTimer, d);
++}
++
++static void nmxFrontTick(thread_call_param_t, thread_call_param_t)
++{
++    if (!gNmxFrontLock) return;
++    IOLockLock(gNmxFrontLock);
++    nmxFrontCopyLocked();
++    const bool live = gNmxFront.src != nullptr;
++    IOLockUnlock(gNmxFrontLock);
++    if (live) nmxFrontArm();
++}
++
++static void nmxFrontInit()
++{
++    if (!gNmxFrontLock) gNmxFrontLock = IOLockAlloc();
++    if (!gNmxFrontTimer) gNmxFrontTimer = thread_call_allocate(nmxFrontTick, nullptr);
++}
++#endif
++
++IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
++{
++#ifdef NMX_ACCEL
++    if (gNmxVmDisplay && gNvIop) {
++        nmxFrontInit();
++        if (gNmxFrontLock) {
++            IOLockLock(gNmxFrontLock);
++            const bool wasLive = gNmxFront.src != nullptr;
++            IOReturn r = performTransactionCopy(txn);
++            const bool live = gNmxFront.src != nullptr;
++            IOLockUnlock(gNmxFrontLock);
++            if (live && !wasLive) nmxFrontArm();
++            return r;
++        }
++    }
++#endif
++    return performTransactionCopy(txn);
++}
++
+ void NVDisplayPipe::free()
+ {
++#ifdef NMX_ACCEL
++    if (gNmxFrontLock) {
++        IOLockLock(gNmxFrontLock);
++        if (gNmxFront.pipe == this) gNmxFront.src = nullptr;
++        IOLockUnlock(gNmxFrontLock);
++    }
++#endif
+     iopDropSources();
+     IOAccelLegacyDisplayPipe::free();
+ }
+@@ -981,7 +1065,7 @@ static void nvAccelSurfScanoutSync(IOSurface *s);
+ static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head);
+ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe);
+ static void nvAccelIopHome(IOService *fb, unsigned head);
+-IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
++IOReturn NVDisplayPipe::performTransactionCopy(IOAccelDisplayPipeTransaction2 *txn)
+ {
+     if (!gNvIop) return (IOReturn)0xe00002c7;
+     if (!txn) NVIOP_FAIL(kIOReturnBadArgument, "performTransaction(NULL)");
+@@ -1058,6 +1142,14 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
+         for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
+     }
+     OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
++#ifdef NMX_ACCEL
++    // the copy source of a VM display becomes its front buffer (a resource's memory can go away under us: not those)
++    if (gNmxVmDisplay && gNmxFrontLock) {
++        if (fromRes) gNmxFront.src = nullptr;
++        else { gNmxFront.pipe = this; gNmxFront.src = src; gNmxFront.w = w; gNmxFront.h = h; gNmxFront.pitch = pitch;
++               gNmxFront.dst = (volatile unsigned *)q.kva; gNmxFront.dpitch = q.pitch; }
++    }
++#endif
+     const SInt64 n = OSAddAtomic64(1, &gCntIopOk);
+     const SInt64 nh = OSAddAtomic64(1, &gCntIopOkHead[head]);
+     unsigned nz = 0, varied = 0; const unsigned first = src[0] & 0xffffffu;
+@@ -1183,10 +1275,14 @@ static void nvaccelInstallSysctl(void)
+     gSysctlInstalled = true;
+ }
+ static bool gVmSysctlInstalled = false;
++NVACCEL_CNT(nmxfb_front_copies, gCntNmxFrontCopies, "VM display: front-buffer copies onto the panel");
++SYSCTL_INT(_debug, OID_AUTO, nmxfb_front_hz, CTLFLAG_RW | CTLFLAG_LOCKED, &gNmxFrontHz, 0,
++           "VM display: front-buffer copies per second (0 = only on transactions)");
+ static void nmxInstallVmSysctls(void)
+ {
+     if (gVmSysctlInstalled) return;
+     gVmSysctlInstalled = true;
++    sysctl_register_oid(&sysctl__debug_nmxfb_front_copies);  sysctl_register_oid(&sysctl__debug_nmxfb_front_hz);
+ #else
+     sysctl_register_oid(&sysctl__debug_nvaccel_headless);
+ #endif

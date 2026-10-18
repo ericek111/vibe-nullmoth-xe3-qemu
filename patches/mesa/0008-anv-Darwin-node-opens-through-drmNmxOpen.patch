@@ -1,0 +1,47 @@
+From 08ae43a8e1c9021a1df1c70990e8a9a24fc4c8ff Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 22:38:21 +0200
+Subject: [PATCH 8/8] anv: Darwin node opens through drmNmxOpen
+
+Generated-by: LLM
+---
+ src/intel/vulkan/anv_device.c          | 6 +++---
+ src/intel/vulkan/anv_physical_device.c | 6 +++---
+ 2 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/src/intel/vulkan/anv_device.c b/src/intel/vulkan/anv_device.c
+index efa126040e4..7f37f9cd21a 100644
+--- a/src/intel/vulkan/anv_device.c
++++ b/src/intel/vulkan/anv_device.c
+@@ -929,10 +929,10 @@ VkResult anv_CreateDevice(
+    device->kmd_backend = anv_kmd_backend_get(device->info->kmd_type);
+ 
+    /* XXX(chadv): Can we dup() physicalDevice->fd here? */
+-   device->fd = open(physical_device->path, O_RDWR | O_CLOEXEC);
+ #ifdef __APPLE__
+-   if (device->fd == -1 && errno == EPERM)
+-      device->fd = open(physical_device->path, O_RDONLY | O_CLOEXEC);
++   device->fd = drmNmxOpen(physical_device->path, O_RDWR | O_CLOEXEC);
++#else
++   device->fd = open(physical_device->path, O_RDWR | O_CLOEXEC);
+ #endif
+    if (device->fd == -1) {
+       result = vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
+diff --git a/src/intel/vulkan/anv_physical_device.c b/src/intel/vulkan/anv_physical_device.c
+index 466fd46e9e3..01d77a2bf2a 100644
+--- a/src/intel/vulkan/anv_physical_device.c
++++ b/src/intel/vulkan/anv_physical_device.c
+@@ -3014,10 +3014,10 @@ anv_physical_device_try_create(struct vk_instance *vk_instance,
+    int master_fd = -1;
+    int ret;
+ 
+-   fd = open(path, O_RDWR | O_CLOEXEC);
+ #ifdef __APPLE__
+-   if (fd < 0 && errno == EPERM)
+-      fd = open(path, O_RDONLY | O_CLOEXEC);
++   fd = drmNmxOpen(path, O_RDWR | O_CLOEXEC);
++#else
++   fd = open(path, O_RDWR | O_CLOEXEC);
+ #endif
+    if (fd < 0) {
+       if (errno == ENOMEM) {

@@ -1,0 +1,110 @@
+From 090ceecb4a2969259d97e5ce3fc09c96a48a3a0a Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 23:25:03 +0200
+Subject: [PATCH 20/47] plugin: NMXPending/NMXPublished surface values for
+ ordered VM-display flips
+
+With debug.nmxfb_blob_ordered=1, each command buffer that writes
+IOSurface-backed textures takes a number at commit and sets NMXPending on
+those surfaces, then sets NMXPublished after its copy-out. NMXAccel puts a
+presented surface on the panel once NMXPublished >= NMXPending.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ plugin/NVMTLEventSync.m |  5 ++++-
+ plugin/NVMTLObjects.h   |  3 +++
+ plugin/NVMTLObjects.m   | 25 ++++++++++++++++++++++++-
+ 3 files changed, 31 insertions(+), 2 deletions(-)
+
+diff --git a/plugin/NVMTLEventSync.m b/plugin/NVMTLEventSync.m
+index 793961f..ac641e7 100644
+--- a/plugin/NVMTLEventSync.m
++++ b/plugin/NVMTLEventSync.m
+@@ -454,7 +454,10 @@ static void nvmtl_gsub_ahead_pass1(void) {
+         if (result == 0) [self nvmtlCollectDeviceTiming:&part->commands];
+         BOOL published = result == 0;
+         if (published) {
+-            for (NVMTLTexture *texture in part->surfaces) if (![texture nvmtlSurfaceOut]) published = NO;
++            for (NVMTLTexture *texture in part->surfaces) {
++                if (![texture nvmtlSurfaceOut]) published = NO;
++                else nvmtl_mark_published(self, texture->_parent ? texture->_parent : texture);
++            }
+             for (NVMTLBuffer *buffer in nvmtl_submission_copies(part->resources, YES)) nvmtl_buffer_sync_out(buffer);
+         }
+         if (!published) {
+diff --git a/plugin/NVMTLObjects.h b/plugin/NVMTLObjects.h
+index 7c5ab34..83c149c 100644
+--- a/plugin/NVMTLObjects.h
++++ b/plugin/NVMTLObjects.h
+@@ -117,6 +117,8 @@ extern id gNVMTLMainDevice;
+   NSMutableArray *_scratch;
+   NSMutableSet *_resources;
+   NSMutableSet *_surfDirty;
++  NSMutableSet *_surfAll;         // every IOSurface-backed texture this command buffer writes (ordered VM-display flips)
++  long long _pubN;                // its NMXPending/NMXPublished number, 0 = none
+   NSMutableSet *_surfOverwrites; // contents defined by writes recorded in this command buffer
+   unsigned _nEnc, _nEnd, _nHandlers, _nStatus, _nEnqueue, _nLabel, _nPresent, _nWait;
+   unsigned _nEncSealed;
+@@ -313,3 +315,4 @@ extern unsigned nvmtl_apps1_resolve_miss, nvmtl_apps1_resolve_extra, nvmtl_apps1
+ @end
+ 
+ NSDictionary *nvmtl_index_argument_fields(NSArray *fields);
++void nvmtl_mark_published(NVMTLCommandBuffer *cb, NVMTLTexture *t);   // ordered VM-display flips (NVMTLObjects.m)
+diff --git a/plugin/NVMTLObjects.m b/plugin/NVMTLObjects.m
+index 75c824f..f99eefb 100644
+--- a/plugin/NVMTLObjects.m
++++ b/plugin/NVMTLObjects.m
+@@ -887,6 +887,8 @@ static void nvmtl_surf_dirty(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
+     if (!r->_surf) return;
+     if (!cb->_surfDirty) cb->_surfDirty = [NSMutableSet new];
+     [cb->_surfDirty addObject:r];
++    if (!cb->_surfAll) cb->_surfAll = [NSMutableSet new];
++    [cb->_surfAll addObject:r];
+ }
+ // A texture a kernel writes through a storage binding although NVK cannot make it a storage image - an IOSurface in a
+ // pitch-linear layout (ImageIO's RGBA16Unorm HDR / gain-map output), or a format NVK refuses linear storage for. The
+@@ -1021,6 +1023,7 @@ static void nvmtl_surface_in_for_cb(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
+     [t nvmtlSurfaceIn];
+ }
+ static unsigned nvmtl_surf_id(NVMTLTexture *t) { NVMTLTexture *r = (t && t->_parent) ? t->_parent : t; return (r && r->_surf) ? (unsigned)IOSurfaceGetID(r->_surf) : 0u; }
++static int nvmtl_flips_ordered(void);
+ static int nvmtl_noseed(void) { static uint64_t next; static int on; uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+     if (now >= next) { next = now + 250000000ull; int was = on; on = access("/tmp/nvmtl-noseed", F_OK) == 0;
+         if (on && !was) nvlog("G17 EXPERIMENT ON: surface-out writes under a read-only lock, the IOSurface seed does not move");
+@@ -1244,6 +1247,7 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
+     if (!rc && r->_i.bpp == 4) { char tag[24]; snprintf(tag, sizeof tag, "out%u-", (unsigned)IOSurfaceGetID(r->_surf)); nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h); }
+     uint32_t seed = 0; IOReturn unlocked = IOSurfaceUnlock(r->_surf, lockopt, &seed); if (lockopt) seed = IOSurfaceGetSeed(r->_surf);
+     if (rc || unlocked != kIOReturnSuccess) { nvlog("G13 surface-out: readback FAILED (%ux%u)", r->_i.w, r->_i.h); return NO; }
++
+     r->_surfSeed = seed; r->_surfSynced = YES;
+     r->_surfGen = r->_vramOn ? r->_surfGen : nvmtl_vram_gen(r->_surf, r->_plane);
+     if (r->_vramOn && !lockopt) nvmtl_vram_tag_set(r->_surf, r->_plane, seed);
+@@ -4818,7 +4822,26 @@ static int nvmtl_flips_ordered(void) {
+     if (ws && !nvmtl_flips_ordered()) [self waitUntilCompleted]; else [self waitUntilScheduled];
+     return self.status != MTLCommandBufferStatusError;
+ }
+-- (void)commit { [self nvmtlSubmitWithEvents]; }
++// Ordered VM-display flips (NMXAccel, debug.nmxfb_blob_ordered): a presented surface goes on the panel once every
++// command buffer committed into it so far has copied its pixels out. At commit each such command buffer takes a new
++// number and sets the surface value NMXPending to it; after its copy-out it sets NMXPublished to it (NVMTLEventSync).
++// A frame can take several command buffers into one surface (WindowServer composites, then CoreDisplay's
++// AccessComplete draws into the same surface), so NMXAccel waits for NMXPublished >= NMXPending.
++static void nvmtl_mark_pending(NVMTLCommandBuffer *cb) {
++    if (!cb->_surfAll.count || !nvmtl_flips_ordered()) return;
++    static _Atomic long long counter;
++    cb->_pubN = ++counter;
++    CFNumberRef num = CFNumberCreate(NULL, kCFNumberLongLongType, &cb->_pubN);
++    if (!num) { cb->_pubN = 0; return; }
++    for (NVMTLTexture *t in cb->_surfAll) if (t->_surf) IOSurfaceSetValue(t->_surf, CFSTR("NMXPending"), num);
++    CFRelease(num);
++}
++void nvmtl_mark_published(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
++    if (!cb->_pubN || !t->_surf) return;
++    CFNumberRef num = CFNumberCreate(NULL, kCFNumberLongLongType, &cb->_pubN);
++    if (num) { IOSurfaceSetValue(t->_surf, CFSTR("NMXPublished"), num); CFRelease(num); }
++}
++- (void)commit { nvmtl_mark_pending(self); [self nvmtlSubmitWithEvents]; }
+ - (id<MTLComputeCommandEncoder>)computeCommandEncoder {
+     NVMTLComputeCommandEncoder *e = [NVMTLComputeCommandEncoder new]; e->_cb = self; _nEnc++; return e;
+ }

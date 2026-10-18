@@ -1,0 +1,70 @@
+From ca907c50dea0765198a7fc40713d0e1c9a3cb7c0 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 16:32:13 +0200
+Subject: [PATCH 35/47] NMXAccel: ordtrace stage times in microseconds
+
+The ordered-flip trace logs when the transaction was submitted, when its
+thread call ran, when the surface's pixels were ready and when the flip
+returned, on the mach clock NMXVGAFB's debug.nmxfb_vtrace uses, so
+vm/tools/ftrace.sh can line up each frame's stages with the VBL.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ kexts/NVRM/accel/nvrm-accel.cpp | 27 ++++++++++++++++-----------
+ 1 file changed, 16 insertions(+), 11 deletions(-)
+
+diff --git a/kexts/NVRM/accel/nvrm-accel.cpp b/kexts/NVRM/accel/nvrm-accel.cpp
+index 7bd7b09..ea8c3ed 100644
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -1900,7 +1900,7 @@ static bool nmxSurfaceReady(IOSurface *s, uint64_t *pub)
+     return pending == 0 || *pub >= pending;
+ }
+ static constexpr unsigned kNmxOrdMaxMs = 100;
+-struct NMXOrdered { void *pipe; IOService *fb; unsigned head; IOSurface *s; volatile SInt32 busy; struct thread_call *call; };
++struct NMXOrdered { void *pipe; IOService *fb; unsigned head; IOSurface *s; volatile SInt32 busy; struct thread_call *call; uint64_t tSubmit; };
+ static NMXOrdered gNmxOrd[kNvMaxFB];
+ static struct { unsigned id; uint64_t pub; } gNmxSeen[16];   // a surface's NMXPublished when it last went on the panel
+ static unsigned gNmxSeenNext;
+@@ -1959,18 +1959,23 @@ static void nmxOrderedRun(void *p0, void *)
+                             f->getSurfaceID(), (unsigned long long)gNmxOrdFrontPub[e->head], (unsigned long long)fp);
+         }
+     }
+-    if (gNmxOrdTrace > 0) {
+-        gNmxOrdTrace--;
+-        IOSurface *f = gNmxOrdFront[e->head];
+-        ALOG("ordtrace t=%llu us: surface 0x%x pub %llu->%llu (last shown %llu) waited %u ms final %d | front 0x%x pub "
+-             "%llu (when shown %llu)", (unsigned long long)(t0 / 1000), id, (unsigned long long)pub0,
+-             (unsigned long long)pub, (unsigned long long)lastShown, waited, (int)final,
+-             f ? f->getSurfaceID() : 0u, (unsigned long long)(f ? nmxPublished(f) : 0),
+-             (unsigned long long)gNmxOrdFrontPub[e->head]);
+-    }
++    const bool trace = gNmxOrdTrace > 0;
++    IOSurface *traceFront = trace ? gNmxOrdFront[e->head] : nullptr;
++    const uint64_t traceFrontPub = traceFront ? nmxPublished(traceFront) : 0, tReady = mach_absolute_time();
+     if (gNmxFrontLock) IOLockLock(gNmxFrontLock);      // nmxIopBlobFlip ends the front-buffer recopy (gNmxFront)
+     const int b = nmxIopBlobFlip(e->fb, e->head, s, final);
+     if (gNmxFrontLock) IOLockUnlock(gNmxFrontLock);
++    if (trace) {
++        // times in us of the mach clock (ns on x86), the same base as NMXVGAFB's debug.nmxfb_vtrace
++        gNmxOrdTrace--;
++        ALOG("ordtrace submit=%llu run=%llu ready=%llu flipped=%llu us: surface 0x%x pub %llu->%llu (last shown %llu) "
++             "waited %u ms final %d flip %d | front 0x%x pub %llu (when shown %llu)",
++             (unsigned long long)(e->tSubmit / 1000), (unsigned long long)(t0 / 1000),
++             (unsigned long long)(tReady / 1000), (unsigned long long)(mach_absolute_time() / 1000), id,
++             (unsigned long long)pub0, (unsigned long long)pub, (unsigned long long)lastShown, waited, (int)final, b,
++             traceFront ? traceFront->getSurfaceID() : 0u, (unsigned long long)traceFrontPub,
++             (unsigned long long)gNmxOrdFrontPub[e->head]);
++    }
+     if (b == 1) {
+         gNmxOrdRefuseRun = 0;
+         ((OSObject *)s)->retain();
+@@ -1997,7 +2002,7 @@ static bool nmxOrderedStart(void *pipe, IOService *fb, unsigned head, IOSurface
+     if (!e->call) e->call = thread_call_allocate(nmxOrderedRun, e);
+     if (!e->call) return false;
+     ((OSObject *)s)->retain();
+-    e->pipe = pipe; e->fb = fb; e->head = head; e->s = s;
++    e->pipe = pipe; e->fb = fb; e->head = head; e->s = s; e->tSubmit = mach_absolute_time();
+     __atomic_store_n(&e->busy, 1, __ATOMIC_RELEASE);
+     thread_call_enter(e->call);
+     return true;

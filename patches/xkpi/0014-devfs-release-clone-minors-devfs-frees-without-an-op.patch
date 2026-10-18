@@ -1,0 +1,68 @@
+From edceb3b2d925c3189fb80eed38201f9d528bd454 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 04:51:48 +0200
+Subject: [PATCH 14/50] devfs: release clone minors devfs frees without an open
+ (every stat leaked one)
+
+---
+ xnu/nmx_devfs.cpp | 24 ++++++++++++++++++------
+ 1 file changed, 18 insertions(+), 6 deletions(-)
+
+diff --git a/gpu-port/xkpi/xnu/nmx_devfs.cpp b/gpu-port/xkpi/xnu/nmx_devfs.cpp
+index 89fe9a9..826b30c 100644
+--- a/gpu-port/xkpi/xnu/nmx_devfs.cpp
++++ b/gpu-port/xkpi/xnu/nmx_devfs.cpp
+@@ -41,6 +41,7 @@ static IOLock *g_lock;
+ static void *g_node_cookie[NODE_MINORS];       /* node minor -> LinuxKPI cookie (struct cdev *) */
+ static void *g_node_handle[NODE_MINORS];       /* devfs node handles */
+ static uint16_t g_open_node[OPEN_MINOR_MAX];   /* open minor -> node minor + 1 (0 = free) */
++static uint8_t g_open_active[OPEN_MINOR_MAX];  /* 1 while an open() of that minor succeeded and is not closed */
+ static int g_open_next = NODE_MINORS;
+ 
+ /* ---- clone minors ------------------------------------------------------------------------------------------------- */
+@@ -62,7 +63,15 @@ static int clone_minor(dev_t dev, int action)
+         IOLockUnlock(g_lock);
+         return -1;
+     }
+-    /* DEVFS_CLONE_FREE: the open minor is released by close() */
++    /*
++     * DEVFS_CLONE_FREE: devfs is done with this minor's vnode. Every lookup clones (a stat() of a node allocates a
++     * minor without opening it), so a minor that was never opened - or already closed - is released here; otherwise
++     * stat()s leaked minors until the table ran out. An open minor is released by close(), which comes first.
++     */
++    IOLockLock(g_lock);
++    if (node >= NODE_MINORS && node < OPEN_MINOR_MAX && !g_open_active[node])
++        g_open_node[node] = 0;
++    IOLockUnlock(g_lock);
+     return 0;
+ }
+ 
+@@ -89,11 +98,12 @@ static int nmx_open(dev_t dev, int flags, int devtype, struct proc *p)
+     if (cookie == nullptr)
+         return ENXIO;
+     int err = nmx_cdev_open(cookie, m, flags);
+-    if (err) {
+-        IOLockLock(g_lock);
++    IOLockLock(g_lock);
++    if (err)
+         g_open_node[m] = 0;
+-        IOLockUnlock(g_lock);
+-    }
++    else
++        g_open_active[m] = 1;
++    IOLockUnlock(g_lock);
+     return err;
+ }
+ 
+@@ -102,8 +112,10 @@ static int nmx_close(dev_t dev, int flags, int devtype, struct proc *p)
+     int m = minor(dev);
+     int err = nmx_cdev_close(m, flags);
+     IOLockLock(g_lock);
+-    if (m >= NODE_MINORS && m < OPEN_MINOR_MAX)
++    if (m >= NODE_MINORS && m < OPEN_MINOR_MAX) {
+         g_open_node[m] = 0;
++        g_open_active[m] = 0;
++    }
+     IOLockUnlock(g_lock);
+     return err;
+ }

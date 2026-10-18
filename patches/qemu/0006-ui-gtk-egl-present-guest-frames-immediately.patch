@@ -1,0 +1,401 @@
+diff --git a/include/ui/gtk.h b/include/ui/gtk.h
+--- a/include/ui/gtk.h
++++ b/include/ui/gtk.h
+@@ -58,6 +58,21 @@
+     bool y0_top;
+     bool scanout_mode;
+     bool has_dmabuf;
++    /* pacing of guest frames that are drawn as soon as they are flushed */
++    int64_t frame_interval_ns;
++    int64_t frame_release_ns;
++    QEMUTimer *frame_timer;
++    QEMUBH *draw_bh;
++    /* vblank of the monitor showing the console, if the DRM device is ours */
++    int vblank_fd;
++    uint32_t vblank_crtc;
++    char *vblank_monitor;
++    int vblank_refresh;
++    int64_t vblank_period_ns;
++    int64_t frame_target_ns;
++    int64_t frame_released_ns;
++    int64_t frame_turnaround_ns;
++    int64_t frame_turnaround_dev_ns;
+ #endif
+ } VirtualGfxConsole;
+ 
+@@ -161,6 +176,8 @@
+ void gd_update_windowsize(VirtualConsole *vc);
+ void gd_update_monitor_refresh_rate(VirtualConsole *vc, GtkWidget *widget);
+ void gd_hw_gl_flushed(void *vc);
++void gd_hw_gl_release(VirtualConsole *vc);
++void gd_hw_gl_frame_arrived(VirtualConsole *vc);
+ 
+ /* ui/gtk-egl.c */
+ void gd_egl_init(VirtualConsole *vc);
+diff --git a/ui/gtk-egl.c b/ui/gtk-egl.c
+--- a/ui/gtk-egl.c
++++ b/ui/gtk-egl.c
+@@ -61,6 +61,15 @@
+         (vc->gfx.ectx, (EGLNativeWindowType)x11_window);
+ 
+     assert(vc->gfx.esurface);
++
++    /*
++     * Don't let eglSwapBuffers() wait for vblank: it runs in the main loop,
++     * where blocking for a refresh interval delays input and the next guest
++     * frame.  The compositor shows the latest frame at its next refresh.
++     */
++    eglMakeCurrent(qemu_egl_display, vc->gfx.esurface,
++                   vc->gfx.esurface, vc->gfx.ectx);
++    eglSwapInterval(qemu_egl_display, 0);
+ }
+ 
+ void gd_egl_draw(VirtualConsole *vc)
+@@ -109,7 +118,7 @@
+                 qemu_set_fd_handler(fence_fd, gd_hw_gl_flushed, NULL, vc);
+                 return;
+             }
+-            qemu_console_hw_gl_block(vc->gfx.dcl.con, false);
++            gd_hw_gl_release(vc);
+         }
+ #endif
+     } else {
+@@ -398,6 +407,17 @@
+     eglSwapBuffers(qemu_egl_display, vc->gfx.esurface);
+ }
+ 
++static void gd_egl_draw_bh(void *opaque)
++{
++    VirtualConsole *vc = opaque;
++
++    if (gtk_widget_is_drawable(vc->gfx.drawing_area)) {
++        gd_egl_draw(vc);
++    } else {
++        gtk_widget_queue_draw(vc->gfx.drawing_area);
++    }
++}
++
+ void gd_egl_flush(DisplayChangeListener *dcl,
+                   uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+ {
+@@ -408,6 +428,23 @@
+         !qemu_dmabuf_get_draw_submitted(vc->gfx.guest_fb.dmabuf)) {
+         qemu_dmabuf_set_draw_submitted(vc->gfx.guest_fb.dmabuf, true);
+         gtk_egl_set_scanout_mode(vc, true);
++        gd_hw_gl_frame_arrived(vc);
++        /*
++         * Draw right away instead of waiting for the next GTK paint cycle,
++         * which is paced by the compositor and adds up to a refresh interval
++         * of latency.  The guest is blocked until the frame is done, so this
++         * also delayed the guest's next frame.  Use a bottom half: drawing
++         * blocks the renderer, and doing that while the device is still
++         * processing the flush command would suspend the command and replay
++         * it forever.
++         */
++        if (gtk_widget_is_drawable(area)) {
++            if (!vc->gfx.draw_bh) {
++                vc->gfx.draw_bh = qemu_bh_new(gd_egl_draw_bh, vc);
++            }
++            qemu_bh_schedule(vc->gfx.draw_bh);
++            return;
++        }
+     }
+ 
+     gtk_widget_queue_draw_area(area, x, y, w, h);
+diff --git a/ui/gtk.c b/ui/gtk.c
+--- a/ui/gtk.c
++++ b/ui/gtk.c
+@@ -63,6 +63,13 @@
+ #include "chardev/char.h"
+ #include "qom/object.h"
+ 
++#if defined(CONFIG_OPENGL) && defined(CONFIG_LINUX)
++#include <sys/ioctl.h>
++#include <drm/drm.h>
++#include <drm/drm_mode.h>
++#define GD_VBLANK_PACING 1
++#endif
++
+ #define VC_WINDOW_X_MIN  320
+ #define VC_WINDOW_Y_MIN  240
+ #define VC_TERM_X_MIN     80
+@@ -603,6 +610,233 @@
+ #endif
+ }
+ 
++static void gd_hw_gl_unblock(VirtualConsole *vc)
++{
++    vc->gfx.frame_released_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    qemu_console_hw_gl_block(vc->gfx.dcl.con, false);
++}
++
++static void gd_hw_gl_frame_timer(void *opaque)
++{
++    gd_hw_gl_unblock(opaque);
++}
++
++#ifdef GD_VBLANK_PACING
++/*
++ * When the DRM device driving the console's monitor can be opened, read
++ * the hardware vblank timestamps of its CRTC (this works without being DRM
++ * master, so it doesn't interfere with the compositor).  X11 clients have
++ * no other accurate way of knowing when the compositor's frames start;
++ * Xwayland's MSC/UST and GTK's frame timings are estimates at best.
++ */
++static const char *const gd_drm_connector_names[] = {
++    "Unknown", "VGA", "DVI-I", "DVI-D", "DVI-A", "Composite", "SVIDEO",
++    "LVDS", "Component", "DIN", "DP", "HDMI-A", "HDMI-B", "TV", "eDP",
++    "Virtual", "DSI", "DPI", "Writeback", "SPI", "USB",
++};
++
++static bool gd_drm_find_crtc(int fd, const char *monitor, uint32_t *crtc,
++                             int64_t *period_ns)
++{
++    struct drm_mode_card_res res = { 0 };
++    g_autofree uint32_t *conns = NULL;
++    uint32_t i;
++
++    if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) || !res.count_connectors) {
++        return false;
++    }
++    conns = g_new0(uint32_t, res.count_connectors);
++    res = (struct drm_mode_card_res) {
++        .connector_id_ptr = (uintptr_t)conns,
++        .count_connectors = res.count_connectors,
++    };
++    if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res)) {
++        return false;
++    }
++    for (i = 0; i < res.count_connectors; i++) {
++        struct drm_mode_get_connector c = { .connector_id = conns[i] };
++        struct drm_mode_get_encoder e = { 0 };
++        struct drm_mode_crtc m = { 0 };
++        g_autofree char *name = NULL;
++
++        if (ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &c) ||
++            c.connector_type >= ARRAY_SIZE(gd_drm_connector_names)) {
++            continue;
++        }
++        name = g_strdup_printf("%s-%u",
++                               gd_drm_connector_names[c.connector_type],
++                               c.connector_type_id);
++        if (strcmp(name, monitor) || !c.encoder_id) {
++            continue;
++        }
++        e.encoder_id = c.encoder_id;
++        if (ioctl(fd, DRM_IOCTL_MODE_GETENCODER, &e) || !e.crtc_id) {
++            return false;
++        }
++        m.crtc_id = e.crtc_id;
++        if (ioctl(fd, DRM_IOCTL_MODE_GETCRTC, &m) || !m.mode_valid ||
++            !m.mode.clock) {
++            return false;
++        }
++        *crtc = e.crtc_id;
++        *period_ns = (int64_t)m.mode.htotal * m.mode.vtotal * 1000000 /
++                     m.mode.clock;
++        return true;
++    }
++    return false;
++}
++
++static void gd_vblank_update(VirtualConsole *vc, GdkMonitor *monitor,
++                             int refresh_rate)
++{
++    const char *name = monitor ? gdk_monitor_get_model(monitor) : NULL;
++    int card;
++
++    if (!g_strcmp0(name, vc->gfx.vblank_monitor) &&
++        refresh_rate == vc->gfx.vblank_refresh) {
++        return;
++    }
++    if (vc->gfx.vblank_fd >= 0) {
++        close(vc->gfx.vblank_fd);
++        vc->gfx.vblank_fd = -1;
++    }
++    g_free(vc->gfx.vblank_monitor);
++    vc->gfx.vblank_monitor = g_strdup(name);
++    vc->gfx.vblank_refresh = refresh_rate;
++    if (!name) {
++        return;
++    }
++    for (card = 0; card < 16; card++) {
++        g_autofree char *path = g_strdup_printf("/dev/dri/card%d", card);
++        int fd = open(path, O_RDWR | O_CLOEXEC);
++
++        if (fd < 0) {
++            continue;
++        }
++        if (gd_drm_find_crtc(fd, name, &vc->gfx.vblank_crtc,
++                             &vc->gfx.vblank_period_ns)) {
++            vc->gfx.vblank_fd = fd;
++            trace_gd_vblank_source(name, card, vc->gfx.vblank_crtc,
++                                   vc->gfx.vblank_period_ns);
++            return;
++        }
++        close(fd);
++    }
++    trace_gd_vblank_source(name, -1, 0, 0);
++}
++
++static bool gd_vblank_last(VirtualConsole *vc, int64_t *vblank_ns)
++{
++    struct drm_crtc_get_sequence seq = { .crtc_id = vc->gfx.vblank_crtc };
++
++    if (vc->gfx.vblank_fd < 0 ||
++        ioctl(vc->gfx.vblank_fd, DRM_IOCTL_CRTC_GET_SEQUENCE, &seq) ||
++        !seq.active) {
++        return false;
++    }
++    *vblank_ns = seq.sequence_ns;
++    return true;
++}
++
++/*
++ * When, after the start of a scanout, a guest frame should arrive so that
++ * the compositor still picks it up for the next refresh.  Measured with
++ * KWin 6.7 at 120 Hz: frames committed up to ~6.75 ms after the vblank
++ * timestamp make the next refresh; Xwayland and our own draw add a bit.
++ */
++static int64_t gd_vblank_phase_ns(void)
++{
++    static int64_t phase = -1;
++
++    if (phase < 0) {
++        const char *env = g_getenv("QEMU_GTK_VBLANK_PHASE_US");
++
++        phase = env ? g_ascii_strtoll(env, NULL, 10) * 1000 : 5000000;
++    }
++    return phase;
++}
++#endif
++
++/* How long before its target to release the guest for its next frame. */
++static int64_t gd_hw_gl_frame_lead(VirtualConsole *vc)
++{
++    return vc->gfx.frame_turnaround_ns + 2 * vc->gfx.frame_turnaround_dev_ns;
++}
++
++/* Called when the guest flushes a new frame after being released. */
++void gd_hw_gl_frame_arrived(VirtualConsole *vc)
++{
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    int64_t t = now - vc->gfx.frame_released_ns;
++    int64_t err;
++
++    if (!vc->gfx.frame_released_ns || t > vc->gfx.frame_interval_ns) {
++        /* the guest was idle, not a measure of its frame turnaround */
++        return;
++    }
++    /* running mean and mean deviation of the guest's frame turnaround */
++    err = t - vc->gfx.frame_turnaround_ns;
++    vc->gfx.frame_turnaround_ns += err / 16;
++    vc->gfx.frame_turnaround_dev_ns += (ABS(err) -
++                                        vc->gfx.frame_turnaround_dev_ns) / 16;
++    trace_gd_frame_arrived(now - vc->gfx.frame_target_ns, t,
++                           gd_hw_gl_frame_lead(vc));
++}
++
++/*
++ * Let the guest continue once a frame has been drawn, but at most once per
++ * host refresh interval.  Frames that are drawn as soon as they arrive are
++ * not paced by the window system, so without this a guest without vsync of
++ * its own renders frames much faster than they can be displayed.  Releases
++ * follow a fixed cadence rather than being an interval after the frame, so
++ * the time the guest takes to produce the next frame is not added on top.
++ */
++void gd_hw_gl_release(VirtualConsole *vc)
++{
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    int64_t next = vc->gfx.frame_release_ns + vc->gfx.frame_interval_ns;
++#ifdef GD_VBLANK_PACING
++    int64_t vblank;
++
++    /*
++     * With the real vblank known, release the guest so that its next frame
++     * arrives at a fixed phase of the host refresh, one frame per refresh.
++     * A free-running cadence drifts against the display and jitters around
++     * the compositor's deadline, which shows as repeated and skipped frames.
++     */
++    if (gd_vblank_last(vc, &vblank)) {
++        int64_t period = vc->gfx.vblank_period_ns;
++        int64_t target = vblank + gd_vblank_phase_ns();
++
++        /*
++         * Aim at the next target after the previous frame's.  If releasing
++         * now is already later than planned (a slow frame, or our own draw
++         * finished late), still go for it: the target leaves some slack
++         * before the compositor's deadline.  Only give up on it when even
++         * a quick guest frame can't make it.
++         */
++        while (target < vc->gfx.frame_target_ns + period / 2 ||
++               target < now + vc->gfx.frame_turnaround_ns / 2) {
++            target += period;
++        }
++        vc->gfx.frame_target_ns = target;
++        next = target - gd_hw_gl_frame_lead(vc);
++    }
++#endif
++
++    if (vc->gfx.frame_interval_ns && now < next) {
++        if (!vc->gfx.frame_timer) {
++            vc->gfx.frame_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
++                                               gd_hw_gl_frame_timer, vc);
++        }
++        vc->gfx.frame_release_ns = next;
++        timer_mod(vc->gfx.frame_timer, next);
++        return;
++    }
++    vc->gfx.frame_release_ns = now;
++    gd_hw_gl_unblock(vc);
++}
++
+ void gd_hw_gl_flushed(void *vcon)
+ {
+     VirtualConsole *vc = vcon;
+@@ -614,7 +848,7 @@
+         qemu_set_fd_handler(fence_fd, NULL, NULL, NULL);
+         close(fence_fd);
+         qemu_dmabuf_set_fence_fd(dmabuf, -1);
+-        qemu_console_hw_gl_block(vc->gfx.dcl.con, false);
++        gd_hw_gl_release(vc);
+     }
+ }
+ 
+@@ -820,6 +1054,15 @@
+     vc->gfx.dcl.update_interval = refresh_rate ?
+         MIN(1000 * 1000 / refresh_rate, GUI_REFRESH_INTERVAL_DEFAULT) :
+         GUI_REFRESH_INTERVAL_DEFAULT;
++#if defined(CONFIG_OPENGL)
++    vc->gfx.frame_interval_ns = refresh_rate ?
++        NANOSECONDS_PER_SECOND * 1000 / refresh_rate : 0;
++#endif
++#ifdef GD_VBLANK_PACING
++    gd_vblank_update(vc, win ? gdk_display_get_monitor_at_window(
++                                   gtk_widget_get_display(widget), win) : NULL,
++                     refresh_rate);
++#endif
+ #endif
+ }
+ 
+@@ -2405,6 +2648,8 @@
+     vc->gfx.scale_y = vc->gfx.preferred_scale;
+ 
+ #if defined(CONFIG_OPENGL)
++    vc->gfx.vblank_fd = -1;
++    vc->gfx.frame_turnaround_ns = 2 * SCALE_MS;
+     if (display_opengl) {
+         if (gtk_use_gl_area) {
+             vc->gfx.drawing_area = gtk_gl_area_new();
+diff --git a/ui/trace-events b/ui/trace-events
+--- a/ui/trace-events
++++ b/ui/trace-events
+@@ -25,6 +25,8 @@
+ gd_key_event(const char *tab, int gdk_keycode, unsigned int lnx, const char *action) "tab=%s, translated GDK keycode %d to Linux %u (%s)"
+ gd_grab(const char *tab, const char *device, const char *reason) "tab=%s, dev=%s, reason=%s"
+ gd_ungrab(const char *tab, const char *device) "tab=%s, dev=%s"
++gd_vblank_source(const char *monitor, int card, uint32_t crtc, int64_t period_ns) "monitor=%s card=%d crtc=%u period=%" PRId64 "ns"
++gd_frame_arrived(int64_t lateness_ns, int64_t turnaround_ns, int64_t lead_ns) "lateness=%" PRId64 "ns turnaround=%" PRId64 "ns lead=%" PRId64 "ns"
+ gd_keymap_windowing(const char *name) "backend=%s"
+ gd_gl_area_create_context(void *ctx, int major, int minor) "ctx=%p, major=%d, minor=%d"
+ gd_gl_area_destroy_context(void *ctx, void *current_ctx) "ctx=%p, current_ctx=%p"

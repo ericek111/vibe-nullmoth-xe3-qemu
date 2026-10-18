@@ -1,0 +1,66 @@
+From 361c0e24eb45a6b1e834a40cd727534f6482c038 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 15:06:19 +0200
+Subject: [PATCH 36/50] user wire: fall back to a read-only wiring when the
+ range cannot be wired for writing
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ xnu/nmx_mm.cpp | 36 ++++++++++++++++++++++++++++++++++--
+ 1 file changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/gpu-port/xkpi/xnu/nmx_mm.cpp b/gpu-port/xkpi/xnu/nmx_mm.cpp
+index caf518f..c5289ff 100644
+--- a/gpu-port/xkpi/xnu/nmx_mm.cpp
++++ b/gpu-port/xkpi/xnu/nmx_mm.cpp
+@@ -86,7 +86,23 @@ extern "C" int nmx_xnu_mm_copy(void *mm, uint64_t uaddr, void *kbuf, size_t len,
+                                                                   kIODirectionOutIn, task);
+     if (md == nullptr)
+         return ENOMEM;
+-    if (md->prepare() != kIOReturnSuccess) {
++    IOReturn pr = md->prepare();
++    if (pr != kIOReturnSuccess && write) {
++        /*
++         * A range this task may only read (WindowServer's mapping of a full-screen IOSurface another process renders
++         * into) cannot be wired for writing; the GPU still needs its pages. Wired for reading, the physical pages are
++         * the same ones the surface's owner writes.
++         */
++        md->release();
++        md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)uaddr, npages * PAGE_SIZE, kIODirectionOut, task);
++        if (md == nullptr)
++            return ENOMEM;
++        IOReturn pr2 = md->prepare();
++        IOLog("NullMoth GPU: wiring 0x%llx + %zu pages for writing failed (0x%x); for reading: 0x%x\n",
++              (unsigned long long)uaddr, npages, pr, pr2);
++        pr = pr2;
++    }
++    if (pr != kIOReturnSuccess) {
+         md->release();
+         return EFAULT;
+     }
+@@ -116,7 +132,23 @@ extern "C" int nmx_xnu_user_wire(void *mm, uint64_t uaddr, size_t npages, int wr
+                                                                   write ? kIODirectionOutIn : kIODirectionOut, task);
+     if (md == nullptr)
+         return ENOMEM;
+-    if (md->prepare() != kIOReturnSuccess) {
++    IOReturn pr = md->prepare();
++    if (pr != kIOReturnSuccess && write) {
++        /*
++         * A range this task may only read (WindowServer's mapping of a full-screen IOSurface another process renders
++         * into) cannot be wired for writing; the GPU still needs its pages. Wired for reading, the physical pages are
++         * the same ones the surface's owner writes.
++         */
++        md->release();
++        md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)uaddr, npages * PAGE_SIZE, kIODirectionOut, task);
++        if (md == nullptr)
++            return ENOMEM;
++        IOReturn pr2 = md->prepare();
++        IOLog("NullMoth GPU: wiring 0x%llx + %zu pages for writing failed (0x%x); for reading: 0x%x\n",
++              (unsigned long long)uaddr, npages, pr, pr2);
++        pr = pr2;
++    }
++    if (pr != kIOReturnSuccess) {
+         md->release();
+         return EFAULT;
+     }

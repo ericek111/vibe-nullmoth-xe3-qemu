@@ -1,0 +1,483 @@
+From 8050e1ff200613676f4ac39de755b6081ba5fd5f Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 20:31:53 +0200
+Subject: [PATCH 08/47] NMXVGAFB: virtio-gpu blob scan-out (virtio-vga
+ blob=true), VGA BAR as the fallback
+
+A small virtio 1.x transport (modern PCI capabilities, one polled control queue) for QEMU's virtio-vga.
+With blob resources offered, the scan-out moves from the VGA BAR into a contiguous guest-RAM buffer
+shown on scanout 0 as a guest blob, which QEMU hands to its GL display as a dmabuf; the VBL timer
+flushes it. Without blob support (or on any failure) the device is reset and the VGA BAR stays the
+scan-out, as before; -nmxvgafbnovirtio skips it. Tested: the fallback on a device without blob
+(host scanout reported 2880x1710, desktop composited on the VF as before).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ kexts/NMXVGAFB/build.sh           |   5 +-
+ kexts/NMXVGAFB/nmx_virtio_gpu.cpp | 257 ++++++++++++++++++++++++++++++
+ kexts/NMXVGAFB/nmx_virtio_gpu.h   |  58 +++++++
+ kexts/NMXVGAFB/nmxvgafb.cpp       |  71 ++++++++-
+ 4 files changed, 389 insertions(+), 2 deletions(-)
+ create mode 100644 kexts/NMXVGAFB/nmx_virtio_gpu.cpp
+ create mode 100644 kexts/NMXVGAFB/nmx_virtio_gpu.h
+
+diff --git a/kexts/NMXVGAFB/build.sh b/kexts/NMXVGAFB/build.sh
+index 4c29f4e..047ef2f 100755
+--- a/kexts/NMXVGAFB/build.sh
++++ b/kexts/NMXVGAFB/build.sh
+@@ -6,7 +6,10 @@ SDK=$(xcrun --show-sdk-path); KHDR="$SDK/System/Library/Frameworks/Kernel.framew
+ xcrun clang++ -arch x86_64 -fapple-kext -mkernel -nostdinc -I"$KHDR" -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT \
+   -std=c++17 -fno-rtti -fno-exceptions -fno-builtin -fno-common -Wall -Wno-unused-parameter -Wno-inconsistent-missing-override -O2 \
+   -c "$D/nmxvgafb.cpp" -o "$OUT/nmxvgafb.o" || exit 1
+-xcrun clang++ -arch x86_64 -fapple-kext -nostdlib -Xlinker -kext -lkmodc++ -lkmod -lcc_kext "$OUT/nmxvgafb.o" \
++xcrun clang++ -arch x86_64 -fapple-kext -mkernel -nostdinc -I"$KHDR" -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT \
++  -std=c++17 -fno-rtti -fno-exceptions -fno-builtin -fno-common -Wall -Wno-unused-parameter -Wno-inconsistent-missing-override -O2 \
++  -c "$D/nmx_virtio_gpu.cpp" -o "$OUT/nmx_virtio_gpu.o" || exit 1
++xcrun clang++ -arch x86_64 -fapple-kext -nostdlib -Xlinker -kext -lkmodc++ -lkmod -lcc_kext "$OUT/nmxvgafb.o" "$OUT/nmx_virtio_gpu.o" \
+   -o "$OUT/NMXVGAFB.kext/Contents/MacOS/NMXVGAFB" || exit 1
+ cp "$D/Info.plist" "$OUT/NMXVGAFB.kext/Contents/Info.plist"
+ echo "NMXVGAFB $(stat -f %z "$OUT/NMXVGAFB.kext/Contents/MacOS/NMXVGAFB") B"
+diff --git a/kexts/NMXVGAFB/nmx_virtio_gpu.cpp b/kexts/NMXVGAFB/nmx_virtio_gpu.cpp
+new file mode 100644
+index 0000000..b57f3b9
+--- /dev/null
++++ b/kexts/NMXVGAFB/nmx_virtio_gpu.cpp
+@@ -0,0 +1,257 @@
++// NMXVirtioGPU: see nmx_virtio_gpu.h. Layouts follow the virtio 1.2 specification (4.1 PCI transport, 2.7 split
++// virtqueues, 5.7 GPU device).
++
++#include "nmx_virtio_gpu.h"
++#include <IOKit/IOLib.h>
++#include <libkern/OSAtomic.h>
++
++#define VGLOG(fmt, ...) do { IOLog("NMXVGAFB: virtio-gpu: " fmt "\n", ##__VA_ARGS__); kprintf("NMXVGAFB: virtio-gpu: " fmt "\n", ##__VA_ARGS__); } while (0)
++
++// ---- PCI transport ------------------------------------------------------------------------------------------------
++enum { kCapVendor = 0x09, kCfgCommon = 1, kCfgNotify = 2, kCfgIsr = 3, kCfgDevice = 4 };
++// common configuration (4.1.4.3)
++enum {
++    kDevFeatureSel = 0x00, kDevFeature = 0x04, kDrvFeatureSel = 0x08, kDrvFeature = 0x0c, kMsixConfig = 0x10,
++    kNumQueues = 0x12, kStatus = 0x14, kCfgGeneration = 0x15, kQueueSel = 0x16, kQueueSize = 0x18,
++    kQueueMsix = 0x1a, kQueueEnable = 0x1c, kQueueNotifyOff = 0x1e, kQueueDesc = 0x20, kQueueDriver = 0x28,
++    kQueueDevice = 0x30,
++};
++enum { kStAck = 1, kStDriver = 2, kStDriverOk = 4, kStFeaturesOk = 8, kStNeedsReset = 0x40, kStFailed = 0x80 };
++static constexpr uint64_t kFVersion1 = 1ull << 32, kFAccessPlatform = 1ull << 33;
++static constexpr uint64_t kFGpuEdid = 1ull << 1, kFGpuBlob = 1ull << 3;
++
++// ---- split virtqueue (2.7) ----------------------------------------------------------------------------------------
++struct VqDesc { uint64_t addr; uint32_t len; uint16_t flags; uint16_t next; };
++enum { kDescNext = 1, kDescWrite = 2 };
++static constexpr uint16_t kMaxQ = 64;
++// offsets in the ring buffer: descriptors, avail ring, used ring, then one command and one response buffer
++enum : uint32_t { kOffDesc = 0, kOffAvail = 1024, kOffUsed = 2048, kOffCmd = 4096, kOffResp = 8192, kRingBytes = 16384 };
++static constexpr uint32_t kCmdMax = 4096, kRespMax = 4096;
++
++// ---- GPU device (5.7.6) -------------------------------------------------------------------------------------------
++enum : uint32_t {
++    kCmdGetDisplayInfo = 0x0100, kCmdResourceUnref = 0x0102, kCmdSetScanout = 0x0103, kCmdResourceFlush = 0x0104,
++    kCmdResourceCreateBlob = 0x010c, kCmdSetScanoutBlob = 0x010d,
++    kRespOkNoData = 0x1100, kRespOkDisplayInfo = 0x1101,
++};
++enum : uint32_t { kBlobMemGuest = 1, kFormatB8G8R8X8 = 2 };
++#pragma pack(push, 1)
++struct GpuHdr { uint32_t type, flags; uint64_t fenceId; uint32_t ctxId; uint8_t ringIdx, pad[3]; };
++struct GpuRect { uint32_t x, y, w, h; };
++struct GpuDisplayInfo { GpuHdr hdr; struct { GpuRect r; uint32_t enabled, flags; } pmodes[16]; };
++struct GpuResourceUnref { GpuHdr hdr; uint32_t resourceId, pad; };
++struct GpuSetScanout { GpuHdr hdr; GpuRect r; uint32_t scanoutId, resourceId; };
++struct GpuResourceFlush { GpuHdr hdr; GpuRect r; uint32_t resourceId, pad; };
++struct GpuMemEntry { uint64_t addr; uint32_t length, pad; };
++struct GpuCreateBlob {
++    GpuHdr hdr; uint32_t resourceId, blobMem, blobFlags, nrEntries; uint64_t blobId, size;
++    GpuMemEntry entry[1];
++};
++struct GpuSetScanoutBlob {
++    GpuHdr hdr; GpuRect r; uint32_t scanoutId, resourceId, width, height, format, pad, strides[4], offsets[4];
++};
++#pragma pack(pop)
++static_assert(sizeof(GpuHdr) == 24, "virtio_gpu_ctrl_hdr");
++static_assert(sizeof(GpuDisplayInfo) == 24 + 16 * 24, "virtio_gpu_resp_display_info");
++static_assert(sizeof(GpuCreateBlob) == 24 + 32 + 16, "virtio_gpu_resource_create_blob + one entry");
++static_assert(sizeof(GpuSetScanoutBlob) == 24 + 16 + 24 + 32, "virtio_gpu_set_scanout_blob");
++
++static inline void mb() { __asm__ __volatile__("mfence" ::: "memory"); }
++static inline uint8_t  rd8 (volatile uint8_t *b, uint32_t o) { return *(volatile uint8_t *)(b + o); }
++static inline uint16_t rd16(volatile uint8_t *b, uint32_t o) { return *(volatile uint16_t *)(b + o); }
++static inline uint32_t rd32(volatile uint8_t *b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static inline void wr8 (volatile uint8_t *b, uint32_t o, uint8_t v)  { *(volatile uint8_t *)(b + o) = v; }
++static inline void wr16(volatile uint8_t *b, uint32_t o, uint16_t v) { *(volatile uint16_t *)(b + o) = v; }
++static inline void wr32(volatile uint8_t *b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; }
++static inline void wr64(volatile uint8_t *b, uint32_t o, uint64_t v) { wr32(b, o, (uint32_t)v); wr32(b, o + 4, (uint32_t)(v >> 32)); }
++
++volatile uint8_t *NMXVirtioGPU::mapCap(uint8_t bar, uint32_t offset, uint32_t length)
++{
++    if (bar > 5) return nullptr;
++    if (!fBarMap[bar]) {
++        fBarMap[bar] = fPci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0 + bar * 4, kIOMapInhibitCache);
++        if (!fBarMap[bar]) { VGLOG("BAR%u would not map", bar); return nullptr; }
++    }
++    if ((uint64_t)offset + length > fBarMap[bar]->getLength()) {
++        VGLOG("capability [0x%x + 0x%x] lies outside BAR%u (0x%llx)", offset, length, bar,
++              (unsigned long long)fBarMap[bar]->getLength());
++        return nullptr;
++    }
++    return (volatile uint8_t *)(fBarMap[bar]->getVirtualAddress() + offset);
++}
++
++bool NMXVirtioGPU::init(IOPCIDevice *pci)
++{
++    fPci = pci;
++    fLock = IOLockAlloc();
++    if (!fLock) return false;
++    // the vendor capabilities: the first of each type is the one to use (4.1.4)
++    uint8_t off = pci->configRead8(kIOPCIConfigCapabilitiesPtr) & ~3;
++    for (int guard = 0; off && guard < 48; guard++) {
++        uint8_t id = pci->configRead8(off), next = pci->configRead8(off + 1) & ~3;
++        if (id == kCapVendor) {
++            uint8_t type = pci->configRead8(off + 3), bar = pci->configRead8(off + 4);
++            uint32_t o = pci->configRead32(off + 8), len = pci->configRead32(off + 12);
++            if (type == kCfgCommon && !fCommon) fCommon = mapCap(bar, o, len);
++            else if (type == kCfgNotify && !fNotifyBase) { fNotifyBase = mapCap(bar, o, len); fNotifyMult = pci->configRead32(off + 16); }
++            else if (type == kCfgIsr && !fIsr) fIsr = mapCap(bar, o, len);
++            else if (type == kCfgDevice && !fDevCfg) fDevCfg = mapCap(bar, o, len);
++        }
++        off = next;
++    }
++    if (!fCommon || !fNotifyBase) { VGLOG("no modern virtio capabilities (common %p notify %p)", fCommon, fNotifyBase); reset(); return false; }
++    pci->setMemoryEnable(true);
++    pci->setBusLeadEnable(true);
++
++    // reset, then ACKNOWLEDGE | DRIVER (3.1.1)
++    wr8(fCommon, kStatus, 0);
++    for (int i = 0; i < 1000 && rd8(fCommon, kStatus) != 0; i++) IODelay(100);
++    wr8(fCommon, kStatus, kStAck);
++    wr8(fCommon, kStatus, kStAck | kStDriver);
++    wr32(fCommon, kDevFeatureSel, 0); uint64_t have = rd32(fCommon, kDevFeature);
++    wr32(fCommon, kDevFeatureSel, 1); have |= (uint64_t)rd32(fCommon, kDevFeature) << 32;
++    if (!(have & kFVersion1)) { VGLOG("device features 0x%llx lack VERSION_1", (unsigned long long)have); reset(); return false; }
++    uint64_t want = kFVersion1 | (have & (kFGpuBlob | kFGpuEdid | kFAccessPlatform));
++    wr32(fCommon, kDrvFeatureSel, 0); wr32(fCommon, kDrvFeature, (uint32_t)want);
++    wr32(fCommon, kDrvFeatureSel, 1); wr32(fCommon, kDrvFeature, (uint32_t)(want >> 32));
++    wr8(fCommon, kStatus, kStAck | kStDriver | kStFeaturesOk);
++    if (!(rd8(fCommon, kStatus) & kStFeaturesOk)) { VGLOG("device refused features 0x%llx", (unsigned long long)want); reset(); return false; }
++    fBlob = want & kFGpuBlob; fEdid = want & kFGpuEdid;
++    if (!setupQueue()) { reset(); return false; }
++    wr8(fCommon, kStatus, kStAck | kStDriver | kStFeaturesOk | kStDriverOk);
++    fReady = true;
++    VGLOG("up: device features 0x%llx, using 0x%llx (blob %s, edid %s), control queue %u entries",
++          (unsigned long long)have, (unsigned long long)want, fBlob ? "yes" : "NO", fEdid ? "yes" : "no", fQSize);
++    return true;
++}
++
++bool NMXVirtioGPU::setupQueue()
++{
++    wr16(fCommon, kQueueSel, 0);
++    uint16_t max = rd16(fCommon, kQueueSize);
++    if (!max) { VGLOG("control queue missing"); return false; }
++    fQSize = max < kMaxQ ? max : kMaxQ;
++    wr16(fCommon, kQueueSize, fQSize);
++    fRing = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++        kIODirectionInOut | kIOMemoryPhysicallyContiguous, kRingBytes, 0x000000FFFFFFF000ull);
++    if (!fRing) { VGLOG("no memory for the control queue"); return false; }
++    fRingKva = (uint8_t *)fRing->getBytesNoCopy();
++    bzero(fRingKva, kRingBytes);
++    fRingPhys = fRing->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
++    wr16(fCommon, kQueueMsix, 0xffff);         // no interrupt: the driver polls
++    wr64(fCommon, kQueueDesc, fRingPhys + kOffDesc);
++    wr64(fCommon, kQueueDriver, fRingPhys + kOffAvail);
++    wr64(fCommon, kQueueDevice, fRingPhys + kOffUsed);
++    uint16_t noff = rd16(fCommon, kQueueNotifyOff);
++    fNotify = (volatile uint16_t *)(fNotifyBase + (uint32_t)noff * fNotifyMult);
++    wr16(fCommon, kQueueEnable, 1);
++    fAvailIdx = fUsedSeen = 0;
++    return true;
++}
++
++void NMXVirtioGPU::reset()
++{
++    if (fCommon) wr8(fCommon, kStatus, 0);    // QEMU: back to VGA mode
++    fReady = false;
++    OSSafeReleaseNULL(fRing);
++    fRingKva = nullptr;
++    for (auto &m : fBarMap) OSSafeReleaseNULL(m);
++    fCommon = fNotifyBase = fIsr = fDevCfg = nullptr;
++    fNotify = nullptr;
++    if (fLock) { IOLockFree(fLock); fLock = nullptr; }
++}
++
++uint32_t NMXVirtioGPU::submit(const void *cmd, uint32_t cmdLen, void *resp, uint32_t respLen)
++{
++    if (!fReady || cmdLen > kCmdMax || respLen > kRespMax) return 0;
++    IOLockLock(fLock);
++    memcpy(fRingKva + kOffCmd, cmd, cmdLen);
++    bzero(fRingKva + kOffResp, respLen);
++    VqDesc *d = (VqDesc *)(fRingKva + kOffDesc);
++    d[0] = { fRingPhys + kOffCmd, cmdLen, kDescNext, 1 };
++    d[1] = { fRingPhys + kOffResp, respLen, kDescWrite, 0 };
++    volatile uint16_t *avail = (volatile uint16_t *)(fRingKva + kOffAvail);   // flags, idx, ring[]
++    avail[2 + (fAvailIdx % fQSize)] = 0;
++    mb();
++    avail[1] = ++fAvailIdx;
++    mb();
++    *fNotify = 0;
++    volatile uint16_t *used = (volatile uint16_t *)(fRingKva + kOffUsed);     // flags, idx, ring[]
++    uint32_t type = 0;
++    // up to 1 s: the host's GL display can take a frame or two to take a new scanout
++    for (int i = 0; i < 100000; i++) {
++        mb();
++        if (used[1] != fUsedSeen) {
++            fUsedSeen = used[1];
++            if (resp) memcpy(resp, fRingKva + kOffResp, respLen);
++            type = ((GpuHdr *)(fRingKva + kOffResp))->type;
++            break;
++        }
++        IODelay(10);
++    }
++    fCommands++;
++    if (!type) {
++        fFailures++;
++        // the device still owns descriptors 0 and 1: no further command is safe
++        fReady = false;
++        VGLOG("command 0x%x timed out; virtio-gpu disabled", ((const GpuHdr *)cmd)->type);
++    }
++    IOLockUnlock(fLock);
++    return type;
++}
++
++bool NMXVirtioGPU::submitNoData(const void *cmd, uint32_t cmdLen, const char *what)
++{
++    GpuHdr r;
++    uint32_t t = submit(cmd, cmdLen, &r, sizeof r);
++    if (t == kRespOkNoData) return true;
++    if (t) { fFailures++; VGLOG("%s: response 0x%x", what, t); }
++    return false;
++}
++
++bool NMXVirtioGPU::displayInfo(uint32_t *w, uint32_t *h, bool *enabled)
++{
++    GpuHdr c = {}; c.type = kCmdGetDisplayInfo;
++    GpuDisplayInfo r;
++    if (submit(&c, sizeof c, &r, sizeof r) != kRespOkDisplayInfo) return false;
++    *w = r.pmodes[0].r.w; *h = r.pmodes[0].r.h; *enabled = r.pmodes[0].enabled != 0;
++    return true;
++}
++
++bool NMXVirtioGPU::createBlob(uint32_t resourceId, uint64_t phys, uint64_t size)
++{
++    GpuCreateBlob c = {};
++    c.hdr.type = kCmdResourceCreateBlob;
++    c.resourceId = resourceId; c.blobMem = kBlobMemGuest; c.blobFlags = 0; c.nrEntries = 1; c.size = size;
++    c.entry[0] = { phys, (uint32_t)size, 0 };
++    return submitNoData(&c, sizeof c, "RESOURCE_CREATE_BLOB");
++}
++
++bool NMXVirtioGPU::unrefResource(uint32_t resourceId)
++{
++    GpuResourceUnref c = {}; c.hdr.type = kCmdResourceUnref; c.resourceId = resourceId;
++    return submitNoData(&c, sizeof c, "RESOURCE_UNREF");
++}
++
++bool NMXVirtioGPU::setScanoutBlob(uint32_t resourceId, uint32_t w, uint32_t h, uint32_t stride)
++{
++    GpuSetScanoutBlob c = {};
++    c.hdr.type = kCmdSetScanoutBlob;
++    c.r = { 0, 0, w, h };
++    c.scanoutId = 0; c.resourceId = resourceId; c.width = w; c.height = h; c.format = kFormatB8G8R8X8;
++    c.strides[0] = stride;
++    return submitNoData(&c, sizeof c, "SET_SCANOUT_BLOB");
++}
++
++bool NMXVirtioGPU::disableScanout()
++{
++    GpuSetScanout c = {}; c.hdr.type = kCmdSetScanout;
++    return submitNoData(&c, sizeof c, "SET_SCANOUT(0)");
++}
++
++bool NMXVirtioGPU::flush(uint32_t resourceId, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
++{
++    GpuResourceFlush c = {};
++    c.hdr.type = kCmdResourceFlush; c.r = { x, y, w, h }; c.resourceId = resourceId;
++    return submitNoData(&c, sizeof c, "RESOURCE_FLUSH");
++}
+diff --git a/kexts/NMXVGAFB/nmx_virtio_gpu.h b/kexts/NMXVGAFB/nmx_virtio_gpu.h
+new file mode 100644
+index 0000000..22ea531
+--- /dev/null
++++ b/kexts/NMXVGAFB/nmx_virtio_gpu.h
+@@ -0,0 +1,58 @@
++// NMXVirtioGPU: the virtio-gpu side of QEMU's virtio-vga, enough to show a guest-memory frame on the host.
++//
++// virtio-vga starts in VGA mode (the firmware's linear framebuffer in BAR0). Once the guest sets a virtio scanout,
++// QEMU shows that instead; with blob=true (and a memfd-backed guest RAM) a scanout can be a "blob" resource made of
++// guest pages, which QEMU exports to the host as a dmabuf (udmabuf) and its GL display shows without copying. A device
++// reset puts QEMU back in VGA mode.
++//
++// One control queue, one command in flight, completion by polling: commands are rare (setup, then one flush per frame).
++#pragma once
++#include <IOKit/pci/IOPCIDevice.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOLocks.h>
++
++class NMXVirtioGPU {
++public:
++    // the virtio transport, feature negotiation and the control queue; false leaves the device in VGA mode
++    bool init(IOPCIDevice *pci);
++    // back to VGA mode (device reset) and everything freed
++    void reset();
++    bool ready() const { return fReady; }
++    bool hasBlob() const { return fBlob; }
++    bool hasEdid() const { return fEdid; }
++
++    // scanout 0's preferred size (the host window), 0 x 0 when the host reports none
++    bool displayInfo(uint32_t *w, uint32_t *h, bool *enabled);
++    // a guest-memory blob resource over one physically contiguous range
++    bool createBlob(uint32_t resourceId, uint64_t phys, uint64_t size);
++    bool unrefResource(uint32_t resourceId);
++    // shows the blob on scanout 0 (XRGB8888, little-endian: memory order B G R X)
++    bool setScanoutBlob(uint32_t resourceId, uint32_t w, uint32_t h, uint32_t stride);
++    // disables scanout 0 (resource 0): QEMU keeps the last frame
++    bool disableScanout();
++    // tells the host the rectangle changed
++    bool flush(uint32_t resourceId, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
++
++    uint64_t commands() const { return fCommands; }
++    uint64_t failures() const { return fFailures; }
++
++private:
++    IOPCIDevice *fPci = nullptr;
++    IOMemoryMap *fBarMap[6] = {};
++    volatile uint8_t *fCommon = nullptr, *fNotifyBase = nullptr, *fIsr = nullptr, *fDevCfg = nullptr;
++    uint32_t fNotifyMult = 0;
++    volatile uint16_t *fNotify = nullptr;      // the control queue's notify register
++    IOBufferMemoryDescriptor *fRing = nullptr; // descriptors, avail and used rings, then the command/response area
++    uint64_t fRingPhys = 0;
++    uint8_t *fRingKva = nullptr;
++    uint16_t fQSize = 0, fAvailIdx = 0, fUsedSeen = 0;
++    IOLock *fLock = nullptr;
++    bool fReady = false, fBlob = false, fEdid = false;
++    uint64_t fCommands = 0, fFailures = 0;
++
++    volatile uint8_t *mapCap(uint8_t bar, uint32_t offset, uint32_t length);
++    bool setupQueue();
++    // sends cmd and waits for the response; returns the response type (0 on timeout)
++    uint32_t submit(const void *cmd, uint32_t cmdLen, void *resp, uint32_t respLen);
++    bool submitNoData(const void *cmd, uint32_t cmdLen, const char *what);
++};
+diff --git a/kexts/NMXVGAFB/nmxvgafb.cpp b/kexts/NMXVGAFB/nmxvgafb.cpp
+index 319b003..fdb4bbb 100644
+--- a/kexts/NMXVGAFB/nmxvgafb.cpp
++++ b/kexts/NMXVGAFB/nmxvgafb.cpp
+@@ -16,6 +16,7 @@
+ #include <kern/thread_call.h>
+ #include <pexpert/pexpert.h>
+ #include "../NMIntelFB/nvrm_vram_abi.h"
++#include "nmx_virtio_gpu.h"
+ 
+ // IOLog and kprintf both: a hang during start leaves only the serial console
+ #define VFBLOG(fmt, ...) do { IOLog("NMXVGAFB: " fmt "\n", ##__VA_ARGS__); kprintf("NMXVGAFB: " fmt "\n", ##__VA_ARGS__); } while (0)
+@@ -37,6 +38,13 @@ class NMXVGAFB : public IOFramebuffer {
+     volatile bool fStopping = false;
+     IOPhysicalAddress fBase = 0;
+     uint32_t fWidth = 0, fHeight = 0, fRowBytes = 0;
++    // virtio-gpu (virtio-vga with blob=true): the scan-out is a guest-RAM blob the host shows without a copy, flushed
++    // every VBL; without it (or when it fails) the scan-out stays the VGA BAR the firmware lit
++    NMXVirtioGPU fVirtio;
++    IOBufferMemoryDescriptor *fScanBuf = nullptr;
++    static constexpr uint32_t kScanResource = 1;
++    bool fVirtioOn = false;
++    bool startVirtio(IOPCIDevice *pci, IOPhysicalAddress vgaBase);
+     static constexpr uint64_t kFrameNs = 16666667ull;
+     // CEA-like timing for the one mode, so WindowServer sees 60 Hz (it showed 0.00 Hz without timing information)
+     uint32_t fHT = 0, fVT = 0;
+@@ -64,6 +72,11 @@ class NMXVGAFB : public IOFramebuffer {
+     static void vblFire(thread_call_param_t p0, thread_call_param_t) {
+         NMXVGAFB *me = (NMXVGAFB *)p0;
+         if (me->fStopping) return;
++        if (me->fVirtioOn && !me->fVirtio.flush(kScanResource, 0, 0, me->fWidth, me->fHeight)) {
++            me->fVirtioOn = false;
++            VFBLOG("virtio-gpu flush failed: the host keeps the last frame (%llu commands, %llu failed)",
++                   me->fVirtio.commands(), me->fVirtio.failures());
++        }
+         if (me->fVbl.proc) me->fVbl.proc(me->fVbl.target, me->fVbl.ref);
+         uint64_t period; nanoseconds_to_absolutetime(kFrameNs, &period);
+         uint64_t now = mach_absolute_time();
+@@ -286,10 +299,17 @@ bool NMXVGAFB::start(IOService *provider)
+         if (!ok) return false;
+     }
+     pci->setMemoryEnable(true);
++    {
++        int off = 0;
++        if (PE_parse_boot_argn("-nmxvgafbnovirtio", &off, sizeof(off))) VFBLOG("start: virtio-gpu off (-nmxvgafbnovirtio)");
++        else if (!startVirtio(pci, fBase)) VFBLOG("start: no virtio-gpu scan-out - the VGA BAR stays the scan-out");
++    }
+     VFBLOG("start: %ux%u pitch %u at 0x%llx, calling IOFramebuffer::start", fWidth, fHeight, fRowBytes, (unsigned long long)fBase);
+     if (!IOFramebuffer::start(provider)) { VFBLOG("start: IOFramebuffer::start failed"); return false; }
+     VFBLOG("start: IOFramebuffer::start returned");
+-    if (IODeviceMemory *sm = IODeviceMemory::withRange(fBase, (IOPhysicalLength)fRowBytes * fHeight)) {
++    if (fVirtioOn) {
++        fSurfMap = fScanBuf->map();         // ordinary cached RAM: the host reads it through the dmabuf
++    } else if (IODeviceMemory *sm = IODeviceMemory::withRange(fBase, (IOPhysicalLength)fRowBytes * fHeight)) {
+         fSurfMap = sm->map(kIOMapWriteCombineCache); sm->release();
+     }
+     if (fSurfMap) {
+@@ -333,9 +353,58 @@ void NMXVGAFB::stop(IOService *provider)
+     OSSafeReleaseNULL(fAccel);
+     if (fVblTimer) { thread_call_cancel(fVblTimer); while (!thread_call_free(fVblTimer)) { thread_call_cancel(fVblTimer); IOSleep(5); } fVblTimer = nullptr; }
+     OSSafeReleaseNULL(fSurfMap);
++    // QEMU back in VGA mode (the firmware's framebuffer) before the blob's memory goes
++    if (fVirtio.ready()) fVirtio.reset();
++    fVirtioOn = false;
++    OSSafeReleaseNULL(fScanBuf);
+     IOFramebuffer::stop(provider);
+ }
+ 
++/*
++ * The scan-out moves from the VGA BAR into guest RAM: a physically contiguous buffer the size of the firmware's mode
++ * (the same pitch, so nothing else changes), given to the host as a blob resource and shown on scanout 0. The VGA
++ * contents are copied over first, so the switch is invisible. fBase becomes the buffer's address: the aperture,
++ * IOFBMemorySize users and NMXAccel's "live scanout" all see the RAM. Any failure resets the device (VGA mode again).
++ */
++bool NMXVGAFB::startVirtio(IOPCIDevice *pci, IOPhysicalAddress vgaBase)
++{
++    if (!fVirtio.init(pci)) return false;
++    uint32_t hw = 0, hh = 0; bool en = false;
++    if (fVirtio.displayInfo(&hw, &hh, &en))
++        VFBLOG("virtio-gpu: host scanout 0 is %ux%u (%s)", hw, hh, en ? "enabled" : "disabled");
++    if (!fVirtio.hasBlob()) {
++        VFBLOG("virtio-gpu: the device offers no blob resources (QEMU: virtio-vga blob=true, memfd guest RAM)");
++        fVirtio.reset();
++        return false;
++    }
++    const uint64_t bytes = ((uint64_t)fRowBytes * fHeight + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
++    fScanBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++        kIODirectionInOut | kIOMemoryPhysicallyContiguous, bytes, 0x000000FFFFFFF000ull);
++    if (!fScanBuf) { VFBLOG("virtio-gpu: no %llu bytes of contiguous memory for the scan-out", bytes); fVirtio.reset(); return false; }
++    const uint64_t phys = fScanBuf->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
++    if (IODeviceMemory *vm = IODeviceMemory::withRange(vgaBase, (IOPhysicalLength)fRowBytes * fHeight)) {
++        if (IOMemoryMap *m = vm->map(kIOMapReadOnly)) {
++            memcpy(fScanBuf->getBytesNoCopy(), (const void *)m->getVirtualAddress(), (size_t)fRowBytes * fHeight);
++            m->release();
++        }
++        vm->release();
++    }
++    if (!fVirtio.createBlob(kScanResource, phys, bytes) ||
++        !fVirtio.setScanoutBlob(kScanResource, fWidth, fHeight, fRowBytes) ||
++        !fVirtio.flush(kScanResource, 0, 0, fWidth, fHeight)) {
++        VFBLOG("virtio-gpu: the blob scan-out was refused - back to VGA");
++        fVirtio.reset();
++        OSSafeReleaseNULL(fScanBuf);
++        return false;
++    }
++    fBase = (IOPhysicalAddress)phys;
++    fVirtioOn = true;
++    setProperty("NMXVirtioScanout", true);
++    VFBLOG("virtio-gpu: scan-out is a %ux%u blob in guest RAM at 0x%llx (was VGA 0x%llx)", fWidth, fHeight,
++           (unsigned long long)phys, (unsigned long long)vgaBase);
++    return true;
++}
++
+ /*
+  * "VRAM" for NMXAccel's video resources (WindowServer's display surfaces): IOAcceleratorFamily2 wires each one into
+  * video memory before a display-pipe transaction may present it, and NMXAccel asks the head's framebuffer for that

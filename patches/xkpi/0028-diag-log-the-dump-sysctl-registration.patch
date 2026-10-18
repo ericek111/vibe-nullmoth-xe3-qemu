@@ -1,0 +1,23 @@
+From d96c1a30779323ee7b101f31a9056029f0496d7e Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 09:20:46 +0200
+Subject: [PATCH 28/50] diag: log the dump sysctl registration
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ xnu/nmx_diag.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/gpu-port/xkpi/xnu/nmx_diag.cpp b/gpu-port/xkpi/xnu/nmx_diag.cpp
+index 0dba724..b4ed53f 100644
+--- a/gpu-port/xkpi/xnu/nmx_diag.cpp
++++ b/gpu-port/xkpi/xnu/nmx_diag.cpp
+@@ -40,6 +40,7 @@ extern "C" void nmx_xnu_set_dump_hook(void (*fn)(void))
+     if (fn && !g_registered) {
+         sysctl_register_oid(&sysctl__debug_nmxgpu_dump);
+         g_registered = true;
++        IOLog("NullMoth GPU: debug.nmxgpu_dump registered (oid number %d)\n", sysctl__debug_nmxgpu_dump.oid_number);
+     }
+ }
+ 

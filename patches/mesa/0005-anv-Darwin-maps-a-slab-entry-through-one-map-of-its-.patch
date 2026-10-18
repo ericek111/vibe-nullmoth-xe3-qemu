@@ -1,0 +1,68 @@
+From eb85bae7e87008826e4d5f2299fc71c13492b0fa Mon Sep 17 00:00:00 2001
+From: nm <nm@x>
+Date: Fri, 16 Oct 2026 21:15:23 +0200
+Subject: [PATCH 5/8] anv: Darwin maps a slab entry through one map of its
+ parent
+
+Every pooled batch BO is a slab entry, mapped on allocation and unmapped
+on free, so a busy queue mapped a fresh BO per command batch (~60/s while
+WindowServer animates). Through the Darwin port each map populates, pins
+and maps the pages into the task. Map the parent once on first use, keep
+it until the parent is released, and serve entry maps from it.
+
+WindowServer, scrolling Terminal: ~60 maps/s -> 3 in 12 s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ src/intel/vulkan/anv_allocator.c | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/src/intel/vulkan/anv_allocator.c b/src/intel/vulkan/anv_allocator.c
+index fb93f35535c..c7b3eb507a9 100644
+--- a/src/intel/vulkan/anv_allocator.c
++++ b/src/intel/vulkan/anv_allocator.c
+@@ -1839,6 +1839,28 @@ anv_device_map_bo(struct anv_device *device,
+ 
+    struct anv_bo *real = anv_bo_get_real(bo);
+    uint64_t offset_adjustment = 0;
++#ifdef __APPLE__
++   /* A map through the Darwin port populates, pins and maps the pages into the task on every call, so a slab
++    * entry (a batch BO from the pool, say: one per command batch) is served from one map of its whole parent,
++    * made on first use and kept until the parent is released.
++    */
++   if (real != bo && placed_addr == NULL) {
++      void *pmap = p_atomic_read(&real->map);
++      if (pmap == NULL) {
++         void *m = device->kmd_backend->gem_mmap(device, real, 0, real->size, NULL);
++         if (unlikely(m == MAP_FAILED))
++            return vk_errorf(device, VK_ERROR_MEMORY_MAP_FAILED, "mmap failed: %m");
++         pmap = p_atomic_cmpxchg(&real->map, NULL, m);
++         if (pmap != NULL)
++            anv_device_unmap_bo(device, real, m, real->size, false /* replace */);
++         else
++            pmap = m;
++      }
++      if (map_out)
++         *map_out = (char *)pmap + (bo->offset - real->offset) + offset;
++      return VK_SUCCESS;
++   }
++#endif
+    if (real != bo) {
+       if (placed_addr)
+          return map_placed_addr_slab(device, bo, offset, size, placed_addr, map_out);
+@@ -1970,6 +1992,14 @@ anv_device_unmap_bo(struct anv_device *device,
+    assert(!bo->from_host_ptr);
+ 
+    struct anv_bo *real = anv_bo_get_real(bo);
++#ifdef __APPLE__
++   /* a slab entry's map lies in its parent's map, which the parent's release unmaps (see anv_device_map_bo) */
++   if (real != bo && !replace) {
++      char *pmap = p_atomic_read(&real->map);
++      if (pmap != NULL && (char *)map >= pmap && (char *)map < pmap + real->size)
++         return VK_SUCCESS;
++   }
++#endif
+    if (real != bo) {
+       const uint64_t page_size = device->physical->page_size;
+       uint64_t slab_offset = bo->offset - real->offset;

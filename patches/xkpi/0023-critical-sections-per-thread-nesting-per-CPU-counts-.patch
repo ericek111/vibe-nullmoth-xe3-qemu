@@ -1,0 +1,157 @@
+From 709153a5827f45cfac343055760f7e67a9c4cd78 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 06:19:24 +0200
+Subject: [PATCH 23/50] critical sections: per-thread nesting (per-CPU counts
+ broke when threads blocked inside; returned to user with IRQs off)
+
+---
+ bsdcompat/src/nmx_kernel.c | 121 +++++++++++++++++++++++++++++++------
+ 1 file changed, 104 insertions(+), 17 deletions(-)
+
+diff --git a/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c b/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c
+index 2fe509a..addcbee 100644
+--- a/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c
++++ b/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c
+@@ -258,38 +258,125 @@ struct thread *tdfind(lwpid_t tid, pid_t pid)
+  * this CPU, which also rules out preemption and migration. Nesting is counted per CPU; the interrupt state from the
+  * outermost entry is restored at the outermost exit. LinuxKPI's critical sections are short and never sleep.
+  */
+-static struct { int nest; boolean_t saved; void *who; } nmx_crit[MAXCPU];
++/*
++ * The nesting is kept per thread, not per CPU. LinuxKPI code can block inside a critical section (its spinlock_t is
++ * an adaptive xnu mutex, and preempt_disable() is critical_enter()), and a thread that blocks resumes wherever xnu
++ * runs it next - with per-CPU counts, exits landed on CPUs that never entered (counts of -1, 1, 2 were seen at system
++ * call exit) and threads went back to user space with interrupts off (panic in workq_exit at process exit). Each
++ * thread now restores the interrupt state of its own outermost entry, on whatever CPU it is by then. The table is
++ * fixed-size and needs no allocation, so it works with interrupts off and in interrupt context (an interrupt handler
++ * runs on behalf of the interrupted thread, which cannot be inside a section: interrupts were on).
++ */
++#define NMX_CRIT_SLOTS 1024
++static struct { thread_t th; int nest; boolean_t saved; } nmx_crit[NMX_CRIT_SLOTS];
++static volatile int nmx_crit_lk;
++
++static inline void crit_lock(void)
++{
++    while (__atomic_test_and_set(&nmx_crit_lk, __ATOMIC_ACQUIRE))
++        __asm__ __volatile__("pause");
++}
++
++static inline void crit_unlock(void)
++{
++    __atomic_clear(&nmx_crit_lk, __ATOMIC_RELEASE);
++}
+ 
+-__attribute__((__noinline__)) void nmx_critical_enter(void)
++static int crit_find(thread_t th)
++{
++    unsigned h = (unsigned)(((uintptr_t)th >> 4) % NMX_CRIT_SLOTS);
++    for (unsigned i = 0; i < NMX_CRIT_SLOTS; i++) {
++        unsigned k = (h + i) % NMX_CRIT_SLOTS;
++        if (nmx_crit[k].th == th)
++            return (int)k;
++        if (nmx_crit[k].th == NULL)
++            return -1;
++    }
++    return -1;
++}
++
++void nmx_critical_enter(void)
+ {
+     boolean_t was = ml_set_interrupts_enabled(FALSE);
+-    int c = cpu_number();
+-    if (nmx_crit[c].nest++ == 0) {
+-        nmx_crit[c].saved = was;
+-        nmx_crit[c].who = __builtin_return_address(0);   /* TEMP diag: who opened the outermost section */
++    thread_t me = current_thread();
++    crit_lock();
++    int k = crit_find(me);
++    if (k < 0) {
++        unsigned h = (unsigned)(((uintptr_t)me >> 4) % NMX_CRIT_SLOTS);
++        for (unsigned i = 0; i < NMX_CRIT_SLOTS; i++) {
++            unsigned j = (h + i) % NMX_CRIT_SLOTS;
++            if (nmx_crit[j].th == NULL) { k = (int)j; break; }
++        }
++        if (k < 0)
++            panic("NullMoth xkpi: more than %d threads in critical sections", NMX_CRIT_SLOTS);
++        nmx_crit[k].th = me;
++        nmx_crit[k].nest = 0;
++        nmx_crit[k].saved = was;
+     }
++    nmx_crit[k].nest++;
++    crit_unlock();
+ }
+ 
+-/* TEMP diag for the IRQ-leak check in the device-node glue */
+-void nmx_crit_debug(int *nest, int *saved, void **who, void **self)
++/* a slot is freed by moving later members of its probe run back, so lookups stay correct (linear probing) */
++static void crit_remove(unsigned k)
+ {
+-    int c = cpu_number();
+-    *nest = nmx_crit[c].nest;
+-    *saved = nmx_crit[c].saved;
+-    *who = nmx_crit[c].who;
+-    *self = (void *)nmx_critical_enter;
++    nmx_crit[k].th = NULL;
++    for (unsigned j = (k + 1) % NMX_CRIT_SLOTS; nmx_crit[j].th != NULL; j = (j + 1) % NMX_CRIT_SLOTS) {
++        unsigned h = (unsigned)(((uintptr_t)nmx_crit[j].th >> 4) % NMX_CRIT_SLOTS);
++        /* move j to the hole at k when its home h is not in (k, j] (cyclically) */
++        if ((j > k && (h <= k || h > j)) || (j < k && (h <= k && h > j))) {
++            nmx_crit[k] = nmx_crit[j];
++            nmx_crit[j].th = NULL;
++            k = j;
++        }
++    }
+ }
+ 
+ void nmx_critical_exit(void)
+ {
+-    int c = cpu_number();
+-    if (--nmx_crit[c].nest == 0)
+-        ml_set_interrupts_enabled(nmx_crit[c].saved);
++    (void)ml_set_interrupts_enabled(FALSE);
++    thread_t me = current_thread();
++    crit_lock();
++    int k = crit_find(me);
++    if (k < 0) {
++        /* an exit with no entry by this thread: leave the interrupt state as the caller had it before (off) */
++        crit_unlock();
++        return;
++    }
++    if (--nmx_crit[k].nest > 0) {
++        crit_unlock();
++        return;
++    }
++    boolean_t saved = nmx_crit[k].saved;
++    crit_remove((unsigned)k);
++    crit_unlock();
++    ml_set_interrupts_enabled(saved);
+ }
+ 
+ int nmx_in_critical(void)
+ {
+-    return (ml_at_interrupt_context() || nmx_crit[cpu_number()].nest > 0) ? 1 : 0;
++    if (ml_at_interrupt_context())
++        return 1;
++    boolean_t was = ml_set_interrupts_enabled(FALSE);
++    crit_lock();
++    int in = crit_find(current_thread()) >= 0;
++    crit_unlock();
++    ml_set_interrupts_enabled(was);
++    return in;
++}
++
++/* TEMP diag for the IRQ-leak check in the device-node glue */
++void nmx_crit_debug(int *nest, int *saved, void **who, void **self)
++{
++    boolean_t was = ml_set_interrupts_enabled(FALSE);
++    crit_lock();
++    int k = crit_find(current_thread());
++    *nest = k < 0 ? 0 : nmx_crit[k].nest;
++    *saved = k < 0 ? -1 : nmx_crit[k].saved;
++    crit_unlock();
++    ml_set_interrupts_enabled(was);
++    *who = NULL;
++    *self = (void *)nmx_critical_enter;
+ }
+ 
+ int nmx_curcpu(void)

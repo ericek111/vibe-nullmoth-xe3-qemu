@@ -1,0 +1,26 @@
+From 7d728ce1bf1bdb1accadef7561eccf8f6c42e66b Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 05:15:13 +0200
+Subject: [PATCH 6/8] anv: batch BOs come from the batch BO pool on Darwin
+
+Generated-by: LLM
+---
+ src/intel/vulkan/anv_slab_bo.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/intel/vulkan/anv_slab_bo.c b/src/intel/vulkan/anv_slab_bo.c
+index 0a543b8222f..54ce73a5358 100644
+--- a/src/intel/vulkan/anv_slab_bo.c
++++ b/src/intel/vulkan/anv_slab_bo.c
+@@ -48,6 +48,11 @@ anv_bo_alloc_flags_to_slab_heap(struct anv_device *device,
+                         ANV_BO_ALLOC_IMPLICIT_WRITE);
+    }
+ 
++#ifdef __APPLE__
++   if (alloc_flags == ANV_BO_ALLOC_BATCH_BUFFER_FLAGS ||
++       alloc_flags == ANV_BO_ALLOC_BATCH_BUFFER_INTERNAL_FLAGS)
++      return ANV_BO_SLAB_NOT_SUPPORTED;
++#endif
+    if (alloc_flags == ANV_BO_ALLOC_BATCH_BUFFER_FLAGS ||
+        alloc_flags == ANV_BO_ALLOC_BATCH_BUFFER_INTERNAL_FLAGS)
+       return ANV_BO_SLAB_HEAP_CACHED_COHERENT_CAPTURE;

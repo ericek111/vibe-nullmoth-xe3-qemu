@@ -1,0 +1,334 @@
+From 3f500d5741ffaf4a2725438d0970ba3c5168831b Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 05:14:45 +0200
+Subject: [PATCH 27/47] plugin: Apple's GL renderer draws without a compute
+ pass per draw (restart and provoking-vertex SPI)
+
+AppleMetalOpenGLRenderer (GL 4.1 over Metal: Minecraft and every other GL app) rewrote each draw's index buffer with
+a compute dispatch (fixIndexBuffer) before drawing, so every GL draw cost a draw plus a dispatch (~13 us; Minecraft
+issues ~50k draws a frame and ran at 1 fps). Two reasons, from its disassembly:
+
+- It carries GL's primitive restart state through the AGX encoder SPI setPrimitiveRestartEnabled:[index:] and logged
+  it unsupported. The render encoder now takes it: strips restart at the all-ones index when GL enables restart (Vulkan
+  restarts only there, GL's usual index), never otherwise; lists never restart.
+- It picks a capability table by the device name, and "Intel" (0x144) lacks bit 3, "encoder takes
+  setProvokingVertexMode:", so GL's default last-vertex convention was emulated by rotating every triangle's indices.
+  The device now enables VK_EXT_provoking_vertex last-vertex mode as EDS3 dynamic state, the encoder takes
+  setProvokingVertexMode: (non-zero = last), and when the renderer first asks for the device name the bit is set in
+  its in-memory Intel table (found by its exact bytes followed by the NVIDIA table; anything else is left alone).
+
+Fans, quads and polygons are still rewritten (Metal has no such primitives). vm/guest/tools/glsem checks flat
+shading under both conventions and strips with restart on and off: all pass. glbench (2000 small draws): 25.2 ->
+7.3 ms per frame, same checksum. Minecraft: 1 -> 2 fps (the rest is per-draw cost).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugin/NVMTLDevice.m  | 33 ++++++++++++++++++++++++
+ plugin/NVMTLObjects.h |  1 +
+ plugin/NVMTLObjects.m | 23 ++++++++++++++---
+ plugin/nvmtl_vk.c     | 58 +++++++++++++++++++++++++++++++++++--------
+ plugin/nvmtl_vk.h     |  3 +++
+ 5 files changed, 104 insertions(+), 14 deletions(-)
+
+diff --git a/plugin/NVMTLDevice.m b/plugin/NVMTLDevice.m
+index 8fe8bc8..bb6e501 100644
+--- a/plugin/NVMTLDevice.m
++++ b/plugin/NVMTLDevice.m
+@@ -9,6 +9,7 @@
+ #import <objc/runtime.h>
+ #import <objc/message.h>
+ #import <mach/mach.h>
++#include <mach-o/getsect.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -449,8 +450,40 @@ static void nvmtl_install_hw_resource_pools(id dev)
+     @synchronized(seen) { NSString *k = @(who); if (![seen containsObject:k]) { [seen addObject:k]; nvlog("vendorName -> %s (asked by %s)", v.UTF8String, who); } }
+     return v;
+ }
++/* Apple's GL-over-Metal renderer (AppleMetalOpenGLRenderer) picks a capability table by the device name: "Intel" gets
++   0x144 (macOS 26.7), which lacks bit 3, "the encoder takes setProvokingVertexMode:". Without it GL's default
++   last-vertex convention is emulated by rewriting every draw's index buffer in a compute pass (fixIndexBuffer): a
++   compute dispatch per draw, which held Minecraft at ~1 fps. This device has last-vertex mode (setProvokingVertexMode:
++   on the render encoder), so the bit is set in that table, once, when the renderer first asks for the name - right
++   before it reads the table. The table is found by its exact bytes, followed by the NVIDIA one (0x140); anything else
++   is left alone. */
++static void nvmtl_amgl_caps(const void *caller)
++{
++    static int done;
++    Dl_info di;
++    if (done || !dladdr(caller, &di) || !di.dli_fname || !strstr(di.dli_fname, "/AppleMetalOpenGLRenderer")) return;
++    done = 1;
++    if (!nvmtl_vk_have_provoking_last()) { nvlog("GL renderer caps: no last-vertex mode - its per-draw index rewrite stays"); return; }
++    unsigned long sz = 0;
++    uint8_t *sec = getsectiondata((const struct mach_header_64 *)di.dli_fbase, "__TEXT", "__const", &sz);
++    static const uint8_t intel[20] = { 0x44, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x42, 0, 0, 0x80, 0x41, 0, 0, 0, 0 };
++    static const uint8_t nvidia[16] = { 0x40, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x42, 0, 0, 0x80, 0x41 };
++    uint8_t *hit = NULL; unsigned n = 0;
++    for (unsigned long k = 0; sec && k + 36 <= sz; k += 4)
++        if (!memcmp(sec + k, intel, sizeof intel) && !memcmp(sec + k + 20, nvidia, sizeof nvidia)) { hit = sec + k; n++; }
++    if (n != 1) { nvlog("GL renderer caps: the Intel table was not found exactly once (%u) - left alone", n); return; }
++    const vm_address_t page = (vm_address_t)hit & ~(vm_address_t)(vm_page_size - 1);
++    kern_return_t kr = vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
++    if (kr == KERN_SUCCESS) {
++        hit[0] |= 0x08;
++        kr = vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
++    }
++    nvlog("GL renderer caps: provoking-vertex bit %s (Intel table at %p: 0x%x, vm_protect %d)", kr == KERN_SUCCESS ? "SET" : "NOT set",
++          (void *)hit, hit[0], kr);
++}
+ - (NSString *)name {
+     static int vk = 0; if (!vk) { vk = 1; nvmtl_vk_init(); }
++    nvmtl_amgl_caps(__builtin_return_address(0));
+     const char *vkname = nvmtl_vk_device_name();
+     NSString *full = [NSString stringWithUTF8String:(vkname ? vkname : "NVIDIA GPU")];
+     NSRange cut = [full rangeOfString:@" (NVK "];
+diff --git a/plugin/NVMTLObjects.h b/plugin/NVMTLObjects.h
+index de9ec5a..ed5d199 100644
+--- a/plugin/NVMTLObjects.h
++++ b/plugin/NVMTLObjects.h
+@@ -268,6 +268,7 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d);
+ NSUInteger nvmtl_air_max_tg(NVMTLFunction *fn);
+ @interface NVMTLRenderCommandEncoder () { @public NSString *_label; } @end
+ @interface NVMTLRenderCommandEncoder () { @public uint32_t _vstride[NVMTL_NVIN]; uint32_t _vstrideSet; } @end
++@interface NVMTLRenderCommandEncoder () { @public int _prMode; NSUInteger _prIndex; } @end   // primitive restart SPI: 0 Metal's rule, 1 off, 2 on
+ @interface NVMTLComputeCommandEncoder () { @public NSString *_label; } @end
+ @interface NVMTLBlitCommandEncoder () { @public NSString *_label; } @end
+ @interface NVMTLAccelerationStructureCommandEncoder () { @public NSString *_label; } @end
+diff --git a/plugin/NVMTLObjects.m b/plugin/NVMTLObjects.m
+index f71198b..d7efbba 100644
+--- a/plugin/NVMTLObjects.m
++++ b/plugin/NVMTLObjects.m
+@@ -2934,7 +2934,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
+     if (![self nvmtlBindSamplerPipeline]) return;
+     nvtrace("DRAW type %u | vs %s | fs %s | blend %s", (unsigned)type, _ps ? _ps->_vname.UTF8String : "-", _ps ? _ps->_fname.UTF8String : "-", _ps ? _ps->_blend.UTF8String : "-");
+     if (nvmtl_trace_on()) { char bufs_[600]; nvmtl_vk_trace_buffers(&_cb->_c, bufs_, sizeof bufs_); nvtrace("  BUFS%s", bufs_); }
+-    if (nvmtl_vk_cmd_set_topology(&_cb->_c, (unsigned)type)) return;
++    if (nvmtl_vk_cmd_set_topology_restart(&_cb->_c, (unsigned)type, _prMode)) return;
+     if ([self nvmtlVertexInputs]) return;
+     nvtrace("  direct start %lu count %lu instances %lu", (unsigned long)start, (unsigned long)count, (unsigned long)instances);
+     nvmtl_vk_cmd_draw(&_cb->_c, (uint32_t)start, (uint32_t)count, (uint32_t)instances, (uint32_t)baseInstance);
+@@ -3190,7 +3190,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
+     if (![self nvmtlBindSamplerPipeline]) return;
+     nvtrace("DRAW type %u | vs %s | fs %s | blend %s", (unsigned)type, _ps ? _ps->_vname.UTF8String : "-", _ps ? _ps->_fname.UTF8String : "-", _ps ? _ps->_blend.UTF8String : "-");
+     if (nvmtl_trace_on()) { char bufs_[600]; nvmtl_vk_trace_buffers(&_cb->_c, bufs_, sizeof bufs_); nvtrace("  BUFS%s", bufs_); }
+-    if (nvmtl_vk_cmd_set_topology(&_cb->_c, (unsigned)type)) return;
++    if (nvmtl_vk_cmd_set_topology_restart(&_cb->_c, (unsigned)type, _prMode)) return;
+     if ([self nvmtlVertexInputs]) return;
+     nvtrace("  indexed count %lu u32 %d off %lu instances %lu baseVertex %ld", (unsigned long)count, it == MTLIndexTypeUInt32, (unsigned long)off, (unsigned long)instances, (long)baseVertex);
+     nvmtl_vk_cmd_draw_indexed(&_cb->_c, &b->_b, off, (uint32_t)count, it == MTLIndexTypeUInt32,
+@@ -3207,6 +3207,20 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
+                   instanceCount:1 baseVertex:0 baseInstance:0];
+ }
+ 
++// Apple's GL-over-Metal renderer carries GL's primitive restart state through this AGX SPI (types v20@0:8c16 and
++// v28@0:8c16Q20 in AGXMetalG13X); answered, it stops rewriting index buffers on the GPU before every draw. Vulkan
++// restarts only at the all-ones index of the bound index type, GL's usual (and GL 4.3's fixed) restart index.
++// AGX SPI (v24@0:8Q16): Apple's GL renderer passes GL's provoking-vertex convention, non-zero for last-vertex (GL's
++// default). Answered only where the device has last-vertex mode; the renderer then stops rotating indices per draw.
++- (void)setProvokingVertexMode:(NSUInteger)mode {
++    if (nvmtl_vk_cmd_set_provoking(&_cb->_c, mode != 0)) { static int said; if (!said++) nvlog("setProvokingVertexMode:%lu - no last-vertex mode on this device, flat varyings take the first vertex", (unsigned long)mode); }
++}
++- (void)setPrimitiveRestartEnabled:(BOOL)on { _prMode = on ? 2 : 1; _prIndex = ~(NSUInteger)0; }
++- (void)setPrimitiveRestartEnabled:(BOOL)on index:(NSUInteger)index {
++    if (on && index != 0xFFFF && index != 0xFFFFFFFFu && index != ~(NSUInteger)0) {
++        static int said; if (said++ < 4) nvlog("primitive restart index 0x%lx is not all-ones: strips restart at the all-ones index only", (unsigned long)index); }
++    _prMode = on ? 2 : 1; _prIndex = index;
++}
+ - (void)setStencilReferenceValue:(uint32_t)ref { nvmtl_vk_cmd_set_stencil_ref(&_cb->_c, ref, ref); _hasRef = YES; }
+ - (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b { nvmtl_vk_cmd_set_stencil_ref(&_cb->_c, f, b); _hasRef = YES; }
+ - (void)setDepthBias:(float)bias slopeScale:(float)slope clamp:(float)clamp { nvmtl_vk_cmd_set_depth_bias(&_cb->_c, bias, slope, clamp); }
+@@ -3305,7 +3319,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
+     if (![self nvmtlBindSamplerPipeline]) return;
+     nvtrace("DRAW type %u | vs %s | fs %s | blend %s", (unsigned)type, _ps ? _ps->_vname.UTF8String : "-", _ps ? _ps->_fname.UTF8String : "-", _ps ? _ps->_blend.UTF8String : "-");
+     if (nvmtl_trace_on()) { char bufs_[600]; nvmtl_vk_trace_buffers(&_cb->_c, bufs_, sizeof bufs_); nvtrace("  BUFS%s", bufs_); }
+-    if (nvmtl_vk_cmd_set_topology(&_cb->_c, (unsigned)type)) return;
++    if (nvmtl_vk_cmd_set_topology_restart(&_cb->_c, (unsigned)type, _prMode)) return;
+     if ([self nvmtlVertexInputs]) return;
+     nvmtl_vk_cmd_draw_indirect(&_cb->_c, &nb->_b, off);
+ }
+@@ -3319,7 +3333,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
+     if (![self nvmtlBindSamplerPipeline]) return;
+     nvtrace("DRAW type %u | vs %s | fs %s | blend %s", (unsigned)type, _ps ? _ps->_vname.UTF8String : "-", _ps ? _ps->_fname.UTF8String : "-", _ps ? _ps->_blend.UTF8String : "-");
+     if (nvmtl_trace_on()) { char bufs_[600]; nvmtl_vk_trace_buffers(&_cb->_c, bufs_, sizeof bufs_); nvtrace("  BUFS%s", bufs_); }
+-    if (nvmtl_vk_cmd_set_topology(&_cb->_c, (unsigned)type)) return;
++    if (nvmtl_vk_cmd_set_topology_restart(&_cb->_c, (unsigned)type, _prMode)) return;
+     if ([self nvmtlVertexInputs]) return;
+     nvmtl_vk_cmd_draw_indexed_indirect(&_cb->_c, &ni->_b, ioff, it == MTLIndexTypeUInt32, &nb->_b, off);
+ }
+@@ -4737,6 +4751,7 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
+     nvmtl_vk_cmd_set_line_width(&_c, 1.0f);
+     (void)nvmtl_vk_cmd_set_polygon_mode(&_c, 0);
+     (void)nvmtl_vk_cmd_set_depth_clip(&_c, 1);
++    (void)nvmtl_vk_cmd_set_provoking(&_c, 0);
+     e->_visBuf = (NVMTLBuffer *)d.visibilityResultBuffer;
+     MTLClearColor cc = d.colorAttachments[0].clearColor;
+     e->_clear[0] = (float)cc.red; e->_clear[1] = (float)cc.green; e->_clear[2] = (float)cc.blue; e->_clear[3] = (float)cc.alpha;
+diff --git a/plugin/nvmtl_vk.c b/plugin/nvmtl_vk.c
+index e2406a9..4a7b990 100644
+--- a/plugin/nvmtl_vk.c
++++ b/plugin/nvmtl_vk.c
+@@ -207,6 +207,7 @@ void nvmtl_vk_counts(uint64_t *bm, uint64_t *bg, uint64_t *im, uint64_t *ig, siz
+     X(vkDestroyBuffer) X(vkFreeMemory) X(vkDestroyImage) X(vkDestroyImageView) X(vkDestroyFramebuffer) X(vkDestroyCommandPool) \
+     X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask)
+ static int g_dyn3;
++static int g_provoke;   // VK_EXT_provoking_vertex last-vertex mode as EDS3 dynamic state (GL's default convention)
+ static int g_tess;
+ static int g_indep;
+ static int g_a2one;
+@@ -235,6 +236,7 @@ static int g_clip;
+ static int g_topo_any;
+ static PFN_vkCmdSetPolygonModeEXT pvkCmdSetPolygonModeEXT;
+ static PFN_vkCmdSetDepthClipEnableEXT pvkCmdSetDepthClipEnableEXT;
++static PFN_vkCmdSetProvokingVertexModeEXT pvkCmdSetProvokingVertexModeEXT;
+ static PFN_vkCmdBindVertexBuffers2 pvkCmdBindVertexBuffers2;
+ static PFN_vkCreateRenderPass2 pvkCreateRenderPass2;
+ static uint32_t g_dsr_depth_modes, g_dsr_stencil_modes, g_dsr_indep, g_dsr_indep_none;
+@@ -763,20 +765,20 @@ static int nvmtl_vk_initialize(void)
+     float prio = 1.0f;
+     VkDeviceQueueCreateInfo qci = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, g_qfam, 1, &prio };
+ 
+-    static const char *kWant[14] = { "VK_EXT_extended_dynamic_state3", "VK_EXT_depth_clip_enable", "VK_EXT_memory_budget",
++    static const char *kWant[15] = { "VK_EXT_extended_dynamic_state3", "VK_EXT_depth_clip_enable", "VK_EXT_memory_budget",
+                                     "VK_KHR_acceleration_structure", "VK_KHR_ray_query", "VK_KHR_deferred_host_operations",
+                                     "VK_EXT_external_memory_host",
+                                     "VK_EXT_image_drm_format_modifier",
+                                     "VK_KHR_external_memory_fd",
+-                                    "VK_EXT_mutable_descriptor_type", "VK_KHR_cooperative_matrix", "VK_EXT_calibrated_timestamps", "VK_EXT_sample_locations", "VK_KHR_pipeline_executable_properties"  };
+-    const char *exts[14]; uint32_t next = 0; int have[14] = {0};
++                                    "VK_EXT_mutable_descriptor_type", "VK_KHR_cooperative_matrix", "VK_EXT_calibrated_timestamps", "VK_EXT_sample_locations", "VK_KHR_pipeline_executable_properties", "VK_EXT_provoking_vertex" };
++    const char *exts[15]; uint32_t next = 0; int have[15] = {0};
+     uint32_t na = 0;
+     if (pvkEnumerateDeviceExtensionProperties &&
+         pvkEnumerateDeviceExtensionProperties(g_pdev, NULL, &na, NULL) == VK_SUCCESS && na) {
+         VkExtensionProperties *props = calloc(na, sizeof *props);
+         if (props && pvkEnumerateDeviceExtensionProperties(g_pdev, NULL, &na, props) == VK_SUCCESS)
+             for (uint32_t i = 0; i < na; i++)
+-                for (int w = 0; w < 14; w++)
++                for (int w = 0; w < 15; w++)
+                     if (!have[w] && !strcmp(props[i].extensionName, kWant[w])) { have[w] = 1; exts[next++] = kWant[w]; }
+         free(props);
+     }
+@@ -821,6 +823,24 @@ static int nvmtl_vk_initialize(void)
+         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT, g_clip ? (void *)&clipf : (void *)&v11 };
+     dyn3.extendedDynamicState3PolygonMode = VK_TRUE;
+     if (g_clip) dyn3.extendedDynamicState3DepthClipEnable = VK_TRUE;
++    /* Last-vertex provoking mode, dynamic: GL's default convention. Apple's GL-over-Metal renderer sets it through the
++       encoder SPI setProvokingVertexMode:; a device without it got every triangle's indices rotated by a compute pass
++       before every draw (fixIndexBuffer). */
++    static VkPhysicalDeviceProvokingVertexFeaturesEXT pvf;
++    if (g_dyn3 && have[14]) {
++        PFN_vkGetPhysicalDeviceFeatures2 gpf2p = (PFN_vkGetPhysicalDeviceFeatures2)pvkGetInstanceProcAddr(g_inst, "vkGetPhysicalDeviceFeatures2");
++        VkPhysicalDeviceProvokingVertexFeaturesEXT qpv = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT };
++        VkPhysicalDeviceExtendedDynamicState3FeaturesEXT qd3 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT, &qpv };
++        VkPhysicalDeviceFeatures2 qf2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &qd3 };
++        if (gpf2p) gpf2p(g_pdev, &qf2);
++        if (qpv.provokingVertexLast && qd3.extendedDynamicState3ProvokingVertexMode) {
++            pvf = (VkPhysicalDeviceProvokingVertexFeaturesEXT){ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT, dyn3.pNext, VK_TRUE, VK_FALSE };
++            dyn3.pNext = &pvf;
++            dyn3.extendedDynamicState3ProvokingVertexMode = VK_TRUE;
++            g_provoke = 1;
++        }
++    }
++    nvlog("vk: last-vertex provoking mode %s", g_provoke ? "dynamic (setProvokingVertexMode:)" : "ABSENT");
+     {
+         PFN_vkGetPhysicalDeviceFeatures2 gpf2 = (PFN_vkGetPhysicalDeviceFeatures2)pvkGetInstanceProcAddr(g_inst, "vkGetPhysicalDeviceFeatures2");
+         VkPhysicalDeviceVulkan12Features q12 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+@@ -999,6 +1019,10 @@ static int nvmtl_vk_initialize(void)
+         pvkCmdSetPolygonModeEXT = (PFN_vkCmdSetPolygonModeEXT)pvkGetDeviceProcAddr(g_dev, "vkCmdSetPolygonModeEXT");
+         if (!pvkCmdSetPolygonModeEXT) { nvlog("vk: the extension is enabled but vkCmdSetPolygonModeEXT is missing — fill mode stays static"); g_dyn3 = 0; }
+     }
++    if (g_provoke) {
++        pvkCmdSetProvokingVertexModeEXT = (PFN_vkCmdSetProvokingVertexModeEXT)pvkGetDeviceProcAddr(g_dev, "vkCmdSetProvokingVertexModeEXT");
++        if (!pvkCmdSetProvokingVertexModeEXT) { nvlog("vk: vkCmdSetProvokingVertexModeEXT is missing - first-vertex only"); g_provoke = 0; }
++    }
+     if (g_clip) {
+         pvkCmdSetDepthClipEnableEXT = (PFN_vkCmdSetDepthClipEnableEXT)pvkGetDeviceProcAddr(g_dev, "vkCmdSetDepthClipEnableEXT");
+         if (!pvkCmdSetDepthClipEnableEXT) { nvlog("vk: vkCmdSetDepthClipEnableEXT is missing — depth clip mode stays static"); g_clip = 0; }
+@@ -3768,29 +3792,30 @@ static int nvmtl_vk_pipeline_create_impl_lifetime_body(const void *vs, size_t vn
+         VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK };
+     VkPipelineDynamicStateCreateInfo dsci = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0,
+         hasDepth ? (out->has_stencil ? 16u : 12u) : 9u, dyn };
+-    VkDynamicState dyn3s[18];
++    VkDynamicState dyn3s[19];
+     if (g_dyn3) {
+         uint32_t n3 = 0;
+         for (uint32_t i = 0; i < (hasDepth ? (out->has_stencil ? 16u : 12u) : 9u); i++) dyn3s[n3++] = dyn[i];
+         dyn3s[n3++] = VK_DYNAMIC_STATE_POLYGON_MODE_EXT;
+         if (g_clip) dyn3s[n3++] = VK_DYNAMIC_STATE_DEPTH_CLIP_ENABLE_EXT;
++        if (g_provoke) dyn3s[n3++] = VK_DYNAMIC_STATE_PROVOKING_VERTEX_MODE_EXT;
+         dsci.pDynamicStates = dyn3s; dsci.dynamicStateCount = n3;
+     }
+-    VkDynamicState dynv[20];
++    VkDynamicState dynv[21];
+     if (out->vin_dyn) {
+         uint32_t nv = 0;
+         for (uint32_t i = 0; i < dsci.dynamicStateCount; i++) dynv[nv++] = dsci.pDynamicStates[i];
+         dynv[nv++] = VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE;
+         dsci.pDynamicStates = dynv; dsci.dynamicStateCount = nv;
+     }
+-    VkDynamicState dynl[21];
++    VkDynamicState dynl[22];
+     if (g_wide) {
+         uint32_t nl = 0;
+         for (uint32_t i = 0; i < dsci.dynamicStateCount; i++) dynl[nl++] = dsci.pDynamicStates[i];
+         dynl[nl++] = VK_DYNAMIC_STATE_LINE_WIDTH;
+         dsci.pDynamicStates = dynl; dsci.dynamicStateCount = nl;
+     }
+-    VkDynamicState dynsample[22];
++    VkDynamicState dynsample[23];
+     if (g_sample_locations && samples > 1) {
+         for (uint32_t i = 0; i < dsci.dynamicStateCount; ++i) dynsample[i] = dsci.pDynamicStates[i];
+         dynsample[dsci.dynamicStateCount++] = VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_EXT;
+@@ -4952,7 +4977,12 @@ void nvmtl_vk_cmd_draw(nvk_cmdbuf *c, uint32_t first, uint32_t count, uint32_t i
+ void nvmtl_vk_cmd_set_scissor(nvk_cmdbuf *c, int32_t x, int32_t y, uint32_t w, uint32_t h)
+ { VkRect2D r = { { x, y }, { w, h } }; pvkCmdSetScissor(c->cb, 0, 1, &r); }
+ void nvmtl_vk_cmd_bind_pipeline(nvk_cmdbuf *c, nvk_pipeline *p) { pvkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, (VkPipeline)p->pipe); }
+-int nvmtl_vk_cmd_set_topology(nvk_cmdbuf *c, unsigned mtlType) {
++int nvmtl_vk_cmd_set_topology(nvk_cmdbuf *c, unsigned mtlType) { return nvmtl_vk_cmd_set_topology_restart(c, mtlType, 0); }
++/* restart: 0 Metal's rule (strips restart at the all-ones index, lists never), 1 off, 2 on for strips. 1 and 2 come from
++   the encoder SPI setPrimitiveRestartEnabled:[index:], which Apple's GL-over-Metal calls to carry GL's restart state;
++   without it that renderer rewrote every index buffer with a compute pass before each draw (fixIndexBuffer). Lists stay
++   without restart: list restart needs primitiveTopologyListRestart, and GL apps don't restart lists. */
++int nvmtl_vk_cmd_set_topology_restart(nvk_cmdbuf *c, unsigned mtlType, int restart) {
+     static const VkPrimitiveTopology map[5] = { VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
+         VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
+     if (c->nobind) return 0;
+@@ -4960,7 +4990,8 @@ int nvmtl_vk_cmd_set_topology(nvk_cmdbuf *c, unsigned mtlType) {
+     if (mtlType < 3 && !g_topo_any) { static int said2; if (said2++ < 4) nvlog("G14 draw: point/line primitives need "
+         "dynamicPrimitiveTopologyUnrestricted, which this device does not report — NOT drawn (was: rasterised as triangles)"); return -1; }
+     pvkCmdSetPrimitiveTopology(c->cb, map[mtlType]);
+-    pvkCmdSetPrimitiveRestartEnable(c->cb, (mtlType == 2 || mtlType == 4) ? VK_TRUE : VK_FALSE);
++    const int strip = mtlType == 2 || mtlType == 4;
++    pvkCmdSetPrimitiveRestartEnable(c->cb, strip && restart != 1 ? VK_TRUE : VK_FALSE);
+     if (mtlType != 3) { static int told[5]; if (!told[mtlType]++) nvlog("G14 first draw of MTLPrimitiveType %u in this process", mtlType); }
+     return 0;
+ }
+@@ -6302,6 +6333,13 @@ int nvmtl_vk_bind_storage_view(nvk_cmdbuf *c, uint32_t set, uint32_t index, void
+ }
+ 
+ int nvmtl_vk_have_polygon_mode(void) { return g_dyn3; }
++int nvmtl_vk_have_provoking_last(void) { return g_provoke; }
++int nvmtl_vk_cmd_set_provoking(nvk_cmdbuf *c, int last)
++{
++    if (!g_provoke) return last ? -1 : 0;
++    pvkCmdSetProvokingVertexModeEXT(c->cb, last ? VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT : VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT);
++    return 0;
++}
+ int nvmtl_vk_cmd_set_polygon_mode(nvk_cmdbuf *c, int line)
+ {
+     if (!g_dyn3 || !pvkCmdSetPolygonModeEXT) return -1;
+diff --git a/plugin/nvmtl_vk.h b/plugin/nvmtl_vk.h
+index d8cc2de..f90960c 100644
+--- a/plugin/nvmtl_vk.h
++++ b/plugin/nvmtl_vk.h
+@@ -128,6 +128,9 @@ int  nvmtl_vk_cmd_clear_image(nvk_cmdbuf *c, nvk_image *img, const float clear[4
+ void nvmtl_vk_cmd_set_scissor(nvk_cmdbuf *c, int32_t x, int32_t y, uint32_t w, uint32_t h);
+ void nvmtl_vk_cmd_set_cull(nvk_cmdbuf *c, int mode);
+ int  nvmtl_vk_cmd_set_topology(nvk_cmdbuf *c, unsigned mtlType);
++int  nvmtl_vk_cmd_set_topology_restart(nvk_cmdbuf *c, unsigned mtlType, int restart);
++int  nvmtl_vk_have_provoking_last(void);
++int  nvmtl_vk_cmd_set_provoking(nvk_cmdbuf *c, int last);
+ void nvmtl_vk_cmd_draw_indexed(nvk_cmdbuf *c, nvk_buffer *idx, size_t offset, uint32_t count, int is32,
+                                uint32_t instances, int32_t baseVertex, uint32_t baseInstance);
+ #define NVMTL_NQUERY 128

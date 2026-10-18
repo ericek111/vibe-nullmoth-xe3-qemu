@@ -1,0 +1,25 @@
+From 4037a5268175fa3275d53b5fe885b6227cc3b406 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 01:42:24 +0200
+Subject: [PATCH 01/50] xe: enable the SR-IOV VF path on Panther Lake
+ (.has_sriov in ptl_desc)
+
+---
+ fork_xe.py | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/gpu-port/xkpi/fork_xe.py b/gpu-port/xkpi/fork_xe.py
+index bb96dfd..f55f5fe 100644
+--- a/gpu-port/xkpi/fork_xe.py
++++ b/gpu-port/xkpi/fork_xe.py
+@@ -76,4 +76,10 @@ edit("xe_uc_fw.c", [
+ ])
+ # acpi_target_system_state() is declared by Linux's linux/acpi.h, which xe_display.c gets indirectly on Linux only
+ edit("display/xe_display.c", [('#include "intel_acpi.h"\n', '#include "intel_acpi.h"\n#include <linux/acpi.h>\n', 1)])
++# SR-IOV VF (a Panther Lake VF passed to a macOS VM): 6.14 carries the VF driver but enables it on no platform. With
++# has_sriov set, xe_sriov_probe_early() reads VF_CAP_REG and runs in VF mode on a VF, where update_device_info()
++# already turns off display, GSC, GuC PC and pcode. On the physical function nothing changes (the PF path needs
++# sriov_configure, removed above, and stays off: pf readiness fails without VFs to provision).
++edit("xe_pci.c", [("\tPLATFORM(PANTHERLAKE),\n\t.has_display = true,\n\t.require_force_probe = true,\n",
++                   "\tPLATFORM(PANTHERLAKE),\n\t.has_display = true,\n\t.has_sriov = true,\n\t.require_force_probe = true,\n", 1)])
+ print("xe fork applied")

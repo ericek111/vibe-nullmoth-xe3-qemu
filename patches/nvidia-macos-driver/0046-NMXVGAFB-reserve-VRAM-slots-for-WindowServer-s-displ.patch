@@ -1,0 +1,114 @@
+From 136f2b77f9abe18c4f5ea91d0297a41d251962d2 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sun, 18 Oct 2026 00:18:37 +0200
+Subject: [PATCH 46/47] NMXVGAFB: reserve VRAM slots for WindowServer's display
+ surfaces at start
+
+WindowServer reallocates its three display surfaces (one per mode-sized
+buffer, ~20 MB each) on a mode change that grows them, and the VM display
+backs NMXAccel's VRAM with physically contiguous guest RAM. After 1.5 h of
+uptime no 20 MB contiguous run was left: making the QEMU window fullscreen
+(2880x1710 -> 2880x1800) got 244 refusals, every CoreDisplay display-pipe
+transaction failed ("Fallback GPU Display Pipe transaction submission
+failed") and WindowServer never presented again - a black screen.
+
+The framebuffer now reserves four slots of the largest mode's size (3840x2400
+plus row padding, 37.4 MB each) at start, while memory is unfragmented;
+nvAllocVram takes a free slot and allocates on demand only for a larger
+surface or when the slots are taken. Tested: 10.5 GB of guest RAM
+fragmented (gemlat), three fullscreen/back cycles, no refusals.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ kexts/NMXVGAFB/nmxvgafb.cpp | 45 +++++++++++++++++++++++++++++++++++--
+ 1 file changed, 43 insertions(+), 2 deletions(-)
+
+diff --git a/kexts/NMXVGAFB/nmxvgafb.cpp b/kexts/NMXVGAFB/nmxvgafb.cpp
+index f3059f6..199e634 100644
+--- a/kexts/NMXVGAFB/nmxvgafb.cpp
++++ b/kexts/NMXVGAFB/nmxvgafb.cpp
+@@ -585,6 +585,8 @@ IOService *NMXVGAFB::probe(IOService *provider, SInt32 *score)
+     return IOFramebuffer::probe(provider, score);
+ }
+ 
++static void nmxVramReserve(unsigned long long slotBytes);
++
+ bool NMXVGAFB::start(IOService *provider)
+ {
+     // the mode the firmware lit (GOP): base, size and pitch of the linear framebuffer
+@@ -647,6 +649,8 @@ bool NMXVGAFB::start(IOService *provider)
+     VFBLOG("start: IOFramebuffer::start returned");
+     if (fVirtioOn) {
+         fSurfMap = fScanBuf->map();         // ordinary cached RAM: the host reads it through the dmabuf
++        // a display surface of the largest mode: its height padded (2880x1800 asks for 1808 rows), page-rounded
++        nmxVramReserve((fScanCap + fScanCap / 64 + PAGE_SIZE - 1) & ~(unsigned long long)(PAGE_SIZE - 1));
+     } else if (IODeviceMemory *sm = IODeviceMemory::withRange(fBase, (IOPhysicalLength)fRowBytes * fHeight)) {
+         fSurfMap = sm->map(kIOMapWriteCombineCache); sm->release();
+     }
+@@ -805,11 +809,36 @@ bool NMXVGAFB::startVirtio(IOPCIDevice *pci, IOPhysicalAddress vgaBase)
+  * video memory before a display-pipe transaction may present it, and NMXAccel asks the head's framebuffer for that
+  * memory, as NVRMFB grants BAR1 VRAM. A VM display has no VRAM; physically contiguous system memory stands in (the
+  * resource's aperture descriptor is a single physical range, and the pipe copies from the kernel address).
++ * WindowServer reallocates its display surfaces on every mode change, and after an hour or two guest RAM no longer
++ * has 20 MB contiguous runs (a fullscreen QEMU window then left the display black: every allocation refused, every
++ * display-pipe transaction failed). So the framebuffer reserves slots for them at start, like a GPU's VRAM; only a
++ * surface larger than a slot, or one more than the slots hold, is allocated on demand.
+  */
+ static constexpr unsigned long long kVramBudget = 512ull << 20;
+ static volatile SInt64 gVramUsed = 0;
+ static volatile SInt64 gVramCookie = 0;
+ static unsigned gVramLogs = 0;
++static constexpr unsigned kVramSlots = 4;            // WindowServer's three display surfaces and one spare
++static IOBufferMemoryDescriptor *gVramSlot[kVramSlots];
++static volatile UInt32 gVramSlotBusy = 0;            // bit per slot
++static unsigned long long gVramSlotBytes = 0;
++static IOLock *gVramLock = nullptr;
++
++static void nmxVramReserve(unsigned long long slotBytes)
++{
++    if (!gVramLock && !(gVramLock = IOLockAlloc())) return;
++    IOLockLock(gVramLock);
++    if (!gVramSlotBytes) {
++        unsigned n = 0;
++        for (; n < kVramSlots; n++)
++            if (!(gVramSlot[n] = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++                      kIODirectionInOut | kIOMemoryPhysicallyContiguous, slotBytes, 0x000000FFFFFFF000ull))) break;
++        if (n) gVramSlotBytes = slotBytes;
++        for (unsigned i = n; i < kVramSlots; i++) gVramSlotBusy |= 1u << i;
++        VFBLOG("VRAM: %u of %u slots of %llu bytes reserved", n, kVramSlots, slotBytes);
++    }
++    IOLockUnlock(gVramLock);
++}
+ 
+ static IOReturn nmxVramAlloc(NVRMVramRequest *r)
+ {
+@@ -820,7 +849,14 @@ static IOReturn nmxVramAlloc(NVRMVramRequest *r)
+         VFBLOG("nvAllocVram(%llu): REFUSED, budget of %llu bytes spent", want, kVramBudget);
+         return kIOReturnNoSpace;
+     }
+-    IOBufferMemoryDescriptor *b = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++    IOBufferMemoryDescriptor *b = nullptr;
++    if (gVramLock && want <= gVramSlotBytes) {
++        IOLockLock(gVramLock);
++        for (unsigned i = 0; i < kVramSlots && !b; i++)
++            if (!(gVramSlotBusy & (1u << i))) { gVramSlotBusy |= 1u << i; b = gVramSlot[i]; b->retain(); }
++        IOLockUnlock(gVramLock);
++    }
++    if (!b) b = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+         kIODirectionInOut | kIOMemoryPhysicallyContiguous, want, 0x000000FFFFFFF000ull);
+     if (!b) {
+         OSAddAtomic64(-(SInt64)want, &gVramUsed);
+@@ -843,7 +879,12 @@ static IOReturn nmxVramFree(NVRMVramRequest *r)
+ {
+     IOBufferMemoryDescriptor *b = OSDynamicCast(IOBufferMemoryDescriptor, (OSObject *)r->handle);
+     if (!b) return kIOReturnBadArgument;
+-    OSAddAtomic64(-(SInt64)b->getLength(), &gVramUsed);
++    OSAddAtomic64(-(SInt64)(r->actualSize ? r->actualSize : b->getLength()), &gVramUsed);
++    if (gVramLock) {
++        IOLockLock(gVramLock);
++        for (unsigned i = 0; i < kVramSlots; i++) if (gVramSlot[i] == b) gVramSlotBusy &= ~(1u << i);
++        IOLockUnlock(gVramLock);
++    }
+     b->release();
+     r->handle = nullptr; r->kva = nullptr; r->phys = 0; r->actualSize = 0; r->allocationCookie = 0;
+     return kIOReturnSuccess;

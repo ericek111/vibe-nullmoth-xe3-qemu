@@ -1,0 +1,31 @@
+From 08d4847d6da0a731552732a532994cd875456de7 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 04:04:06 +0200
+Subject: [PATCH 08/50] xe VF: temporary CT/IRQ diagnostics on G2H timeout
+
+---
+ fork_xe.py | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/gpu-port/xkpi/fork_xe.py b/gpu-port/xkpi/fork_xe.py
+index b8865f4..910218b 100644
+--- a/gpu-port/xkpi/fork_xe.py
++++ b/gpu-port/xkpi/fork_xe.py
+@@ -97,4 +97,17 @@ edit("xe_pci.c", [
+     ("\t\tgt->info.id = 0;\n\t\tgt->info.type = XE_GT_TYPE_UNINITIALIZED;\n",
+      "\t\tgt->info.id = 0;\n\t\tgt->info.type = XE_GT_TYPE_UNINITIALIZED;\n\t\tgt->mmio.adj_offset = 0;\n\t\tgt->mmio.adj_limit = 0;\n", 1),
+ ])
++# --- NMX VF DIAGNOSTICS (temporary, for bring-up on the VF) ---
++# count VF interrupts, and on a G2H timeout print both CT descriptors: tells "GuC never read the H2G" (DMA/GGTT) from
++# "GuC answered but no interrupt arrived" (IRQ path)
++edit("xe_irq.c", [("static irqreturn_t vf_mem_irq_handler(int irq, void *arg)\n{\n\tstruct xe_device *xe = arg;\n",
++                   "unsigned int nmx_vf_irq_count;\nstatic irqreturn_t vf_mem_irq_handler(int irq, void *arg)\n{\n\tstruct xe_device *xe = arg;\n\n\tnmx_vf_irq_count++;\n", 1)])
++edit("xe_guc_ct.c", [("\t\txe_gt_err(gt, \"Timed out wait for G2H, fence %u, action %04x, done %s\",\n\t\t\t  g2h_fence.seqno, action[0], str_yes_no(g2h_fence.done));\n",
++    "\t\txe_gt_err(gt, \"Timed out wait for G2H, fence %u, action %04x, done %s\",\n\t\t\t  g2h_fence.seqno, action[0], str_yes_no(g2h_fence.done));\n"
++    "\t\t{\n\t\t\textern unsigned int nmx_vf_irq_count;\n\t\t\tstruct xe_device *nxe = ct_to_xe(ct);\n"
++    "\t\t\txe_gt_err(gt, \"NMX CT: h2g head %u tail %u status %#x | g2h head %u tail %u status %#x | info h2g tail %u g2h head %u | ggtt %#x | vf irqs %u enabled %d memirq %d\\n\",\n"
++    "\t\t\t\t  desc_read(nxe, &ct->ctbs.h2g, head), desc_read(nxe, &ct->ctbs.h2g, tail), desc_read(nxe, &ct->ctbs.h2g, status),\n"
++    "\t\t\t\t  desc_read(nxe, &ct->ctbs.g2h, head), desc_read(nxe, &ct->ctbs.g2h, tail), desc_read(nxe, &ct->ctbs.g2h, status),\n"
++    "\t\t\t\t  ct->ctbs.h2g.info.tail, ct->ctbs.g2h.info.head, xe_bo_ggtt_addr(ct->bo), nmx_vf_irq_count,\n"
++    "\t\t\t\t  atomic_read(&nxe->irq.enabled), xe_device_uses_memirq(nxe));\n\t\t}\n", 1)])
+ print("xe fork applied")

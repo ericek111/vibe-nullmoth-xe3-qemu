@@ -1,0 +1,42 @@
+From ffc0b5971be55a972095c103da7377179ea67db1 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 04:05:24 +0200
+Subject: [PATCH 09/50] fix diag macro use; build-guest refuses to link after a
+ failed compile
+
+---
+ build-guest.sh | 5 +++++
+ fork_xe.py     | 4 ++--
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/gpu-port/xkpi/build-guest.sh b/gpu-port/xkpi/build-guest.sh
+index 8321aee..256acb3 100755
+--- a/gpu-port/xkpi/build-guest.sh
++++ b/gpu-port/xkpi/build-guest.sh
+@@ -28,6 +28,11 @@ case "$WHAT" in
+ esac
+ fail=$(( $(ls logs/*.failed 2>/dev/null | wc -l) + $(ls logs-i915/*.failed 2>/dev/null | wc -l) + $(find logs-xe -name '*.failed' | wc -l) ))
+ echo "compile failures: $fail ($(( $(date +%s) - t0 )) s)"
++# never link stale objects over a failed compile
++if [ "$fail" != 0 ]; then
++    for f in $(ls logs/*.failed logs-i915/*.failed 2>/dev/null; find logs-xe -name '*.failed'); do grep -m3 -A2 "error:" "${f%.failed}.log"; done
++    rm -rf "$OUT/NMXGPU.kext"; exit 1
++fi
+ # rt.sh compiles every xnu/*.cpp, NMXNPU's kext stub included; it has its own kmod_info and belongs to the NPU kext
+ rm -f xnuobj/nmx_npu_kext.o
+ rm -rf "$OUT/NMXGPU.kext"
+diff --git a/gpu-port/xkpi/fork_xe.py b/gpu-port/xkpi/fork_xe.py
+index 910218b..a820011 100644
+--- a/gpu-port/xkpi/fork_xe.py
++++ b/gpu-port/xkpi/fork_xe.py
+@@ -106,8 +106,8 @@ edit("xe_guc_ct.c", [("\t\txe_gt_err(gt, \"Timed out wait for G2H, fence %u, act
+     "\t\txe_gt_err(gt, \"Timed out wait for G2H, fence %u, action %04x, done %s\",\n\t\t\t  g2h_fence.seqno, action[0], str_yes_no(g2h_fence.done));\n"
+     "\t\t{\n\t\t\textern unsigned int nmx_vf_irq_count;\n\t\t\tstruct xe_device *nxe = ct_to_xe(ct);\n"
+     "\t\t\txe_gt_err(gt, \"NMX CT: h2g head %u tail %u status %#x | g2h head %u tail %u status %#x | info h2g tail %u g2h head %u | ggtt %#x | vf irqs %u enabled %d memirq %d\\n\",\n"
+-    "\t\t\t\t  desc_read(nxe, &ct->ctbs.h2g, head), desc_read(nxe, &ct->ctbs.h2g, tail), desc_read(nxe, &ct->ctbs.h2g, status),\n"
+-    "\t\t\t\t  desc_read(nxe, &ct->ctbs.g2h, head), desc_read(nxe, &ct->ctbs.g2h, tail), desc_read(nxe, &ct->ctbs.g2h, status),\n"
++    "\t\t\t\t  desc_read(nxe, (&ct->ctbs.h2g), head), desc_read(nxe, (&ct->ctbs.h2g), tail), desc_read(nxe, (&ct->ctbs.h2g), status),\n"
++    "\t\t\t\t  desc_read(nxe, (&ct->ctbs.g2h), head), desc_read(nxe, (&ct->ctbs.g2h), tail), desc_read(nxe, (&ct->ctbs.g2h), status),\n"
+     "\t\t\t\t  ct->ctbs.h2g.info.tail, ct->ctbs.g2h.info.head, xe_bo_ggtt_addr(ct->bo), nmx_vf_irq_count,\n"
+     "\t\t\t\t  atomic_read(&nxe->irq.enabled), xe_device_uses_memirq(nxe));\n\t\t}\n", 1)])
+ print("xe fork applied")

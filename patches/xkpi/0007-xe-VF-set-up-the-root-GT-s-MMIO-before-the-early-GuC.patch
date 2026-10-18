@@ -1,0 +1,29 @@
+From 0b7902a9935338a72613158b567f6b2495b407ae Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 04:01:34 +0200
+Subject: [PATCH 07/50] xe VF: set up the root GT's MMIO before the early GuC
+ GMD_ID query
+
+---
+ fork_xe.py | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/gpu-port/xkpi/fork_xe.py b/gpu-port/xkpi/fork_xe.py
+index 630769f..b8865f4 100644
+--- a/gpu-port/xkpi/fork_xe.py
++++ b/gpu-port/xkpi/fork_xe.py
+@@ -87,4 +87,14 @@ edit("xe_pci.c", [("\tPLATFORM(PANTHERLAKE),\n\t.has_display = true,\n\t.require
+ # "pci" and was never offered the GPU: every xe device ended in "vgapci0: no driver attached".
+ edit("xe_pci.c", [("static struct pci_driver xe_pci_driver = {\n\t.name = DRIVER_NAME,\n",
+                    "static struct pci_driver xe_pci_driver = {\n\t.name = \"drmn\",\t/* LinuxKPI: a DRM driver, on vgapci */\n", 1)])
++# VF GMD_ID read (6.14 bug, fixed upstream by giving read_gmdid() a dummy GT with xe_gt_mmio_init()): 6.14 talks to
++# the GuC through the root GT before that GT's MMIO is set up, so the first VF_SW_FLAG write went through a NULL base
++# (panic in xe_mmio_write32 from xe_gt_sriov_vf_bootstrap). Map it first; since 6.14 reuses the real root GT, drop the
++# media GSI offset afterwards so the main GT does not keep it after the GMDID_MEDIA read.
++edit("xe_pci.c", [
++    ("\t\txe_guc_comm_init_early(&gt->uc.guc);\n\n\t\t/* Don't bother with GMDID if failed to negotiate the GuC ABI */\n",
++     "\t\txe_gt_mmio_init(gt);\n\t\txe_guc_comm_init_early(&gt->uc.guc);\n\n\t\t/* Don't bother with GMDID if failed to negotiate the GuC ABI */\n", 1),
++    ("\t\tgt->info.id = 0;\n\t\tgt->info.type = XE_GT_TYPE_UNINITIALIZED;\n",
++     "\t\tgt->info.id = 0;\n\t\tgt->info.type = XE_GT_TYPE_UNINITIALIZED;\n\t\tgt->mmio.adj_offset = 0;\n\t\tgt->mmio.adj_limit = 0;\n", 1),
++])
+ print("xe fork applied")

@@ -1,0 +1,22 @@
+From 89e48e3244f6e1ef77da4dead365e02ddfca6692 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 03:55:01 +0200
+Subject: [PATCH 04/50] build-guest.sh: resolve <uapi/drm/xe_drm.h> for xe
+
+---
+ build-guest.sh | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/gpu-port/xkpi/build-guest.sh b/gpu-port/xkpi/build-guest.sh
+index 540021c..0f245fc 100755
+--- a/gpu-port/xkpi/build-guest.sh
++++ b/gpu-port/xkpi/build-guest.sh
+@@ -16,6 +16,8 @@ mkdir -p fbroot fbroot/contrib
+ [ -e fbroot/compat ] || ln -s ../../kpi/freebsd-src/sys/compat fbroot/compat
+ [ -e fbroot/contrib/dev ] || ln -s ../../../kpi/freebsd-src/sys/contrib/dev fbroot/contrib/dev
+ [ -e fbroot/contrib/ck ] || ln -s ../../../kpi/freebsd-src/sys/contrib/ck fbroot/contrib/ck
++# xe includes <uapi/drm/xe_drm.h>, but cc-xe.sh only has -I$V/include/uapi: make uapi/ resolve inside it
++[ -e ../linux-6.14/include/uapi/uapi ] || ln -s . ../linux-6.14/include/uapi/uapi
+ [ -f amd.flags ] || /opt/homebrew/bin/python3 gen_flags.py ../kpi/drm-kmod amd.flags || exit 1
+ t0=$(date +%s)
+ case "$WHAT" in

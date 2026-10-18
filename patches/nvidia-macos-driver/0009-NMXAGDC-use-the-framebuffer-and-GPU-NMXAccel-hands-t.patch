@@ -1,0 +1,95 @@
+From 11e51b2020ee65d0b93e8347cf4ef3fc5671422f Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 20:35:54 +0200
+Subject: [PATCH 09/47] NMXAGDC: use the framebuffer and GPU NMXAccel hands to
+ nmxAgdcUp
+
+NMXAccel can arm the VM display while NMXVGAFB is still registering (its virtio-gpu setup takes
+about a second inside start), and the AGDC loader's own copyMatchingService(NMXVGAFB) then found
+nothing: AGDC stayed down (state -1), WindowServer built no display pipe and nothing was presented.
+The loader now takes the PCI device and framebuffer from the call, with the lookups as the fallback.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ kexts/NMXAGDC/gen.py       | 15 ++++++++++++---
+ kexts/NMXAGDC/nmx-agdc.cpp | 11 +++++++++--
+ 2 files changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/kexts/NMXAGDC/gen.py b/kexts/NMXAGDC/gen.py
+index 38c82fe..29a7b97 100644
+--- a/kexts/NMXAGDC/gen.py
++++ b/kexts/NMXAGDC/gen.py
+@@ -27,12 +27,19 @@ rep('''    OSDictionary *m = IOService::serviceMatching("NVRMNVDAFramebuffer");
+     IOService *p = f->getProvider(); int hops = 0;
+     while (p && !p->metaCast("IOPCIDevice") && hops++ < 8) p = p->getProvider();
+     if (!p || !p->metaCast("IOPCIDevice")) { f->release(); return; }''',
+-    '''    OSDictionary *m = IOService::serviceMatching("NMXVGAFB"); if (!m) return;
+-    IOService *f = IOService::copyMatchingService(m); m->release(); if (!f) return;
++    '''    // the framebuffer and GPU NMXAccel handed to nmxAgdcUp: it can arm the display while the framebuffer is still
++    // registering, when a matching lookup does not find it yet; the lookups below are the fallback
++    IOService *f = gAgdcHintFB, *p = gAgdcHintPCI;
++    if (f && p && p->metaCast("IOPCIDevice")) { f->retain(); gAgdcFBRef = f; *fb = f; *pci = p; return; }
++    OSDictionary *m = IOService::serviceMatching("NMXVGAFB"); if (!m) return;
++    f = IOService::copyMatchingService(m); m->release(); if (!f) return;
+     OSDictionary *g = IOService::serviceMatching("NMXGPU"); IOService *gpu = g ? IOService::copyMatchingService(g) : nullptr;
+     OSSafeReleaseNULL(g);
+-    IOService *p = gpu ? gpu->getProvider() : nullptr; OSSafeReleaseNULL(gpu);
++    p = gpu ? gpu->getProvider() : nullptr; OSSafeReleaseNULL(gpu);
+     if (!p || !p->metaCast("IOPCIDevice")) { f->release(); return; }''')
++# the hints live next to the other AGDC state
++rep('''static IOService *gAgdcFBRef = nullptr;''', '''static IOService *gAgdcFBRef = nullptr;
++static IOService *gAgdcHintFB = nullptr, *gAgdcHintPCI = nullptr;   // from nmxAgdcUp (NMXAccel's framebuffer and GPU)''')
+ rep('''    OSDictionary *m = IOService::serviceMatching("NVRMNVDAFramebuffer");
+     OSIterator *it''', '''    OSDictionary *m = IOService::serviceMatching("NMXVGAFB");
+     OSIterator *it''')
+@@ -50,7 +57,9 @@ IOReturn NMXAGDCLoader::callPlatformFunction(const OSSymbol *fn, bool wait, void
+ {
+     if (fn && fn->isEqualTo("nmxAgdcUp")) {
+         gAgdcK5 = 1; gAgdcWant = 1;
++        gAgdcHintPCI = OSDynamicCast(IOService, (OSObject *)p1); gAgdcHintFB = OSDynamicCast(IOService, (OSObject *)p2);
+         OSIncrementAtomic(&gAgdcBusy); nvdaAgdcWorkBody(); OSDecrementAtomic(&gAgdcBusy);
++        gAgdcHintPCI = gAgdcHintFB = nullptr;   // not retained: only for this call
+         FBLOG("AGDC: brought up for the VM display -> state %d", gAgdcState);
+         return gAgdcState == 1 ? kIOReturnSuccess : kIOReturnError;
+     }
+diff --git a/kexts/NMXAGDC/nmx-agdc.cpp b/kexts/NMXAGDC/nmx-agdc.cpp
+index 40e1fb7..3dcfd66 100644
+--- a/kexts/NMXAGDC/nmx-agdc.cpp
++++ b/kexts/NMXAGDC/nmx-agdc.cpp
+@@ -156,6 +156,7 @@ IOReturn NMXDeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned l
+ 
+ static int gAgdcState = 0; static NMXDeviceControl *gAgdc = nullptr; static thread_call_t gAgdcCall = nullptr; static int gAgdcWant = 0;
+ static IOService *gAgdcFBRef = nullptr;
++static IOService *gAgdcHintFB = nullptr, *gAgdcHintPCI = nullptr;   // from nmxAgdcUp (NMXAccel's framebuffer and GPU)
+ static void nvdaAgdcDropTable(void)
+ {
+     unsigned n = gAgdcNFB; gAgdcNFB = 0;
+@@ -167,11 +168,15 @@ static void nvdaAgdcDropFB(void) { if (gAgdcFBRef) { gAgdcFBRef->release(); gAgd
+ static void nvdaAgdcTargets(IOService **pci, IOService **fb)
+ {
+     *pci = nullptr; *fb = nullptr;
++    // the framebuffer and GPU NMXAccel handed to nmxAgdcUp: it can arm the display while the framebuffer is still
++    // registering, when a matching lookup does not find it yet; the lookups below are the fallback
++    IOService *f = gAgdcHintFB, *p = gAgdcHintPCI;
++    if (f && p && p->metaCast("IOPCIDevice")) { f->retain(); gAgdcFBRef = f; *fb = f; *pci = p; return; }
+     OSDictionary *m = IOService::serviceMatching("NMXVGAFB"); if (!m) return;
+-    IOService *f = IOService::copyMatchingService(m); m->release(); if (!f) return;
++    f = IOService::copyMatchingService(m); m->release(); if (!f) return;
+     OSDictionary *g = IOService::serviceMatching("NMXGPU"); IOService *gpu = g ? IOService::copyMatchingService(g) : nullptr;
+     OSSafeReleaseNULL(g);
+-    IOService *p = gpu ? gpu->getProvider() : nullptr; OSSafeReleaseNULL(gpu);
++    p = gpu ? gpu->getProvider() : nullptr; OSSafeReleaseNULL(gpu);
+     if (!p || !p->metaCast("IOPCIDevice")) { f->release(); return; }
+     gAgdcFBRef = f; *fb = f; *pci = p;
+ }
+@@ -304,7 +309,9 @@ IOReturn NMXAGDCLoader::callPlatformFunction(const OSSymbol *fn, bool wait, void
+ {
+     if (fn && fn->isEqualTo("nmxAgdcUp")) {
+         gAgdcK5 = 1; gAgdcWant = 1;
++        gAgdcHintPCI = OSDynamicCast(IOService, (OSObject *)p1); gAgdcHintFB = OSDynamicCast(IOService, (OSObject *)p2);
+         OSIncrementAtomic(&gAgdcBusy); nvdaAgdcWorkBody(); OSDecrementAtomic(&gAgdcBusy);
++        gAgdcHintPCI = gAgdcHintFB = nullptr;   // not retained: only for this call
+         FBLOG("AGDC: brought up for the VM display -> state %d", gAgdcState);
+         return gAgdcState == 1 ? kIOReturnSuccess : kIOReturnError;
+     }

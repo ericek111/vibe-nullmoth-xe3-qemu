@@ -1,0 +1,30 @@
+From 9f9c5a4e189942f851e2cbea87f78de93f1a1dcc Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 03:30:06 +0200
+Subject: [PATCH 22/47] NMXVGAFB: release the display hold when the accelerator
+ armed the head before it
+
+IOFramebuffer::start registers the framebuffer and NMXAccel arms on that publication, so nmxDisplayReady could run
+13 ms before start() took the hold; the hold then waited out its 20 s cap on every boot (WindowServer's display
+search waited with it). start() releases it at once when an accelerator is already recorded. Measured: the hold
+is released 0 ms after it is taken.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ kexts/NMXVGAFB/nmxvgafb.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/kexts/NMXVGAFB/nmxvgafb.cpp b/kexts/NMXVGAFB/nmxvgafb.cpp
+index b910569..386ad3a 100644
+--- a/kexts/NMXVGAFB/nmxvgafb.cpp
++++ b/kexts/NMXVGAFB/nmxvgafb.cpp
+@@ -421,6 +421,9 @@ bool NMXVGAFB::start(IOService *provider)
+         uint64_t d; clock_interval_to_deadline(kHoldCapSec, kSecondScale, &d);
+         thread_call_enter_delayed(fHoldCap, d);
+         VFBLOG("display hold: the registry stays busy until the accelerator arms this head (%u s at most)", kHoldCapSec);
++        // IOFramebuffer::start registered this framebuffer, and NMXAccel arms on that publication: its nmxDisplayReady
++        // can come before the hold above (measured: 13 ms earlier), and the hold then lasted the whole cap
++        if (fAccel) releaseHold("the accelerator armed this head before the hold");
+     }
+     return true;
+ }

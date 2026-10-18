@@ -1,0 +1,8 @@
+| Directory | Patches | Base (upstream + commit) | How to apply | Verification |
+|---|---|---|---|---|
+| nvidia-macos-driver/ | 47 | https://github.com/nullmoth/nvidia-macos-driver @ d96eaca ("Driver and Mac app 2.0.2") | `git checkout d96eaca && git am nvidia-macos-driver/*.patch` | git am OK on d96eaca |
+| xkpi/ | 50 | gpu-port/xkpi inside nvidia-macos-driver (xkpi 80a87f2 tree is identical to d96eaca:gpu-port/xkpi) | at the nvidia-macos-driver repo root (d96eaca, or after the series above): `git am xkpi/*.patch` | git am OK on d96eaca and on top of series 1 (1 trailing-whitespace warning) |
+| drm-kmod/ | 1 | https://github.com/freebsd/drm-kmod @ c16de0f9fa | `git checkout c16de0f9fa && git am drm-kmod/*.patch` | git am OK |
+| libdrm/ | 5 | https://gitlab.freedesktop.org/mesa/drm @ b97cbde15c5c + gpu-port/patches/libdrm-macos.patch (committed; = repo commit 0706230d) | `git checkout b97cbde15c5c && git apply gpu-port/patches/libdrm-macos.patch && git commit -am base && git am libdrm/*.patch` | OK (macos patch identical to 0706230d except abbreviated index hashes) |
+| mesa/ | 8 | https://gitlab.freedesktop.org/mesa/mesa @ bffd91947ef + gpu-port/patches/mesa-macos.patch (committed; = repo commit 5ab4e3af9cc) | `git checkout bffd91947ef && git apply gpu-port/patches/mesa-macos.patch && git commit -am base && git am mesa/*.patch` | OK (macos patch identical to 5ab4e3af9cc except index hash lengths) |
+| qemu/ | 4 (0002, 0006, 0007, 0008) | https://gitlab.com/qemu-project/qemu v11.1.2 | `patch -Np1 -i` each in order (or `git apply`) in a pristine 11.1.2 tree | all four apply in order to pristine 11.1.2 without 0001/0003/0004/0005 |

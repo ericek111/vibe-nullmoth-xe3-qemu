@@ -1,0 +1,332 @@
+From 56132fce24a3ffaa7f25769e1be785c9da2d3241 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 13:13:27 +0200
+Subject: [PATCH 31/47] translator: split vector loads over GEP-indexed slots
+ of another same-width type
+
+Apple's GL compiler addresses a GLSL ivec3 at the start of a uniform block
+as getelementptr float and loads it as <3 x i32>. vec_scalar_merge only
+scalarized components whose uses share one element type, so the emitter
+failed (reinterpret load bit width mismatch Float vs <3 x i32>) and
+Minecraft's terrain vertex shader never got a pipeline: AppleMetalGL ran
+it on the CPU (SW vertex processing). Such components now split into slot
+loads/stores with a per-lane bitcast; the plain reinterpret mix without a
+GEP stays untouched. Minecraft 26.3: 2 -> 22 fps.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../translator/src/native/vec_scalar_merge.rs | 171 ++++++++++++++++--
+ 1 file changed, 158 insertions(+), 13 deletions(-)
+
+diff --git a/translator/translator/src/native/vec_scalar_merge.rs b/translator/translator/src/native/vec_scalar_merge.rs
+index c6153ba..856cd09 100644
+--- a/translator/translator/src/native/vec_scalar_merge.rs
++++ b/translator/translator/src/native/vec_scalar_merge.rs
+@@ -321,6 +321,9 @@ fn component(defs: &BTreeMap<String, Def>, seeds: &HashSet<String>) -> HashSet<S
+ struct UseWidths {
+     scalars: HashSet<String>,
+     vectors: HashSet<String>,
++    /// Scalar element types this pointer is indexed by (`getelementptr <scalar>, ptr %p, ...`): the IR treats the
++    /// memory as an array of that type.
++    gep_scalars: HashSet<String>,
+     other: bool,
+     logical: bool,
+ }
+@@ -362,12 +365,15 @@ fn scalar_byte_width(elem: &str) -> Option<usize> {
+ 
+ fn use_widths(body: &[&str]) -> HashMap<String, UseWidths> {
+     let mut map: HashMap<String, UseWidths> = HashMap::new();
+-    let mut observe = |name: &str, ty: &str, ptr_prefix: &str| {
++    let mut observe = |name: &str, ty: &str, ptr_prefix: &str, from_gep: bool| {
+         let entry = map.entry(name.to_string()).or_default();
+         if let Some((elem, _)) = vec_elem_lanes(ty) {
+             entry.vectors.insert(elem);
+         } else if is_simple_scalar(ty.trim()) {
+             entry.scalars.insert(ty.trim().to_string());
++            if from_gep {
++                entry.gep_scalars.insert(ty.trim().to_string());
++            }
+         } else {
+             entry.other = true;
+         }
+@@ -381,14 +387,14 @@ fn use_widths(body: &[&str]) -> HashMap<String, UseWidths> {
+                     let chunks = split_top_level(def.rest, ',');
+                     if chunks.len() >= 2 {
+                         if let Some((prefix, ptr)) = split_ptr_operand(chunks[1]) {
+-                            observe(ptr, chunks[0].trim(), prefix);
++                            observe(ptr, chunks[0].trim(), prefix, false);
+                         }
+                     }
+                 }
+                 "getelementptr" => {
+                     if let Some(g) = parse_gep(def.rest) {
+                         let prefix = split_ptr_operand(g.base_chunk).map_or("", |(p, _)| p);
+-                        observe(g.base_name, g.src_ty, prefix);
++                        observe(g.base_name, g.src_ty, prefix, true);
+                     }
+                 }
+                 _ => {}
+@@ -401,7 +407,7 @@ fn use_widths(body: &[&str]) -> HashMap<String, UseWidths> {
+                 if let (Some((ty, _)), Some((prefix, ptr))) =
+                     (split_ptr_operand(chunks[0]), split_ptr_operand(chunks[1]))
+                 {
+-                    observe(ptr, ty, prefix);
++                    observe(ptr, ty, prefix, false);
+                 }
+             }
+         }
+@@ -409,7 +415,12 @@ fn use_widths(body: &[&str]) -> HashMap<String, UseWidths> {
+     map
+ }
+ 
+-fn widen_targets(body: &[&str], defs: &BTreeMap<String, Def>) -> Vec<(HashSet<String>, String)> {
++/// Pointer components to scalarize: (members, slot element type, whether a vector of a different element type of the
++/// same width may be split into slot loads/stores with a per-lane bitcast).
++fn widen_targets(
++    body: &[&str],
++    defs: &BTreeMap<String, Def>,
++) -> Vec<(HashSet<String>, String, bool)> {
+     let widths = use_widths(body);
+     let reloaded = memory_reloaded_pointers(body);
+     let adj = pointer_adjacency(defs);
+@@ -417,7 +428,7 @@ fn widen_targets(body: &[&str], defs: &BTreeMap<String, Def>) -> Vec<(HashSet<St
+     nodes.extend(widths.keys().cloned());
+ 
+     let mut visited: HashSet<String> = HashSet::new();
+-    let mut targets: Vec<(HashSet<String>, String)> = Vec::new();
++    let mut targets: Vec<(HashSet<String>, String, bool)> = Vec::new();
+     for start in &nodes {
+         if !visited.insert(start.clone()) {
+             continue;
+@@ -437,6 +448,8 @@ fn widen_targets(body: &[&str], defs: &BTreeMap<String, Def>) -> Vec<(HashSet<St
+             }
+         }
+         let mut elems: HashSet<String> = HashSet::new();
++        let mut scalar_elems: HashSet<String> = HashSet::new();
++        let mut gep_elems: HashSet<String> = HashSet::new();
+         let (mut has_scalar, mut has_vector, mut other, mut logical) = (false, false, false, false);
+         let mut memory_ptr = false;
+         for m in &members {
+@@ -444,8 +457,10 @@ fn widen_targets(body: &[&str], defs: &BTreeMap<String, Def>) -> Vec<(HashSet<St
+             if let Some(w) = widths.get(m) {
+                 for s in &w.scalars {
+                     elems.insert(s.clone());
++                    scalar_elems.insert(s.clone());
+                     has_scalar = true;
+                 }
++                gep_elems.extend(w.gep_scalars.iter().cloned());
+                 for v in &w.vectors {
+                     elems.insert(v.clone());
+                     has_vector = true;
+@@ -454,12 +469,29 @@ fn widen_targets(body: &[&str], defs: &BTreeMap<String, Def>) -> Vec<(HashSet<St
+                 logical |= w.logical;
+             }
+         }
+-        if !other && !logical && !memory_ptr && has_scalar && has_vector && elems.len() == 1 {
++        if other || logical || memory_ptr || !has_scalar || !has_vector {
++            continue;
++        }
++        if elems.len() == 1 {
+             let elem = elems.into_iter().next().unwrap();
+             if scalar_byte_width(&elem).is_some_and(|w| w < 4) {
+                 continue;
+             }
+-            targets.push((members, elem));
++            targets.push((members, elem, false));
++            continue;
++        }
++        // Memory the IR indexes as an array of one scalar type (a GEP over it, and no scalar access of another
++        // type), read or written as vectors of a different element type of the same width: e.g. a GLSL `ivec3` at
++        // the start of a uniform block that Apple's GL compiler addresses as `getelementptr float` and loads as
++        // `<3 x i32>`. Each lane is a slot of the array, reinterpreted.
++        if scalar_elems.len() == 1 && gep_elems == scalar_elems {
++            let elem = scalar_elems.into_iter().next().unwrap();
++            let Some(width) = scalar_byte_width(&elem).filter(|w| *w >= 4) else {
++                continue;
++            };
++            if elems.iter().all(|e| scalar_byte_width(e) == Some(width)) {
++                targets.push((members, elem, true));
++            }
+         }
+     }
+     targets
+@@ -610,6 +642,71 @@ impl Rewriter {
+         }
+         lines
+     }
++
++    /// `split_load` for a vector of `elem` over slots of `slot` (same width): each lane loads a slot and bitcasts it.
++    fn split_load_reinterpret(
++        &mut self,
++        name: &str,
++        elem: &str,
++        slot: &str,
++        lanes: usize,
++        ptr_prefix: &str,
++        ptr_name: &str,
++    ) -> Vec<String> {
++        let mut lines = Vec::new();
++        let mut elem_ids = Vec::with_capacity(lanes);
++        for k in 0..lanes {
++            let p = self.fresh();
++            let l = self.fresh();
++            let c = self.fresh();
++            lines.push(format!(
++                "  {p} = getelementptr inbounds {slot}, {ptr_prefix} {ptr_name}, i64 {k}"
++            ));
++            lines.push(format!("  {l} = load {slot}, {ptr_prefix} {p}, align 4"));
++            lines.push(format!("  {c} = bitcast {slot} {l} to {elem}"));
++            elem_ids.push(c);
++        }
++        let vty = format!("<{lanes} x {elem}>");
++        let mut prev = "undef".to_string();
++        for (k, elem_id) in elem_ids.iter().enumerate() {
++            let out = if k + 1 == lanes {
++                name.to_string()
++            } else {
++                self.fresh()
++            };
++            lines.push(format!(
++                "  {out} = insertelement {vty} {prev}, {elem} {elem_id}, i32 {k}"
++            ));
++            prev = out;
++        }
++        lines
++    }
++
++    /// `split_store` for a vector of `elem` over slots of `slot` (same width).
++    fn split_store_reinterpret(
++        &mut self,
++        value: &str,
++        elem: &str,
++        slot: &str,
++        lanes: usize,
++        ptr_prefix: &str,
++        ptr_name: &str,
++    ) -> Vec<String> {
++        let vty = format!("<{lanes} x {elem}>");
++        let mut lines = Vec::new();
++        for k in 0..lanes {
++            let x = self.fresh();
++            let c = self.fresh();
++            let p = self.fresh();
++            lines.push(format!("  {x} = extractelement {vty} {value}, i32 {k}"));
++            lines.push(format!("  {c} = bitcast {elem} {x} to {slot}"));
++            lines.push(format!(
++                "  {p} = getelementptr inbounds {slot}, {ptr_prefix} {ptr_name}, i64 {k}"
++            ));
++            lines.push(format!("  store {slot} {c}, {ptr_prefix} {p}, align 4"));
++        }
++        lines
++    }
+ }
+ 
+ fn rewrite_function_body(body: &[&str], widen: bool) -> Option<Vec<String>> {
+@@ -620,6 +717,7 @@ fn rewrite_function_body(body: &[&str], widen: bool) -> Option<Vec<String>> {
+         .collect();
+ 
+     let mut comp_elem: HashMap<String, String> = HashMap::new();
++    let mut reinterpret: HashSet<String> = HashSet::new();
+ 
+     let (pointees, mismatches) = classify(&defs);
+     if let Some(elem) = unify_mismatch_elem(&mismatches, &pointees) {
+@@ -628,9 +726,15 @@ fn rewrite_function_body(body: &[&str], widen: bool) -> Option<Vec<String>> {
+         }
+     }
+     if widen {
+-        for (members, elem) in widen_targets(body, &defs) {
++        for (members, elem, lanes_reinterpret) in widen_targets(body, &defs) {
+             for m in members {
+-                comp_elem.entry(m).or_insert_with(|| elem.clone());
++                if comp_elem.contains_key(&m) {
++                    continue;
++                }
++                if lanes_reinterpret {
++                    reinterpret.insert(m.clone());
++                }
++                comp_elem.insert(m, elem.clone());
+             }
+         }
+     }
+@@ -644,7 +748,7 @@ fn rewrite_function_body(body: &[&str], widen: bool) -> Option<Vec<String>> {
+     let mut rw = Rewriter { counter: 0 };
+     let mut out: Vec<String> = Vec::with_capacity(body.len());
+     for line in body {
+-        if let Some(rewritten) = rewrite_line(line, &comp_elem, &mut rw) {
++        if let Some(rewritten) = rewrite_line(line, &comp_elem, &reinterpret, &mut rw) {
+             out.extend(rewritten);
+         } else {
+             out.push(line.to_string());
+@@ -672,6 +776,7 @@ fn unify_mismatch_elem(
+ fn rewrite_line(
+     line: &str,
+     comp_elem: &HashMap<String, String>,
++    reinterpret: &HashSet<String>,
+     rw: &mut Rewriter,
+ ) -> Option<Vec<String>> {
+     let trimmed = line.trim();
+@@ -695,7 +800,12 @@ fn rewrite_line(
+                 let (ptr_prefix, ptr_name) = split_ptr_operand(chunks[1])?;
+                 let elem = comp_elem.get(ptr_name)?;
+                 if &e != elem {
+-                    return None;
++                    if !reinterpret.contains(ptr_name) {
++                        return None;
++                    }
++                    return Some(
++                        rw.split_load_reinterpret(def.name, &e, elem, lanes, ptr_prefix, ptr_name),
++                    );
+                 }
+                 return Some(rw.split_load(def.name, &e, lanes, ptr_prefix, ptr_name));
+             }
+@@ -712,7 +822,10 @@ fn rewrite_line(
+         let (ptr_prefix, ptr_name) = split_ptr_operand(chunks[1])?;
+         let elem = comp_elem.get(ptr_name)?;
+         if &e != elem {
+-            return None;
++            if !reinterpret.contains(ptr_name) {
++                return None;
++            }
++            return Some(rw.split_store_reinterpret(value, &e, elem, lanes, ptr_prefix, ptr_name));
+         }
+         return Some(rw.split_store(value, &e, lanes, ptr_prefix, ptr_name));
+     }
+@@ -885,6 +998,38 @@ entry:
+         assert_eq!(lower_impl(src, true), src);
+     }
+ 
++    #[test]
++    fn gep_indexed_slots_read_as_other_same_width_vector_are_split_with_bitcasts() {
++        // Apple's GL compiler: a GLSL `ivec3` at the start of a uniform block, addressed as `getelementptr float`.
++        let src = "\
++define void @k(ptr addrspace(2) %ubo) {
++entry:
++  %p = getelementptr float, ptr addrspace(2) %ubo, i32 0
++  %v = load <3 x i32>, ptr addrspace(2) %p, align 16
++  ret void
++}
++";
++        assert_eq!(lower_impl(src, false), src);
++        let out = lower_impl(src, true);
++        assert!(!out.contains("load <3 x i32>"), "{out}");
++        assert_eq!(out.matches("load float,").count(), 3, "{out}");
++        assert_eq!(out.matches("bitcast float ").count(), 3, "{out}");
++        assert!(out.contains("%v = insertelement <3 x i32>"), "{out}");
++    }
++
++    #[test]
++    fn gep_indexed_slots_of_another_width_are_not_reinterpreted() {
++        let src = "\
++define void @k(ptr addrspace(2) %ubo) {
++entry:
++  %p = getelementptr float, ptr addrspace(2) %ubo, i32 0
++  %v = load <2 x i16>, ptr addrspace(2) %p, align 4
++  ret void
++}
++";
++        assert_eq!(lower_impl(src, true), src);
++    }
++
+     #[test]
+     fn use_width_logical_workgroup_pointer_is_not_widened() {
+         let src = "\

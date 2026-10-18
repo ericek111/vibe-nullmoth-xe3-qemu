@@ -1,0 +1,34 @@
+From a4fb78b60d346abcd9d68c9829e626b88ee7836c Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 01:45:54 +0200
+Subject: [PATCH 50/50] xe fork: runtime resume from reclaim is safe on a VF
+ (7.2 backport)
+
+7.2's xe_rpm_reclaim_safe only excludes D3cold. With 6.14's extra
+!has_sriov, every BO move handling system CCS pages on this VF took the
+noresume branch and hit drm_WARN_ON(handle_system_ccs): 3858 kernel log
+lines in 46 minutes of desktop use. None after the change.
+
+Tested together on the VF (build b9acec2+-1017.014208): boot, login,
+GPU desktop, Metal compute exact.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fork_xe.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/gpu-port/xkpi/fork_xe.py b/gpu-port/xkpi/fork_xe.py
+index b9e64cc..80d5e0e 100644
+--- a/gpu-port/xkpi/fork_xe.py
++++ b/gpu-port/xkpi/fork_xe.py
+@@ -192,6 +192,10 @@ edit("xe_guc_ct.c", [
+     ("\t\tif (g2h_fence.done) {\n", "\t\tif (READ_ONCE(g2h_fence.done)) {\n", 1),
+     ("\tg2h_fence->done = true;\n\tsmp_mb();\n", "\tWRITE_ONCE(g2h_fence->done, true);\n\tsmp_mb();\n", 1),
+ ])
++# Runtime resume from reclaim on a VF (backport of upstream, as in Linux 7.2 xe_pm.c): only D3cold makes it unsafe.
++# 6.14 also excluded SR-IOV, so on this VF every BO move that handles system CCS pages (Xe3 iGPU: most user BOs)
++# took the noresume branch and hit drm_WARN_ON(handle_system_ccs), ~80 times a minute on the desktop.
++edit("xe_pm.c", [("\treturn !xe->d3cold.capable && !xe->info.has_sriov;\n", "\treturn !xe->d3cold.capable;\n", 1)])
+ # --- NMX VF DIAGNOSTICS (temporary, for bring-up on the VF) ---
+ # count VF interrupts, and on a G2H timeout print both CT descriptors: tells "GuC never read the H2G" (DMA/GGTT) from
+ # "GuC answered but no interrupt arrived" (IRQ path)

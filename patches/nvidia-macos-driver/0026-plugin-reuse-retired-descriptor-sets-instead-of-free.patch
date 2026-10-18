@@ -1,0 +1,117 @@
+From d5af3408b1948a7bb9c6f30c06b67b2165fee55d Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 05:14:23 +0200
+Subject: [PATCH 26/47] plugin: reuse retired descriptor sets instead of
+ freeing them
+
+ANV zeroes and initialises every binding of a set at vkAllocateDescriptorSets; this layout has 321 bindings (~45 KB
+per set) and a draw takes one or two sets, so allocation was the largest CPU cost of small draws (40% of Minecraft's
+GL render thread, ~20% of WindowServer's main thread). Retired sets now go to a free list and are handed out again;
+every binding a pipeline uses is written again on reuse, the rest are never read. NVMTL_NO_DESC_RECYCLE=1 frees them.
+
+Measured: pointer motion over the desktop 73 -> 107 presents/s, WindowServer 151% -> 98% of a core.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugin/nvmtl_vk.c | 60 ++++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 54 insertions(+), 6 deletions(-)
+
+diff --git a/plugin/nvmtl_vk.c b/plugin/nvmtl_vk.c
+index f5c7611..e2406a9 100644
+--- a/plugin/nvmtl_vk.c
++++ b/plugin/nvmtl_vk.c
+@@ -2632,6 +2632,47 @@ static int nvmtl_spirv_uses_set(const void *code, size_t words, uint32_t set)
+ }
+ 
+ #define NVMTL_DESC_BATCH_MAX 32
++/* Retired descriptor sets are kept for reuse instead of freed. ANV zeroes and initialises every binding of a set at
++   vkAllocateDescriptorSets (this layout has 321 of them, ~45 KB), which with a set or two per draw was the largest
++   CPU cost of WindowServer's and Minecraft's draws (40% of a GL render thread). A recycled set's bindings still hold
++   their last descriptors; every binding a pipeline uses is written again (the mask), the rest are never read.
++   NVMTL_NO_DESC_RECYCLE=1 frees them as before. Under g_desc_lock. */
++typedef struct { VkDescriptorPool pool; VkDescriptorSet set; } nvmtl_dfree_ent;
++static nvmtl_dfree_ent *g_dfree; static unsigned g_ndfree, g_capdfree;
++static unsigned long long g_dfree_reused, g_dfree_allocated;
++static int nvmtl_desc_recycle_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("NVMTL_NO_DESC_RECYCLE"); on = !(e && e[0] == '1');
++                  nvlog("vk: retired descriptor sets are %s (NVMTL_NO_DESC_RECYCLE=%s)", on ? "reused" : "freed", e ? e : "unset"); }
++    return on;
++}
++// keeps one retired set for reuse; false: the caller frees it
++static int nvmtl_dfree_put(VkDescriptorPool pool, VkDescriptorSet set)
++{
++    if (!nvmtl_desc_recycle_on()) return 0;
++    if (g_ndfree == g_capdfree) {
++        unsigned cap = g_capdfree ? g_capdfree * 2 : 1024;
++        if (cap > 65536) return 0;
++        nvmtl_dfree_ent *grown = (nvmtl_dfree_ent *)realloc(g_dfree, cap * sizeof *grown);
++        if (!grown) return 0;
++        g_dfree = grown; g_capdfree = cap;
++    }
++    g_dfree[g_ndfree++] = (nvmtl_dfree_ent){ pool, set };
++    return 1;
++}
++// up to n retired sets of one pool
++static unsigned nvmtl_dfree_take(unsigned n, VkDescriptorSet *out, VkDescriptorPool *pool)
++{
++    unsigned got = 0;
++    if (!g_ndfree) return 0;
++    *pool = g_dfree[g_ndfree - 1].pool;
++    while (got < n && g_ndfree && g_dfree[g_ndfree - 1].pool == *pool) out[got++] = g_dfree[--g_ndfree].set;
++    g_dfree_reused += got;
++    if (((g_dfree_reused - got) >> 16) != (g_dfree_reused >> 16))
++        nvlog("vk: descriptor sets: %llu reused, %llu allocated, %u waiting", g_dfree_reused, g_dfree_allocated, g_ndfree);
++    return got;
++}
+ static unsigned nvmtl_desc_batch(void)
+ {
+     static int n = -1;
+@@ -2680,7 +2721,9 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
+         VkDescriptorSetLayout ls[NVMTL_DESC_BATCH_MAX];
+         VkDescriptorSet got[NVMTL_DESC_BATCH_MAX];
+         for (unsigned k = 0; k < NVMTL_DESC_BATCH_MAX; k++) ls[k] = g_setLayout;
+-        for (;;) {
++        unsigned taken = nvmtl_dfree_take(n, got, &pool);
++        if (taken) { n = taken; r = VK_SUCCESS; }
++        else for (;;) {
+             r = VK_ERROR_OUT_OF_POOL_MEMORY;
+             for (unsigned k = g_ndescPools; k-- > 0 && r != VK_SUCCESS;) {
+                 VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, g_descPools[k], n, ls };
+@@ -2693,6 +2736,7 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
+             if (r == VK_SUCCESS || n == 1) break;
+             n = 1;
+         }
++        if (r == VK_SUCCESS && !taken) g_dfree_allocated += n;
+         if (r == VK_SUCCESS) {
+             set = got[0];
+             c->dcachepool = (void *)pool;
+@@ -5033,9 +5077,10 @@ static void nvmtl_cmd_retire(nvk_cmdbuf *c)
+     free(c->rvs); c->rvs = NULL; c->nrv = c->caprv = 0;
+     if (c->ndcache) {
+         pthread_mutex_lock(&g_desc_lock);
+-        VkDescriptorSet back[NVMTL_DESC_BATCH_MAX];
+-        for (unsigned i = 0; i < c->ndcache && i < NVMTL_DESC_BATCH_MAX; i++) back[i] = (VkDescriptorSet)c->dcache[i];
+-        pvkFreeDescriptorSets(g_dev, (VkDescriptorPool)c->dcachepool, c->ndcache, back);
++        VkDescriptorSet back[NVMTL_DESC_BATCH_MAX]; unsigned nb = 0;
++        for (unsigned i = 0; i < c->ndcache && i < NVMTL_DESC_BATCH_MAX; i++)
++            if (!nvmtl_dfree_put((VkDescriptorPool)c->dcachepool, (VkDescriptorSet)c->dcache[i])) back[nb++] = (VkDescriptorSet)c->dcache[i];
++        if (nb) pvkFreeDescriptorSets(g_dev, (VkDescriptorPool)c->dcachepool, nb, back);
+         pthread_mutex_unlock(&g_desc_lock);
+         c->ndcache = 0; c->dcachepool = NULL;
+     }
+@@ -5043,8 +5088,11 @@ static void nvmtl_cmd_retire(nvk_cmdbuf *c)
+         pthread_mutex_lock(&g_desc_lock);
+         for (unsigned i = 0; i < c->nsets;) {
+             VkDescriptorPool p = (VkDescriptorPool)c->sets[i].pool; VkDescriptorSet run[256]; unsigned n = 0;
+-            while (i < c->nsets && c->sets[i].pool == (void *)p && n < 256) run[n++] = (VkDescriptorSet)c->sets[i++].set;
+-            pvkFreeDescriptorSets(g_dev, p, n, run);
++            while (i < c->nsets && c->sets[i].pool == (void *)p && n < 256) {
++                VkDescriptorSet one = (VkDescriptorSet)c->sets[i++].set;
++                if (!nvmtl_dfree_put(p, one)) run[n++] = one;
++            }
++            if (n) pvkFreeDescriptorSets(g_dev, p, n, run);
+         }
+         pthread_mutex_unlock(&g_desc_lock);
+     }

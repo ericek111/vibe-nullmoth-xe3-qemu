@@ -1,0 +1,51 @@
+From 652beecf842941c062b6882406d512ff260bd794 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 22:15:49 +0200
+Subject: [PATCH 16/47] plugin: WindowServer's commitAndWaitUntilSubmitted
+ waits only until scheduled when flips are ordered
+
+With debug.nmxfb_blob_ordered=1 the VM display orders each flip after the
+surface's copy-out (NMXAccel), so WindowServer no longer waits for the GPU:
+its main thread prepares the next frame while the GPU draws this one.
+Window drag: ~50 -> ~85-110 presents/s, gaps mostly under 20 ms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ plugin/NVMTLObjects.m | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/plugin/NVMTLObjects.m b/plugin/NVMTLObjects.m
+index ce8722c..75c824f 100644
+--- a/plugin/NVMTLObjects.m
++++ b/plugin/NVMTLObjects.m
+@@ -4,6 +4,7 @@
+  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+  */
+ 
++#include <sys/sysctl.h>
+ #import <QuartzCore/QuartzCore.h>
+ #import <Foundation/Foundation.h>
+ #import <Metal/Metal.h>
+@@ -4802,12 +4803,19 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
+ // The display-pipe swap follows this call immediately in WindowServer. NVAccel
+ // cannot order that swap after an NVK fence, so wait for the pixels to finish
+ // before allowing the surface to become scanout. Other applications keep the
+-// normal submission-only contract.
++// normal submission-only contract. A VM display that orders its flips itself
++// (NMXAccel: the flip waits until the surface's copy-out moved its lock seed,
++// debug.nmxfb_blob_ordered) needs no wait here, and WindowServer's main thread
++// then prepares the next frame while the GPU draws this one.
++static int nvmtl_flips_ordered(void) {
++    int v = 0; size_t n = sizeof v;
++    return sysctlbyname("debug.nmxfb_blob_ordered", &v, &n, NULL, 0) == 0 && v == 1;
++}
+ - (BOOL)commitAndWaitUntilSubmitted {
+     static int ws = -1;
+     if (ws < 0) ws = (getprogname() && !strcmp(getprogname(), "WindowServer")) ? 1 : 0;
+     [self commit];
+-    if (ws) [self waitUntilCompleted]; else [self waitUntilScheduled];
++    if (ws && !nvmtl_flips_ordered()) [self waitUntilCompleted]; else [self waitUntilScheduled];
+     return self.status != MTLCommandBufferStatusError;
+ }
+ - (void)commit { [self nvmtlSubmitWithEvents]; }

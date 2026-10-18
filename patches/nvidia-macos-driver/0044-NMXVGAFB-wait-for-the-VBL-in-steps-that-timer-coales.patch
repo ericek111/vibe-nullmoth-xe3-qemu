@@ -1,0 +1,94 @@
+From f70240bd7aebff13539ee6971c00e9f546e93a99 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 21:43:42 +0200
+Subject: [PATCH 44/47] NMXVGAFB: wait for the VBL in steps that timer
+ coalescing cannot carry past it
+
+A kernel thread's timer gets kernel_task coalescing leeway whatever its
+scheduling policy: distance >> 3, at most 1 ms (kern.timer_coalesce_kt_*).
+Armed a refresh ahead, the VBL fired 0.95 ms late at p50 (bimodal: on time
+or ~1 ms late), so the VBL interval alternated 9.3/7.5 ms around each host
+answer. The VBL thread now sleeps 8/9 of the remaining time per step and
+the last step is under 20 us out: idle lateness p50 953 -> 44 us, p90
+1050 -> 121 us. Drag frame intervals p95 8.80 -> 8.63 ms at ~118 fps.
+debug.nmxfb_vbl_stepped=0 restores the single wait for comparison.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ kexts/NMXVGAFB/nmxvgafb.cpp | 26 +++++++++++++++++++++-----
+ 1 file changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/kexts/NMXVGAFB/nmxvgafb.cpp b/kexts/NMXVGAFB/nmxvgafb.cpp
+index b8c78a8..f3059f6 100644
+--- a/kexts/NMXVGAFB/nmxvgafb.cpp
++++ b/kexts/NMXVGAFB/nmxvgafb.cpp
+@@ -47,6 +47,7 @@ class NMXVGAFB : public IOFramebuffer {
+     volatile bool fVblThreadDone = false;
+     void vblArm(uint64_t) { thread_wakeup((event_t)&fVblNext); }
+     static void vblThreadMain(void *p0, wait_result_t);
++    static constexpr uint64_t kVblNearNs = 20000;   // the VBL wait's last step: at most this far out (see vblThreadMain)
+     uint64_t fVblNext = 0;
+     // VBL phase: while frames flow, the host's answer to a flip's fenced flush is the vblank (QEMU releases the guest
+     // at a fixed phase of its panel's refresh); the timer runs on from the last one. fVblLock orders the two callers.
+@@ -390,6 +391,10 @@ static uint32_t gVblLeadUs = 0;
+ SYSCTL_UINT(_debug, OID_AUTO, nmxfb_vbl_lead_us, CTLFLAG_RW | CTLFLAG_LOCKED, &gVblLeadUs, 0,
+             "NMXVGAFB: VBL this long (us) before the host's latch point (QEMU 0007 fenced flush answers); 0: on it, as on a real display");
+ 
++static uint32_t gVblStepped = 1;
++SYSCTL_UINT(_debug, OID_AUTO, nmxfb_vbl_stepped, CTLFLAG_RW | CTLFLAG_LOCKED, &gVblStepped, 0,
++            "NMXVGAFB: wait for the VBL in steps that timer coalescing cannot carry past it; 0: one wait (up to 1 ms late)");
++
+ void NMXVGAFB::hostLatch(uint64_t at)
+ {
+     if (!fVblLock || !fVblTimer) return;
+@@ -427,12 +432,21 @@ void NMXVGAFB::vblThreadMain(void *p0, wait_result_t)
+     NMXVGAFB *me = (NMXVGAFB *)p0;
+     IOLockLock(me->fVblLock);
+     while (!me->fStopping) {
+-        // (assert_wait_deadline_with_leeway, critical urgency, isn't exported to kexts; a time-constraint thread's
+-        // timers are not coalesced)
+-        assert_wait_deadline((event_t)&me->fVblNext, THREAD_UNINT, me->fVblNext);
++        /*
++         * A kernel thread's timer is coalesced like any kernel_task timer, time-constraint policy or not: up to 1/8 of
++         * the distance to it, at most 1 ms (kern.timer_coalesce_kt_scale / _kt_ns_max). Armed a refresh ahead, the VBL
++         * fired 0.95 ms late at p50 (bimodal: on time or ~1 ms late), so WindowServer's frame clock jumped by a ms and
++         * it composited late and dropped refreshes. (assert_wait_deadline_with_leeway with critical urgency isn't
++         * exported to kexts.) So the wait goes in steps of 8/9 of what is left, which even the full leeway cannot
++         * carry past the VBL; the last steps are microseconds away and get next to none (p50 ~40 us late).
++         */
++        const uint64_t due = me->fVblNext, now = mach_absolute_time();
++        uint64_t near; nanoseconds_to_absolutetime(kVblNearNs, &near);
++        const uint64_t wake = gVblStepped && due > now + near ? now + (due - now) / 9 * 8 : due;
++        assert_wait_deadline((event_t)&me->fVblNext, THREAD_UNINT, wake);
+         IOLockUnlock(me->fVblLock);
+         const wait_result_t w = thread_block(THREAD_CONTINUE_NULL);
+-        if (w == THREAD_TIMED_OUT && !me->fStopping) vblFire(me);
++        if (w == THREAD_TIMED_OUT && !me->fStopping && wake == due) vblFire(me);
+         IOLockLock(me->fVblLock);
+     }
+     me->fVblThreadDone = true;
+@@ -654,6 +668,7 @@ bool NMXVGAFB::start(IOService *provider)
+         sysctl_register_oid(&sysctl__debug_nmxfb_vtiming);
+         sysctl_register_oid(&sysctl__debug_nmxfb_vtrace);
+         sysctl_register_oid(&sysctl__debug_nmxfb_vbl_lead_us);
++        sysctl_register_oid(&sysctl__debug_nmxfb_vbl_stepped);
+         sysctl_register_oid(&sysctl__debug_nmxfb_shot);
+     }
+     nanoseconds_to_absolutetime(fFrameNs, &fPeriodAbs);
+@@ -672,7 +687,7 @@ bool NMXVGAFB::start(IOService *provider)
+     // No registerPowerDriver here (NMIntelFB has one): IOFramebuffer::start sets up power management with its own
+     // power states, and a second registration with two states panicked in a power-change callout (read at 0x120).
+     VFBLOG("%ux%u pitch %u at 0x%llx adopted from the firmware, %u Hz%s", fWidth, fHeight, fRowBytes,
+-           (unsigned long long)fBase, fHz, fVblTimer ? " (VBL thread, time-constraint)" : ", NO VBL TIMER");
++           (unsigned long long)fBase, fHz, fVblTimer ? " (VBL thread, time-constraint, stepped wait)" : ", NO VBL TIMER");
+     if (fSurfMap && (fHoldCap = thread_call_allocate(holdCapFire, this))) {
+         fHolding = 1; adjustBusy(1);
+         uint64_t d; clock_interval_to_deadline(kHoldCapSec, kSecondScale, &d);
+@@ -692,6 +707,7 @@ void NMXVGAFB::stop(IOService *provider)
+         sysctl_unregister_oid(&sysctl__debug_nmxfb_vtiming);
+         sysctl_unregister_oid(&sysctl__debug_nmxfb_vtrace);
+         sysctl_unregister_oid(&sysctl__debug_nmxfb_vbl_lead_us);
++        sysctl_unregister_oid(&sysctl__debug_nmxfb_vbl_stepped);
+         sysctl_unregister_oid(&sysctl__debug_nmxfb_shot);
+     }
+     if (fHoldCap) { thread_call_cancel(fHoldCap); while (!thread_call_free(fHoldCap)) { thread_call_cancel(fHoldCap); IOSleep(5); } fHoldCap = nullptr; }

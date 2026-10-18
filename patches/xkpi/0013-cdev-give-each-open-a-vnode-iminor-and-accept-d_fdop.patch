@@ -1,0 +1,58 @@
+From 78ad1f836f3b78462827a6459b279d733f970c22 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 04:38:15 +0200
+Subject: [PATCH 13/50] cdev: give each open a vnode (iminor) and accept
+ d_fdopen's ENXIO-after-finit success; /dev/dri opens failed with ENODEV
+
+---
+ override/src/nmx_linux_cdev.c | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/gpu-port/xkpi/override/src/nmx_linux_cdev.c b/gpu-port/xkpi/override/src/nmx_linux_cdev.c
+index 2534b0a..5d09a7b 100644
+--- a/gpu-port/xkpi/override/src/nmx_linux_cdev.c
++++ b/gpu-port/xkpi/override/src/nmx_linux_cdev.c
+@@ -20,6 +20,7 @@
+ #include <sys/mutex.h>
+ #include <sys/conf.h>
+ #include <sys/file.h>
++#include <sys/vnode.h>
+ #include <sys/uio.h>
+ #include <sys/proc.h>
+ #include <sys/stdarg.h>
+@@ -188,6 +189,7 @@ struct nmx_open {
+     d_priv_dtor_t *priv_dtor;
+     struct mtx maps_mtx;
+     TAILQ_HEAD(, nmx_umap) maps;        /* user mappings made through this open */
++    struct vnode vn;                    /* the open's inode: LinuxKPI passes file->f_vnode to the driver's open */
+ };
+ 
+ #define OPEN_BUCKETS 64
+@@ -273,12 +275,26 @@ int nmx_cdev_open(void *cookie, int open_id, int fflags)
+     o->cdev = c;
+     mtx_init(&o->maps_mtx, "nmx umaps", NULL, MTX_DEF);
+     TAILQ_INIT(&o->maps);
++    /*
++     * LinuxKPI's linux_dev_fdopen() hands file->f_vnode to the driver's open as the inode, and iminor() reads the
++     * DRM minor from its v_rdev. Without one, drm_open() looked up minor -1 and every open of /dev/dri/* failed with
++     * ENODEV (so Mesa found no GPU). The vnode lives with the open record.
++     */
++    o->vn.v_rdev = c;
++    o->vn.v_type = VCHR;
++    o->vn.v_usecount = 1;
++    fp->f_vnode = &o->vn;
+ 
+     struct nmx_open *prev = enter(o);
+     struct nmx_bsd_cdevsw *sw = c->si_devsw;
+     int err = 0;
+-    if (sw->d_fdopen != NULL)
++    if (sw->d_fdopen != NULL) {
+         err = sw->d_fdopen(c, fflags, curthread, fp);
++        /* FreeBSD's d_fdopen convention: ENXIO after finit() means "the file was replaced", i.e. success
++           (linux_dev_fdopen always ends that way); nmx_cdev_close already expects the replaced f_ops */
++        if (err == ENXIO && fp->f_ops != NULL)
++            err = 0;
++    }
+     else if (sw->d_open != NULL)
+         err = sw->d_open(c, fflags, 0x2000 /* S_IFCHR */, curthread);
+     if (err) {

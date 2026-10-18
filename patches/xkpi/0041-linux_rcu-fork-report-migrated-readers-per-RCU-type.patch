@@ -1,0 +1,36 @@
+From 67cb2bb43a6a6116be393aae705b1c636276778d Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 21:17:48 +0200
+Subject: [PATCH 41/50] linux_rcu fork: report migrated readers per RCU type
+
+SRCU readers migrate at boot and used up the shared cap of 8 reports, so a
+regular-RCU migration (the kind that leaked a record) would go unreported.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ fork_linux_rcu.py | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/gpu-port/xkpi/fork_linux_rcu.py b/gpu-port/xkpi/fork_linux_rcu.py
+index 9ef276e..f914758 100644
+--- a/gpu-port/xkpi/fork_linux_rcu.py
++++ b/gpu-port/xkpi/fork_linux_rcu.py
+@@ -48,7 +48,7 @@ nmx_record_unlock(struct linux_epoch_record *record)
+ }
+ 
+ /* macOS port: reports of a reader that unlocked on another CPU than it locked on, and of grace-period stalls */
+-static volatile int nmx_rcu_migrations;
++static volatile int nmx_rcu_migrations[RCU_TYPE_MAX];	/* per type: SRCU's boot-time ones would hide RCU's */
+ static volatile int nmx_rcu_reports;
+ #define	NMX_RCU_REPORTS_MAX	8
+ """)
+@@ -110,7 +110,7 @@ replace_once("""	record = &DPCPU_GET(linux_epoch_record[type]);
+ 		}
+ 		record = &DPCPU_ID_GET(cpu1 - 1, linux_epoch_record[type]);
+ 		if (cpu1 - 1 != curcpu) {
+-			int n = atomic_fetchadd_int(&nmx_rcu_migrations, 1);
++			int n = atomic_fetchadd_int(&nmx_rcu_migrations[type], 1);
+ 
+ 			if (n < NMX_RCU_REPORTS_MAX)
+ 				printf("NullMoth xkpi: RCU(%u) reader tid %d "

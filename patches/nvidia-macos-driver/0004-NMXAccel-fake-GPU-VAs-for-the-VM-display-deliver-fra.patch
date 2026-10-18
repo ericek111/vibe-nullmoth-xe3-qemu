@@ -1,0 +1,54 @@
+From 78c6cfebc1ffa886c2a3d833965dd8601fb0d379 Mon Sep 17 00:00:00 2001
+From: erik <eb.skola@gmail.com>
+Date: Fri, 16 Oct 2026 15:28:03 +0200
+Subject: [PATCH 04/47] NMXAccel: fake GPU VAs for the VM display; deliver
+ framebuffer_did_power_on when arming (untested)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ kexts/NVRM/accel/nvrm-accel.cpp | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/kexts/NVRM/accel/nvrm-accel.cpp b/kexts/NVRM/accel/nvrm-accel.cpp
+index d5d5767..90f1c2f 100644
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -557,6 +557,16 @@ public:
+                 ALOG("sysctl debug.nvaccelfb=%d: scanout-backed display pipe ENABLED, re-delivering the mode change", how);
+                 gAccel->deliverModeChange();
+             }
++#ifdef NMX_ACCEL
++            // A VM display has no power transitions of its own (NMXVGAFB registers no power driver: a second
++            // registration over IOFramebuffer's panicked), so the "did power on" that activates a display pipe never
++            // came and the family refused every transaction ("Fallback GPU Display Pipe transaction submission
++            // failed"). Deliver it for each registered head.
++            if (gNmxVmDisplay && gAccel->fDM) {
++                for (unsigned i = 0; i < gAccel->fDM->getFramebufferCount(); i++) gAccel->fDM->framebuffer_did_power_on(i);
++                gAccel->reportPipeGates("after framebuffer_did_power_on");
++            }
++#endif
+             if (gAccel->fRegLock) IOLockUnlock(gAccel->fRegLock);
+             return;
+         }
+@@ -1788,6 +1798,20 @@ static unsigned long long nvAccelGpuVaAlloc(IOAccelMemoryMap *map,
+     NVMemoryMap *mm = OSDynamicCast(NVMemoryMap, map);
+     if (!mm || !len) return 0;
+     if (mm->fGpuVa) return mm->fGpuVa;
++#ifdef NMX_ACCEL
++    {
++        // AMD/Intel: Metal's GPU work runs on Mesa's own GPU VM (RADV/ANV), so the family's per-task GPU address of a
++        // mapping is only a unique number to it (WindowServer's mapping of the scanout resource asked for one; with
++        // none, nothing was ever presented). A bump allocator in a range no GPU uses.
++        static volatile SInt64 gNmxNextVa = 0x100000000000ll;
++        unsigned long long a = align > 0x10000 ? align : 0x10000;
++        unsigned long long sz = (len + a - 1) & ~(a - 1);
++        unsigned long long va = (unsigned long long)OSAddAtomic64((SInt64)(sz + a), &gNmxNextVa);
++        va = (va + a - 1) & ~(a - 1);
++        mm->fGpuVa = va; mm->fVaLen = len; mm->fMapped = true;
++        return va;
++    }
++#endif
+ 
+     struct NVRMRmHandles h;
+     if (!nvAccelRmHandles(&h)) return 0;

@@ -1,0 +1,39 @@
+From ad4c62f843cf0151d47165eaee8b867b286cdc89 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 15:03:54 +0200
+Subject: [PATCH 35/50] diag: log userptr pin and bind-ops copy failures
+ (temporary)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ fork_xe.py               | 4 ++++
+ override/xe/nmx_xe_hmm.c | 3 +++
+ 2 files changed, 7 insertions(+)
+
+diff --git a/gpu-port/xkpi/fork_xe.py b/gpu-port/xkpi/fork_xe.py
+index 95a0d65..6f48549 100644
+--- a/gpu-port/xkpi/fork_xe.py
++++ b/gpu-port/xkpi/fork_xe.py
+@@ -136,3 +136,7 @@ print("xe fork applied")
+ # debug.nmxgpu_dump (override/xe/nmx_xe_debug.c): the probed device prints its GuC, queue and fence state on demand
+ edit("xe_pci.c", [("\terr = xe_device_probe(xe);\n\tif (err)\n\t\treturn err;\n",
+      "\terr = xe_device_probe(xe);\n\tif (err)\n\t\treturn err;\n\t{ void nmx_xe_debug_register(struct xe_device *); nmx_xe_debug_register(xe); }\n", 1)])
++
++# TEMPORARY (2026-10-16): a VM_BIND that fails with EFAULT in WindowServer only - say which copy failed
++edit("xe_vm.c", [("\t\t\terr = -EFAULT;\n\t\t\tgoto free_bind_ops;\n",
++     "\t\t\terr = -EFAULT;\n\t\t\tprintf(\"xe vm_bind: copying %u bind ops from 0x%llx failed\\n\", args->num_binds, (unsigned long long)args->vector_of_binds);\n\t\t\tgoto free_bind_ops;\n", 1)])
+diff --git a/gpu-port/xkpi/override/xe/nmx_xe_hmm.c b/gpu-port/xkpi/override/xe/nmx_xe_hmm.c
+index a8a4cd9..ea499eb 100644
+--- a/gpu-port/xkpi/override/xe/nmx_xe_hmm.c
++++ b/gpu-port/xkpi/override/xe/nmx_xe_hmm.c
+@@ -97,6 +97,9 @@ int xe_hmm_userptr_populate_range(struct xe_userptr_vma *uvma, bool is_mm_mmap_l
+ 	}
+ 	pinned = get_user_pages_remote(NULL, mm, start, npages, write ? FOLL_WRITE : 0, pages, NULL);
+ 	mmput(mm);
++	if (pinned < 0 || (unsigned long)pinned != npages)
++		printf("xe userptr: pinning 0x%llx + %lu pages (%s) failed: %ld\n", (unsigned long long)start, npages,
++		       write ? "write" : "read", pinned);
+ 	if (pinned < 0) {
+ 		ret = pinned;
+ 		goto free_pages;

@@ -1,0 +1,237 @@
+From 424ff267161189bac9ef6fca3e26dd7e16737169 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 11:21:16 +0200
+Subject: [PATCH 33/50] highmem: kunmap writes a non-write-back page's lines
+ out of the CPU cache
+
+The kernel view of a page stays write-back on macOS. TTM clears pooled write-combined pages through it,
+and the dirty lines were later written back over the GPU's non-snooped writes: a 64 MB fill into
+HOST_COHERENT (write-combined) memory read back up to 10% zeros.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ override/include/linux/highmem.h | 214 +++++++++++++++++++++++++++++++
+ 1 file changed, 214 insertions(+)
+ create mode 100644 override/include/linux/highmem.h
+
+diff --git a/gpu-port/xkpi/override/include/linux/highmem.h b/gpu-port/xkpi/override/include/linux/highmem.h
+new file mode 100644
+index 0000000..568b048
+--- /dev/null
++++ b/gpu-port/xkpi/override/include/linux/highmem.h
+@@ -0,0 +1,214 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (c) 2010 Isilon Systems, Inc.
++ * Copyright (c) 2016 Matthew Macy (mmacy@mattmacy.io)
++ * Copyright (c) 2017 Mellanox Technologies, Ltd.
++ * Copyright (c) 2021 Vladimir Kondratyev <wulf@FreeBSD.org>
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are
++ * met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++/* macOS port copy of LinuxKPI highmem.h: kunmap flushes non-write-back pages (see nmx_kunmap_flush) */
++#ifndef _LINUXKPI_LINUX_HIGHMEM_H_
++#define _LINUXKPI_LINUX_HIGHMEM_H_
++
++#include <sys/types.h>
++#include <sys/lock.h>
++#include <sys/mutex.h>
++#include <sys/proc.h>
++#include <sys/sched.h>
++#include <sys/sf_buf.h>
++
++#include <vm/vm.h>
++#include <vm/vm_page.h>
++#include <vm/pmap.h>
++
++#include <linux/mm.h>
++#include <linux/page.h>
++#include <linux/hardirq.h>
++
++#define	PageHighMem(p)		(0)
++
++static inline struct page *
++kmap_to_page(void *addr)
++{
++
++	return (virt_to_page(addr));
++}
++
++static inline void *
++kmap(struct page *page)
++{
++	struct sf_buf *sf;
++
++	if (PMAP_HAS_DMAP) {
++		return (PHYS_TO_DMAP(page_to_phys(page)));
++	} else {
++		sched_pin();
++		sf = sf_buf_alloc(page, SFB_NOWAIT | SFB_CPUPRIVATE);
++		if (sf == NULL) {
++			sched_unpin();
++			return (NULL);
++		}
++		return (sf_buf_kva(sf));
++	}
++}
++
++static inline void *
++kmap_atomic_prot(struct page *page, pgprot_t prot)
++{
++	vm_memattr_t attr = pgprot2cachemode(prot);
++
++	if (attr != VM_MEMATTR_DEFAULT) {
++		page->flags |= PG_FICTITIOUS;
++		pmap_page_set_memattr(page, attr);
++	}
++	return (kmap(page));
++}
++
++static inline void *
++kmap_atomic(struct page *page)
++{
++
++	return (kmap_atomic_prot(page, VM_PROT_ALL));
++}
++
++static inline void *
++kmap_local_page(struct page *page)
++{
++	return (kmap(page));
++}
++
++static inline void *
++kmap_local_folio(struct folio *folio, size_t offset)
++{
++	struct page *page;
++	char *vaddr;
++
++	page = &folio->page;
++	vaddr = kmap_local_page(page);
++	vaddr += offset;
++
++	return (vaddr);
++}
++
++static inline void *
++kmap_local_page_prot(struct page *page, pgprot_t prot)
++{
++
++	return (kmap_atomic_prot(page, prot));
++}
++
++/*
++ * macOS port: the kernel's view of a page (PHYS_TO_DMAP) is always write-back; a kext cannot make it write-combined as
++ * Linux's set_pages_wc does. A page the GPU reads and writes without snooping (write-combined or uncached: an iGPU's
++ * HOST_COHERENT memory) that the kernel touched through that view - TTM clears pooled pages with kmap + clear_page -
++ * kept dirty lines in the CPU cache that were later written back over what the GPU wrote (64 MB vkCmdFillBuffer: up
++ * to 10% of the words read back as the zeros of the clear). So ending such a kernel view writes its lines out.
++ */
++static inline void
++nmx_kunmap_flush(struct page *page, void *addr)
++{
++	if (page != NULL && addr != NULL && page->md.pat_mode != VM_MEMATTR_WRITE_BACK) {
++		vm_offset_t va = (vm_offset_t)addr & ~(vm_offset_t)PAGE_MASK;
++		pmap_invalidate_cache_range(va, va + PAGE_SIZE);
++	}
++}
++
++static inline void
++kunmap(struct page *page)
++{
++	struct sf_buf *sf;
++
++	if (PMAP_HAS_DMAP)
++		nmx_kunmap_flush(page, PHYS_TO_DMAP(page_to_phys(page)));
++	if (!PMAP_HAS_DMAP) {
++		/* lookup SF buffer in list */
++		sf = sf_buf_alloc(page, SFB_NOWAIT | SFB_CPUPRIVATE);
++
++		/* double-free */
++		sf_buf_free(sf);
++		sf_buf_free(sf);
++
++		sched_unpin();
++	}
++}
++
++static inline void
++kunmap_atomic(void *vaddr)
++{
++
++	if (PMAP_HAS_DMAP)
++		nmx_kunmap_flush(virt_to_page(vaddr), vaddr);
++	else
++		kunmap(virt_to_page(vaddr));
++}
++
++static inline void
++kunmap_local(void *addr)
++{
++
++	kunmap_atomic(addr);
++}
++
++static inline void
++memcpy_from_page(char *to, struct page *page, size_t offset, size_t len)
++{
++	char *from;
++
++	KASSERT(offset + len <= PAGE_SIZE,
++	    ("%s: memcpy from page %p to address %p: "
++	     "offset+len (%zu+%zu) would go beyond page end",
++	     __func__, page, to, offset, len));
++
++	from = kmap_local_page(page);
++	memcpy(to, from + offset, len);
++	kunmap_local(from);
++}
++
++static inline void
++memcpy_to_page(struct page *page, size_t offset, const char *from, size_t len)
++{
++	char *to;
++
++	KASSERT(offset + len <= PAGE_SIZE,
++	    ("%s: memcpy from address %p to page %p: "
++	     "offset+len (%zu+%zu) would go beyond page end",
++	     __func__, from, page, offset, len));
++
++	to = kmap_local_page(page);
++	memcpy(to + offset, from, len);
++	kunmap_local(to);
++}
++
++static inline void
++memcpy_to_folio(struct folio *folio, size_t offset, const char *from, size_t len)
++{
++	struct page *page;
++
++	page = &folio->page;
++	memcpy_to_page(page, offset, from, len);
++}
++
++#endif	/* _LINUXKPI_LINUX_HIGHMEM_H_ */

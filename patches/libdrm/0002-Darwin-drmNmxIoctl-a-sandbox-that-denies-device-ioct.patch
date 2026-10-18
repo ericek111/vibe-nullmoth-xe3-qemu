@@ -1,0 +1,182 @@
+From e7d6dcc7fe44fae165e3a9f67030585b3867fdb7 Mon Sep 17 00:00:00 2001
+From: erik <eb.skola@gmail.com>
+Date: Fri, 16 Oct 2026 11:00:45 +0200
+Subject: [PATCH 2/5] Darwin: drmNmxIoctl - a sandbox that denies device ioctls
+ reaches the node through NMXGPU's IOKit user client
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ core-symbols.txt |   1 +
+ meson.build      |   2 +
+ xf86drm.c        | 101 +++++++++++++++++++++++++++++++++++++++++++++++
+ xf86drm.h        |   4 ++
+ 4 files changed, 108 insertions(+)
+
+diff --git a/core-symbols.txt b/core-symbols.txt
+index 766c342d..f0a73a1f 100644
+--- a/core-symbols.txt
++++ b/core-symbols.txt
+@@ -86,6 +86,7 @@ drmHashInsert
+ drmHashLookup
+ drmHashNext
+ drmIoctl
++drmNmxIoctl
+ drmIsKMS
+ drmIsMaster
+ drmMalloc
+diff --git a/meson.build b/meson.build
+index 5bc9388d..e3348ac7 100644
+--- a/meson.build
++++ b/meson.build
+@@ -265,6 +265,8 @@ libdrm = library(
+   include_directories : inc_drm,
+   install : true,
+   kwargs : libdrm_kw,
++  # Darwin: drmNmxIoctl reaches NMXGPU's DRM user client through IOKit
++  link_args : host_machine.system() == 'darwin' ? ['-framework', 'IOKit', '-framework', 'CoreFoundation'] : [],
+   gnu_symbol_visibility : 'hidden',
+ )
+ 
+diff --git a/xf86drm.c b/xf86drm.c
+index 589bda8d..2e46aba6 100644
+--- a/xf86drm.c
++++ b/xf86drm.c
+@@ -743,7 +743,11 @@ drmIoctl(int fd, unsigned long request, void *arg)
+     int ret;
+ 
+     do {
++#ifdef __APPLE__
++        ret = drmNmxIoctl(fd, request, arg);
++#else
+         ret = ioctl(fd, request, arg);
++#endif
+     } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
+     return ret;
+ }
+@@ -1023,6 +1027,11 @@ static int drmOpenMinor(int minor, int create, int type)
+     sprintf(buf, dev_name, DRM_DIR_NAME, minor);
+     if ((fd = open(buf, O_RDWR | O_CLOEXEC)) >= 0)
+         return fd;
++#ifdef __APPLE__
++    /* a sandbox that denies writing the node (WindowServer's): read-only, its ioctls go through IOKit (drmNmxIoctl) */
++    if (errno == EPERM && (fd = open(buf, O_RDONLY | O_CLOEXEC)) >= 0)
++        return fd;
++#endif
+     return -errno;
+ }
+ 
+@@ -5370,6 +5379,98 @@ drmGetFormatName(uint32_t format)
+ #ifdef __APPLE__
+ #include <pthread.h>
+ #include <sys/ioctl.h>
++#include <IOKit/IOKitLib.h>
++
++/*
++ * A sandboxed process (WindowServer) may open a DRM node read-only, but every ioctl on a device file fails with EPERM.
++ * NMXGPU offers the same node through an IOKit user client (IOAccelNMXDRMClient, which that sandbox allows): on EPERM
++ * the fd is switched to one, and every ioctl on it goes there from then on, so all its state (GEM handles, VMs,
++ * mappings) lives in one DRM file. The fd stays a real open of the node, for fstat() and device identification. A
++ * client is matched to its fd by the fd's device number: every open of a NullMoth node is its own clone minor, so a
++ * reused fd number never inherits another file's client.
++ */
++struct nmx_uc {
++    int fd;
++    dev_t rdev;
++    io_connect_t conn;
++    struct nmx_uc *next;
++};
++static struct nmx_uc *nmx_ucs;
++static pthread_mutex_t nmx_ucs_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static io_connect_t nmx_uc_get(int fd, int create)
++{
++    struct stat st;
++    struct nmx_uc *u, **pp;
++    io_connect_t conn = 0;
++
++    if (fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode))
++        return 0;
++    pthread_mutex_lock(&nmx_ucs_lock);
++    for (pp = &nmx_ucs; (u = *pp) != NULL; pp = &u->next) {
++        if (u->fd != fd)
++            continue;
++        if (u->rdev == st.st_rdev) {
++            conn = u->conn;
++            break;
++        }
++        /* the fd number now names another open: its old client is stale */
++        *pp = u->next;
++        IOServiceClose(u->conn);
++        free(u);
++        break;
++    }
++    if (!conn && create) {
++        io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NMXGPU"));
++        if (svc) {
++            if (IOServiceOpen(svc, mach_task_self(), 'NMXD', &conn) != KERN_SUCCESS)
++                conn = 0;
++            IOObjectRelease(svc);
++        }
++        if (conn && (u = malloc(sizeof(*u))) != NULL) {
++            u->fd = fd;
++            u->rdev = st.st_rdev;
++            u->conn = conn;
++            u->next = nmx_ucs;
++            nmx_ucs = u;
++        } else if (conn) {
++            IOServiceClose(conn);
++            conn = 0;
++        }
++    }
++    pthread_mutex_unlock(&nmx_ucs_lock);
++    return conn;
++}
++
++drm_public int drmNmxIoctl(int fd, unsigned long request, void *arg)
++{
++    io_connect_t conn = nmx_uc_get(fd, 0);
++    if (!conn) {
++        int ret = ioctl(fd, request, arg);
++        if (ret == 0 || errno != EPERM)
++            return ret;
++        conn = nmx_uc_get(fd, 1);
++        if (!conn) {
++            errno = EPERM;
++            return -1;
++        }
++    }
++    uint64_t cmd = request, err = 0;
++    uint32_t nout = 1;
++    size_t len = IOCPARM_LEN(request), outlen = (request & IOC_OUT) ? len : 0;
++    kern_return_t kr = IOConnectCallMethod(conn, 0, &cmd, 1, (request & IOC_IN) ? arg : NULL,
++                                           (request & IOC_IN) ? len : 0, &err, &nout,
++                                           (request & IOC_OUT) ? arg : NULL, &outlen);
++    if (kr != KERN_SUCCESS) {
++        errno = EIO;
++        return -1;
++    }
++    if (err) {
++        errno = (int)err;
++        return -1;
++    }
++    return 0;
++}
+ 
+ /* the NullMoth DRM node ioctls (the kext's nmx_drm_uapi.h; the two must stay identical) */
+ struct nmx_drm_mmap {
+diff --git a/xf86drm.h b/xf86drm.h
+index b9f4fd40..8a141a92 100644
+--- a/xf86drm.h
++++ b/xf86drm.h
+@@ -111,6 +111,10 @@ typedef struct drmHashEntry {
+ } drmHashEntry;
+ 
+ extern int drmIoctl(int fd, unsigned long request, void *arg);
++#ifdef __APPLE__
++/* ioctl on a NullMoth DRM node; in a sandbox that denies device ioctls it goes through NMXGPU's IOKit user client */
++extern int drmNmxIoctl(int fd, unsigned long request, void *arg);
++#endif
+ extern void *drmGetHashTable(void);
+ extern drmHashEntry *drmGetEntry(int fd);
+ 

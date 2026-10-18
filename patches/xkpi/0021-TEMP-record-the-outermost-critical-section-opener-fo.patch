@@ -1,0 +1,65 @@
+From bc47c35f9d223aded3fe4f28a8b0b75dee0f947e Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 05:58:40 +0200
+Subject: [PATCH 21/50] TEMP: record the outermost critical-section opener for
+ the IRQ-leak report
+
+---
+ bsdcompat/src/nmx_kernel.c | 18 +++++++++++++++---
+ xnu/nmx_devfs.cpp          |  6 +++++-
+ 2 files changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c b/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c
+index dc71374..44e9345 100644
+--- a/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c
++++ b/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c
+@@ -258,14 +258,26 @@ struct thread *tdfind(lwpid_t tid, pid_t pid)
+  * this CPU, which also rules out preemption and migration. Nesting is counted per CPU; the interrupt state from the
+  * outermost entry is restored at the outermost exit. LinuxKPI's critical sections are short and never sleep.
+  */
+-static struct { int nest; boolean_t saved; } nmx_crit[MAXCPU];
++static struct { int nest; boolean_t saved; void *who; } nmx_crit[MAXCPU];
+ 
+-void nmx_critical_enter(void)
++__attribute__((noinline)) void nmx_critical_enter(void)
+ {
+     boolean_t was = ml_set_interrupts_enabled(FALSE);
+     int c = cpu_number();
+-    if (nmx_crit[c].nest++ == 0)
++    if (nmx_crit[c].nest++ == 0) {
+         nmx_crit[c].saved = was;
++        nmx_crit[c].who = __builtin_return_address(0);   /* TEMP diag: who opened the outermost section */
++    }
++}
++
++/* TEMP diag for the IRQ-leak check in the device-node glue */
++void nmx_crit_debug(int *nest, int *saved, void **who, void **self)
++{
++    int c = cpu_number();
++    *nest = nmx_crit[c].nest;
++    *saved = nmx_crit[c].saved;
++    *who = nmx_crit[c].who;
++    *self = (void *)nmx_critical_enter;
+ }
+ 
+ void nmx_critical_exit(void)
+diff --git a/gpu-port/xkpi/xnu/nmx_devfs.cpp b/gpu-port/xkpi/xnu/nmx_devfs.cpp
+index 17066d2..585681a 100644
+--- a/gpu-port/xkpi/xnu/nmx_devfs.cpp
++++ b/gpu-port/xkpi/xnu/nmx_devfs.cpp
+@@ -103,10 +103,14 @@ static inline bool irqs_on(void)
+     return (fl & 0x200) != 0;
+ }
+ 
++extern "C" void nmx_crit_debug(int *nest, int *saved, void **who, void **self);
+ static void irq_check(const char *what, unsigned long cmd)
+ {
+     if (!irqs_on()) {
+-        IOLog("NullMoth devfs: IRQ LEAK: %s (cmd 0x%lx) returned with interrupts disabled; re-enabling\n", what, cmd);
++        int nest, saved; void *who, *self;
++        nmx_crit_debug(&nest, &saved, &who, &self);
++        IOLog("NullMoth devfs: IRQ LEAK: %s (cmd 0x%lx) returned with interrupts disabled (crit nest %d saved %d "
++              "who %p, nmx_critical_enter at %p); re-enabling\n", what, cmd, nest, saved, who, self);
+         __asm__ __volatile__("sti" ::: "memory");
+     }
+ }

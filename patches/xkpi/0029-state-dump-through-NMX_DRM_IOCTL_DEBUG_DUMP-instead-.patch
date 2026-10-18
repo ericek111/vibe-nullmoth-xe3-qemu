@@ -1,0 +1,144 @@
+From 44cb05efd56d9282ef09f0596d846aff67285064 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 09:25:59 +0200
+Subject: [PATCH 29/50] state dump through NMX_DRM_IOCTL_DEBUG_DUMP instead of
+ a sysctl
+
+A kext-side sysctl oid links against the port's own sysctl tree (it defines sysctl_register_oid and
+sysctl__debug_children), so it registered there and never reached xnu.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ bsdcompat/include/nmx_drm_uapi.h   |  2 ++
+ bsdcompat/include/nmx_xnu.h        |  3 ++-
+ bsdcompat/include/nmxxnu/nmx_xnu.h |  3 ++-
+ override/src/nmx_linux_cdev.c      |  3 +++
+ xnu/nmx_diag.cpp                   | 40 ++++++++----------------------
+ 5 files changed, 19 insertions(+), 32 deletions(-)
+
+diff --git a/gpu-port/xkpi/bsdcompat/include/nmx_drm_uapi.h b/gpu-port/xkpi/bsdcompat/include/nmx_drm_uapi.h
+index c207800..2262075 100644
+--- a/gpu-port/xkpi/bsdcompat/include/nmx_drm_uapi.h
++++ b/gpu-port/xkpi/bsdcompat/include/nmx_drm_uapi.h
+@@ -43,4 +43,6 @@ struct nmx_drm_sysfs_get {
+ #define NMX_DRM_IOCTL_SYSFS_GET _IOWR('N', 0x42, struct nmx_drm_sysfs_get)
+ /* writes 'len' bytes of 'value' to the attribute (root only, and only a writable attribute, as on Linux) */
+ #define NMX_DRM_IOCTL_SYSFS_PUT _IOW('N', 0x43, struct nmx_drm_sysfs_get)
++/* prints the driver state (GuC, exec queues and what each waits on, hw fences) to the kernel log; vm tools/nmxdump */
++#define NMX_DRM_IOCTL_DEBUG_DUMP _IO('N', 0x44)
+ #endif
+diff --git a/gpu-port/xkpi/bsdcompat/include/nmx_xnu.h b/gpu-port/xkpi/bsdcompat/include/nmx_xnu.h
+index a9bdcfa..177d73a 100644
+--- a/gpu-port/xkpi/bsdcompat/include/nmx_xnu.h
++++ b/gpu-port/xkpi/bsdcompat/include/nmx_xnu.h
+@@ -77,9 +77,10 @@ void *nmx_xnu_pci_map_bar(void *pci, int bar_reg, int cache, uint64_t *phys, uin
+ int nmx_xnu_pci_bar_info(void *pci, int bar_reg, uint64_t *phys, uint64_t *size, int *is_io);
+ /* message-signalled interrupts: number available, and handler registration (handler runs on a work loop thread) */
+ int nmx_xnu_pci_msi_count(void *pci);
+-/* debug.nmxgpu_dump (xnu/nmx_diag.cpp): the function a write of 1 runs */
++/* the driver state dump (xnu/nmx_diag.cpp): what NMX_DRM_IOCTL_DEBUG_DUMP runs */
+ void nmx_xnu_set_dump_hook(void (*fn)(void));
+ void nmx_xnu_diag_fini(void);
++void nmx_xnu_run_dump(void);
+ int nmx_xnu_pci_irq_setup(void *pci, int vector, void (*handler)(void *), void *arg, void **cookie);
+ void nmx_xnu_pci_irq_teardown(void *cookie);
+ /* returns once a handler running on this source has finished */
+diff --git a/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_xnu.h b/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_xnu.h
+index 41fdb1f..734407e 100644
+--- a/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_xnu.h
++++ b/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_xnu.h
+@@ -77,9 +77,10 @@ void *nmx_xnu_pci_map_bar(void *pci, int bar_reg, int cache, uint64_t *phys, uin
+ int nmx_xnu_pci_bar_info(void *pci, int bar_reg, uint64_t *phys, uint64_t *size, int *is_io);
+ /* message-signalled interrupts: number available, and handler registration (handler runs on a work loop thread) */
+ int nmx_xnu_pci_msi_count(void *pci);
+-/* debug.nmxgpu_dump (xnu/nmx_diag.cpp): the function a write of 1 runs */
++/* the driver state dump (xnu/nmx_diag.cpp): what NMX_DRM_IOCTL_DEBUG_DUMP runs */
+ void nmx_xnu_set_dump_hook(void (*fn)(void));
+ void nmx_xnu_diag_fini(void);
++void nmx_xnu_run_dump(void);
+ int nmx_xnu_pci_irq_setup(void *pci, int vector, void (*handler)(void *), void *arg, void **cookie);
+ void nmx_xnu_pci_irq_teardown(void *cookie);
+ /* returns once a handler running on this source has finished */
+diff --git a/gpu-port/xkpi/override/src/nmx_linux_cdev.c b/gpu-port/xkpi/override/src/nmx_linux_cdev.c
+index 7a63f7f..99d8d70 100644
+--- a/gpu-port/xkpi/override/src/nmx_linux_cdev.c
++++ b/gpu-port/xkpi/override/src/nmx_linux_cdev.c
+@@ -393,6 +393,9 @@ int nmx_cdev_ioctl(int open_id, unsigned long cmd, void *data, int fflag)
+         err = nmx_mmap(o, data);
+     } else if (cmd == NMX_DRM_IOCTL_MUNMAP) {
+         err = nmx_munmap(o, data);
++    } else if (cmd == NMX_DRM_IOCTL_DEBUG_DUMP) {
++        nmx_xnu_run_dump();
++        err = 0;
+     } else if (o->fp->f_ops != NULL && (err = nmx_drm_node_ioctl(o->fp->f_data, cmd, data)) != -1) {
+         /* answered by the port (DRM_IOCTL_GET_PCIINFO) */
+     } else if (o->fp->f_ops != NULL) {
+diff --git a/gpu-port/xkpi/xnu/nmx_diag.cpp b/gpu-port/xkpi/xnu/nmx_diag.cpp
+index b4ed53f..e4021f0 100644
+--- a/gpu-port/xkpi/xnu/nmx_diag.cpp
++++ b/gpu-port/xkpi/xnu/nmx_diag.cpp
+@@ -1,12 +1,10 @@
+ /*
+- * debug.nmxgpu_dump: writing 1 prints the driver's state to the kernel log (`sudo sysctl debug.nmxgpu_dump=1`, then
+- * `log show`). The xe side registers what it prints (override/xe/nmx_xe_debug.c), so a stuck submission can be looked
+- * at in the running system instead of through a rebuild and reboot per question.
++ * The driver state dump: NMX_DRM_IOCTL_DEBUG_DUMP on any DRM node (vm/guest/tools/nmxdump) prints what the xe side
++ * registered (override/xe/nmx_xe_debug.c) to the kernel log, so a stuck submission can be looked at in the running
++ * system instead of through a rebuild and reboot per question. (Not a sysctl: the port has its own sysctl tree, whose
++ * sysctl_register_oid and sysctl__debug_children a kext-side oid would link against.)
+  */
+-#include <sys/types.h>
+-#include <sys/sysctl.h>
+ #include <IOKit/IOLib.h>
+-#include <libkern/OSAtomic.h>
+ #include "nmx_xnu.h"
+ #if __has_include("nmx_buildstamp.h")
+ #include "nmx_buildstamp.h"      /* written by vm/tools/cycle.sh for each test build */
+@@ -15,40 +13,22 @@
+ #endif
+ 
+ static void (*volatile g_dump)(void);
+-static bool g_registered;
+ 
+-static int dump_handler(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
++extern "C" void nmx_xnu_set_dump_hook(void (*fn)(void))
++{
++    g_dump = fn;
++}
++
++extern "C" void nmx_xnu_run_dump(void)
+ {
+-    int v = 0;
+-    int err = sysctl_handle_int(oidp, &v, 0, req);
+-    if (err != 0 || req->newptr == USER_ADDR_NULL)
+-        return err;
+     void (*fn)(void) = g_dump;
+     IOLog("NullMoth GPU: state dump (build %s)%s\n", NMX_BUILD_STAMP, fn ? "" : " - nothing registered");
+     if (fn)
+         fn();
+     IOLog("NullMoth GPU: state dump end\n");
+-    return 0;
+-}
+-
+-SYSCTL_PROC(_debug, OID_AUTO, nmxgpu_dump, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, nullptr, 0,
+-            dump_handler, "I", "write 1: print NMXGPU's driver state to the kernel log");
+-
+-extern "C" void nmx_xnu_set_dump_hook(void (*fn)(void))
+-{
+-    g_dump = fn;
+-    if (fn && !g_registered) {
+-        sysctl_register_oid(&sysctl__debug_nmxgpu_dump);
+-        g_registered = true;
+-        IOLog("NullMoth GPU: debug.nmxgpu_dump registered (oid number %d)\n", sysctl__debug_nmxgpu_dump.oid_number);
+-    }
+ }
+ 
+ extern "C" void nmx_xnu_diag_fini(void)
+ {
+     g_dump = nullptr;
+-    if (g_registered) {
+-        sysctl_unregister_oid(&sysctl__debug_nmxgpu_dump);
+-        g_registered = false;
+-    }
+ }

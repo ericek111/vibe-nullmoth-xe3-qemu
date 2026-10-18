@@ -1,0 +1,33 @@
+From 2c54173bda6c747112ae9fe1a485936410fe5940 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 20:15:49 +0200
+Subject: [PATCH 3/5] Darwin: drmNmxIoctl looks up its user client with the
+ real fstat
+
+nmx_uc_get ran on every ioctl through drm_darwin_fstat, which adds F_GETPATH and up to three sscanf calls, and that
+wrapper also puts the DRM minor into st_rdev - the same for every open of a node - so the check meant to catch a
+reused fd number never saw a difference. The raw fstat gives the clone minor each open has, for less. WindowServer
+issues ~8000 of these ioctls a second during a window drag; fcntl+sscanf were ~1.4 s of a 25 s sample.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ xf86drm.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/xf86drm.c b/xf86drm.c
+index 2e46aba6..ba5d3ebb 100644
+--- a/xf86drm.c
++++ b/xf86drm.c
+@@ -5404,7 +5404,11 @@ static io_connect_t nmx_uc_get(int fd, int create)
+     struct nmx_uc *u, **pp;
+     io_connect_t conn = 0;
+ 
+-    if (fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode))
++    /*
++     * The real fstat, not drm_darwin_fstat: the clone minor is what tells two opens apart (the DRM minor is the same
++     * for every open of a node), and this runs on every ioctl, where F_GETPATH + sscanf cost more than the call.
++     */
++    if ((fstat)(fd, &st) != 0 || !S_ISCHR(st.st_mode))
+         return 0;
+     pthread_mutex_lock(&nmx_ucs_lock);
+     for (pp = &nmx_ucs; (u = *pp) != NULL; pp = &u->next) {

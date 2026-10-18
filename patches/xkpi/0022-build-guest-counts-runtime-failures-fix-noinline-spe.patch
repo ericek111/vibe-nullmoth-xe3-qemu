@@ -1,0 +1,54 @@
+From 8b69703368eae1ce643cf605af62f421af6c4721 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 06:08:39 +0200
+Subject: [PATCH 22/50] build-guest counts runtime failures; fix noinline
+ spelling under LinuxKPI macros
+
+---
+ bsdcompat/src/nmx_kernel.c |  2 +-
+ build-guest.sh             | 11 +++++++----
+ 2 files changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c b/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c
+index 44e9345..2fe509a 100644
+--- a/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c
++++ b/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c
+@@ -260,7 +260,7 @@ struct thread *tdfind(lwpid_t tid, pid_t pid)
+  */
+ static struct { int nest; boolean_t saved; void *who; } nmx_crit[MAXCPU];
+ 
+-__attribute__((noinline)) void nmx_critical_enter(void)
++__attribute__((__noinline__)) void nmx_critical_enter(void)
+ {
+     boolean_t was = ml_set_interrupts_enabled(FALSE);
+     int c = cpu_number();
+diff --git a/gpu-port/xkpi/build-guest.sh b/gpu-port/xkpi/build-guest.sh
+index 900a9bf..736b7ea 100755
+--- a/gpu-port/xkpi/build-guest.sh
++++ b/gpu-port/xkpi/build-guest.sh
+@@ -21,18 +21,21 @@ mkdir -p fbroot fbroot/contrib
+ [ -f amd.flags ] || /opt/homebrew/bin/python3 gen_flags.py ../kpi/drm-kmod amd.flags || exit 1
+ t0=$(date +%s)
+ case "$WHAT" in
+-    all)  ./all.sh 25; ./all-i915.sh 25; ./all-xe.sh 25; ./rt.sh ;;
++    all)  ./all.sh 25; ./all-i915.sh 25; ./all-xe.sh 25; ./rt.sh | tee rt.out ;;
+     xe)   ./all-xe.sh 25 ;;
+-    rt)   ./rt.sh ;;
+-    xert) ./all-xe.sh 25; ./rt.sh ;;
++    rt)   ./rt.sh | tee rt.out ;;
++    xert) ./all-xe.sh 25; ./rt.sh | tee rt.out ;;
+     link) ;;
+     *) echo "usage: $0 [all|xe|rt|xert|link] <out>"; exit 2 ;;
+ esac
+-fail=$(( $(ls logs/*.failed 2>/dev/null | wc -l) + $(ls logs-i915/*.failed 2>/dev/null | wc -l) + $(find logs-xe -name '*.failed' | wc -l) ))
++# the runtime (rt.sh) reports its failures as "LK FAIL x" / "SRC FAIL x" lines, not .failed files
++rtfail=0; case "$WHAT" in rt|xert|all) rtfail=$(grep -c -E '^(LK|SRC|XNU) FAIL' rt.out) ;; esac
++fail=$(( rtfail + $(ls logs/*.failed 2>/dev/null | wc -l) + $(ls logs-i915/*.failed 2>/dev/null | wc -l) + $(find logs-xe -name '*.failed' | wc -l) ))
+ echo "compile failures: $fail ($(( $(date +%s) - t0 )) s)"
+ # never link stale objects over a failed compile
+ if [ "$fail" != 0 ]; then
+     for f in $(ls logs/*.failed logs-i915/*.failed 2>/dev/null; find logs-xe -name '*.failed'); do grep -m3 -A2 "error:" "${f%.failed}.log"; done
++    grep -E '^(LK|SRC|XNU) FAIL' rt.out 2>/dev/null | while read -r _ _ b; do grep -h -m3 -A2 "error:" srclog_$b.txt lklogs/$b.log 2>/dev/null; done
+     rm -rf "$OUT/NMXGPU.kext"; exit 1
+ fi
+ # rt.sh compiles every xnu/*.cpp, NMXNPU's kext stub included; it has its own kmod_info and belongs to the NPU kext

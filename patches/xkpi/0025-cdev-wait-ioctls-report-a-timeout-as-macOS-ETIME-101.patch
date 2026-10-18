@@ -1,0 +1,53 @@
+From 189ddf51ff6886d6e88f51ca8033372b12a7969c Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 07:42:14 +0200
+Subject: [PATCH 25/50] cdev: wait ioctls report a timeout as macOS ETIME
+ (101), as userland compares
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ override/src/nmx_linux_cdev.c | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/gpu-port/xkpi/override/src/nmx_linux_cdev.c b/gpu-port/xkpi/override/src/nmx_linux_cdev.c
+index 88b644e..7a63f7f 100644
+--- a/gpu-port/xkpi/override/src/nmx_linux_cdev.c
++++ b/gpu-port/xkpi/override/src/nmx_linux_cdev.c
+@@ -361,6 +361,27 @@ static int nmx_mmap(struct nmx_open *o, struct nmx_drm_mmap *req);
+ int nmx_drm_node_ioctl(struct linux_file *filp, unsigned long cmd, void *data);   /* nmx_drm_os.c: -1 = not one of its ioctls */
+ static int nmx_munmap(struct nmx_open *o, struct nmx_drm_munmap *req);
+ 
++/*
++ * A wait that runs out of time returns -ETIME on Linux, and userland tells it from an error by that errno (Mesa:
++ * "errno == ETIME" is VK_TIMEOUT, anything else a lost device). LinuxKPI defines ETIME as ETIMEDOUT (60), but macOS
++ * has its own ETIME (101), which is what userland built for macOS compares with. Only the wait ioctls are translated:
++ * elsewhere -ETIMEDOUT is a real failure (a GuC or hardware timeout) and must stay one.
++ */
++#define NMX_DARWIN_ETIME 101
++static bool nmx_is_wait_ioctl(unsigned long cmd)
++{
++    if (((cmd >> 8) & 0xff) != 'd')
++        return false;
++    switch (cmd & 0xff) {
++    case 0xC3:          /* DRM_IOCTL_SYNCOBJ_WAIT */
++    case 0xCA:          /* DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT */
++    case 0x40 + 0x0a:   /* DRM_IOCTL_XE_WAIT_USER_FENCE */
++    case 0x40 + 0x2c:   /* DRM_IOCTL_I915_GEM_WAIT */
++        return true;
++    }
++    return false;
++}
++
+ int nmx_cdev_ioctl(int open_id, unsigned long cmd, void *data, int fflag)
+ {
+     struct nmx_open *o = open_find(open_id);
+@@ -376,6 +397,8 @@ int nmx_cdev_ioctl(int open_id, unsigned long cmd, void *data, int fflag)
+         /* answered by the port (DRM_IOCTL_GET_PCIINFO) */
+     } else if (o->fp->f_ops != NULL) {
+         err = o->fp->f_ops->fo_ioctl(o->fp, cmd, data, NULL, curthread);
++        if (err == ETIMEDOUT && nmx_is_wait_ioctl(cmd))
++            err = NMX_DARWIN_ETIME;
+     } else {
+         struct nmx_bsd_cdevsw *sw = o->cdev->si_devsw;
+         err = sw->d_ioctl ? sw->d_ioctl(o->cdev, cmd, data, fflag, curthread) : ENOTTY;

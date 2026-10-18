@@ -1,0 +1,40 @@
+From 82b0cc2578c7a2177ee3cc43a09089c63efda0e5 Mon Sep 17 00:00:00 2001
+From: claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 02:18:37 +0200
+Subject: [PATCH 02/50] build-guest.sh: build NMXGPU inside the macOS VM
+
+---
+ build-guest.sh | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+ create mode 100755 build-guest.sh
+
+diff --git a/gpu-port/xkpi/build-guest.sh b/gpu-port/xkpi/build-guest.sh
+new file mode 100755
+index 0000000..acb78b8
+--- /dev/null
++++ b/gpu-port/xkpi/build-guest.sh
+@@ -0,0 +1,24 @@
++#!/bin/bash
++# build-guest.sh [all|xe|link] <out dir>: builds NMXGPU.kext in the macOS VM with Nullmoth's own scripts.
++#   all  - everything (DRM core + amdgpu, i915, xe, the runtime), then links
++#   xe   - xe only (after a fork_xe.py / override/xe change), then links
++#   link - only the link step
++# The scripts expect their Mac's layout (/Volumes/MiniData/build/gpu-src, /opt/homebrew/bin/python3); the guest
++# bootstrap (vm/guest/bootstrap.sh) makes those paths exist.
++set -uo pipefail
++X=/Volumes/MiniData/build/gpu-src/xkpi
++WHAT=${1:-all}; OUT=${2:-$HOME/build/out}
++cd "$X" || exit 1
++mkdir -p fbroot obj obj-i915 obj-xe lkobj srcobj xnuobj logs logs-i915 logs-xe lklogs srclogs xnulogs "$OUT"
++[ -f amd.flags ] || /opt/homebrew/bin/python3 gen_flags.py ../kpi/drm-kmod amd.flags || exit 1
++t0=$(date +%s)
++case "$WHAT" in
++    all)  ./all.sh 25; ./all-i915.sh 25; ./all-xe.sh 25; ./rt.sh ;;
++    xe)   ./all-xe.sh 25 ;;
++    link) ;;
++    *) echo "usage: $0 [all|xe|link] <out>"; exit 2 ;;
++esac
++fail=$(( $(ls logs/*.failed 2>/dev/null | wc -l) + $(ls logs-i915/*.failed 2>/dev/null | wc -l) + $(find logs-xe -name '*.failed' | wc -l) ))
++echo "compile failures: $fail ($(( $(date +%s) - t0 )) s)"
++rm -rf "$OUT/NMXGPU.kext"
++kext/build.sh "$OUT"

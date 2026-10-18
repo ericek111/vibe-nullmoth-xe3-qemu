@@ -1,0 +1,46 @@
+From fdeda7eb1334675269ff36e5f51a5e10d8cfc89a Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 05:28:45 +0200
+Subject: [PATCH 18/50] TEMP: nmx_mmap diagnostics
+
+---
+ override/src/nmx_linux_cdev.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/gpu-port/xkpi/override/src/nmx_linux_cdev.c b/gpu-port/xkpi/override/src/nmx_linux_cdev.c
+index 5d09a7b..944c7d1 100644
+--- a/gpu-port/xkpi/override/src/nmx_linux_cdev.c
++++ b/gpu-port/xkpi/override/src/nmx_linux_cdev.c
+@@ -546,6 +546,7 @@ static int nmx_mmap(struct nmx_open *o, struct nmx_drm_mmap *req)
+     linux_set_current(curthread);
+     struct mm_struct *mm = current->mm;
+     if (mm == NULL || !mmget_not_zero(mm)) {
++        printf("NMX mmap diag: no mm (mm %p)\n", mm);
+         mtx_destroy(&u->obj.lock);
+         free(u->pages, M_NMXCDEV);
+         free(u, M_NMXCDEV);
+@@ -565,6 +566,9 @@ static int nmx_mmap(struct nmx_open *o, struct nmx_drm_mmap *req)
+     curthread->td_fpop = o->fp;
+     down_write(&mm->mmap_sem);
+     int err = -filp->f_op->mmap(filp, vma);
++    printf("NMX mmap diag: f_op->mmap off 0x%llx size %llu -> %d, vm_ops %p fault %p pfn_count %d npages %zu flags 0x%lx\n",
++           (unsigned long long)req->offset, (unsigned long long)size, err, vma->vm_ops,
++           vma->vm_ops ? (void *)vma->vm_ops->fault : NULL, vma->vm_pfn_count, u->npages, (unsigned long)vma->vm_flags);
+     if (err == 0) {
+         u->vm_opened = vma->vm_ops != NULL;
+         if (vma->vm_ops != NULL && vma->vm_ops->fault != NULL) {
+@@ -583,10 +587,14 @@ static int nmx_mmap(struct nmx_open *o, struct nmx_drm_mmap *req)
+     }
+     up_write(&mm->mmap_sem);
+     curthread->td_fpop = oldfp;
++    if (err)
++        printf("NMX mmap diag: populate/pin -> %d (pinned %d)\n", err, u->pinned);
+ 
+     if (err == 0) {
+         int writable = (vma->vm_flags & VM_WRITE) != 0;
+         err = nmx_xnu_map_user(u->pages, u->npages, u->cache, writable, fixed, &u->uaddr, &u->xmap);
++        if (err)
++            printf("NMX mmap diag: map_user -> %d\n", err);
+     }
+     if (err) {
+         umap_free(u);

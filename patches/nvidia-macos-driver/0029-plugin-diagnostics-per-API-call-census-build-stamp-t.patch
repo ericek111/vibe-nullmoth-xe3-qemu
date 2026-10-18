@@ -1,0 +1,219 @@
+From fc0ad44c34aa186c9dd44f9f6766ed11fb1803b8 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Sat, 17 Oct 2026 05:15:13 +0200
+Subject: [PATCH 29/47] plugin: diagnostics - per-API call census, build stamp,
+ the first function constant in the log
+
+- apistat: counts per Metal entry point (draws with vertex/index/instance totals, dispatches, encoders, commits,
+  waits with time, buffer creation, uploads/readbacks), logged per second every 2 s while /tmp/nvmtl-apistat exists.
+  It showed Minecraft's ~50k draws per frame, each paired with a compute dispatch.
+- +load logs "build <NVMTL_STAMP>"; vm/tools/pcycle.sh stamps every build and refuses to install one without it.
+- newFunctionWithName:constantValues: logs the first constant's value (it identified fixIndexBuffer's conversions).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugin/NVMTLDevice.m  | 41 +++++++++++++++++++++++++++++++++++++----
+ plugin/NVMTLObjects.m | 29 ++++++++++++++++-------------
+ 2 files changed, 53 insertions(+), 17 deletions(-)
+
+diff --git a/plugin/NVMTLDevice.m b/plugin/NVMTLDevice.m
+index bb6e501..a9acf8d 100644
+--- a/plugin/NVMTLDevice.m
++++ b/plugin/NVMTLDevice.m
+@@ -143,6 +143,36 @@ static void nvmtl_alloc_failed(const char *what) {
+ @interface NVMTLDevice : MTLIOAccelDevice <MTLDevice, MTLDeviceSPI>
+ @end
+ #import "NVMTLObjects.h"
++/* API call census: counts (and for waits, time) per Metal entry point, logged every 2 s as "apistat" while the file
++   /tmp/nvmtl-apistat exists (checked every 2 s). Shows what an app's frames are made of (Minecraft through Apple's
++   GL-over-Metal: draws, compute dispatches, command buffers, CPU waits). Counting is a relaxed atomic add. */
++enum { NVS_DRAW, NVS_DRAWIDX, NVS_DISPATCH, NVS_RENC, NVS_CENC, NVS_BENC, NVS_COMMIT, NVS_WAIT, NVS_WAITNS, NVS_NEWBUF,
++       NVS_NEWBUFBYTES, NVS_REPLACE, NVS_GETBYTES, NVS_MODRANGE, NVS_SETBUF, NVS_SETBYTES, NVS_SETTEX, NVS_SETPSO, NVS_DRAWVERTS, NVS_IDXCOUNT, NVS_INSTANCES, NVS_N };
++static const char *const nvs_name[NVS_N] = { "draw", "drawidx", "dispatch", "renc", "cenc", "benc", "commit", "wait",
++    "wait_ms", "newbuf", "newbuf_kb", "replace", "getbytes", "modrange", "setbuf", "setbytes", "settex", "setpso", "verts", "indices", "instances" };
++static _Atomic unsigned long long g_nvs[NVS_N];
++static void nvmtl_apistat_tick(void);
++static inline void NVS(int k) { atomic_fetch_add_explicit(&g_nvs[k], 1, memory_order_relaxed); }
++static inline void NVSN(int k, unsigned long long n) { atomic_fetch_add_explicit(&g_nvs[k], n, memory_order_relaxed); }
++static void nvmtl_apistat_tick(void)
++{
++    static _Atomic unsigned long long next; static unsigned long long last[NVS_N]; static int on;
++    const unsigned long long now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW), n = atomic_load(&next);
++    if (now < n || !atomic_compare_exchange_strong(&next, &(unsigned long long){ n }, now + 2000000000ull)) return;
++    const int was = on; on = access("/tmp/nvmtl-apistat", F_OK) == 0;
++    unsigned long long v[NVS_N];
++    for (int k = 0; k < NVS_N; k++) v[k] = atomic_load_explicit(&g_nvs[k], memory_order_relaxed);
++    if (on && was && n) {
++        char line[900]; int o = 0;
++        for (int k = 0; k < NVS_N && o < (int)sizeof line - 40; k++) {
++            unsigned long long d = v[k] - last[k];
++            if (k == NVS_WAITNS) d /= 1000000ull; else if (k == NVS_NEWBUFBYTES) d >>= 10;
++            if (d) o += snprintf(line + o, sizeof line - (size_t)o, " %s %llu", nvs_name[k], d / 2);
++        }
++        nvlog("apistat per second:%s", line);
++    }
++    memcpy(last, v, sizeof v);
++}
+ void nvmtl_vendor_compile_airs(NSDictionary<NSString *, NSString *> *airs,
+                                NSDictionary<NSString *, NSString *> *stages);
+ void nvmtl_vendor_attach_sass(id device, id pipelineState, id function);
+@@ -355,8 +385,11 @@ static bool nvmtl_process_is_allowed(void)
+ + (void)load {
+     char me[1200], ts[40] = "?"; time_t now = time(NULL); struct tm tm;
+     if (localtime_r(&now, &tm)) strftime(ts, sizeof ts, "%Y-%m-%dT%H:%M:%S%z", &tm);
+-    nvlog("NVMTLDevice +load in pid %d (static class, image-owned) image %s at %s", getpid(),
+-          nvmtl_image_ident((const void *)nvmtl_image_ident, me, sizeof me), ts);
++#ifndef NVMTL_STAMP
++#define NVMTL_STAMP "unstamped"
++#endif
++    nvlog("NVMTLDevice +load in pid %d (static class, image-owned) image %s at %s, build %s", getpid(),
++          nvmtl_image_ident((const void *)nvmtl_image_ident, me, sizeof me), ts, NVMTL_STAMP);
+ }
+ static void nvmtl_fill_pool_args(uint8_t *a, int second)
+ {
+@@ -501,7 +534,7 @@ static void nvmtl_amgl_caps(const void *caller)
+ 
+ static void nvmtl_zero_new_buffer(NVMTLBuffer *b, NSUInteger len);
+ static __thread int gZeroSkip;
+-- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)len options:(MTLResourceOptions)opt {
++- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)len options:(MTLResourceOptions)opt { NVS(NVS_NEWBUF); NVSN(NVS_NEWBUFBYTES, len);
+     if (nvmtl_vk_init()) return nil;
+     if (nvmtl_alloc_blocked()) return nil;
+     NVMTLBuffer *b = [NVMTLBuffer new];
+@@ -522,7 +555,7 @@ static __thread int gZeroSkip;
+     if (!gZeroSkip) nvmtl_zero_new_buffer(b, len);
+     nvlog("newBufferWithLength:%lu storage %d -> %p%s", (unsigned long)len, (int)b->_storage, (__bridge void *)b, b->_b.map ? "" : " VRAM"); return b; }
+ 
+-- (id<MTLBuffer>)newBufferWithBytes:(const void *)bytes length:(NSUInteger)len options:(MTLResourceOptions)opt {
++- (id<MTLBuffer>)newBufferWithBytes:(const void *)bytes length:(NSUInteger)len options:(MTLResourceOptions)opt { NVS(NVS_NEWBUF); NVSN(NVS_NEWBUFBYTES, len);
+     int priv = (((opt >> MTLResourceStorageModeShift) & 0xF) == MTLStorageModePrivate);
+     MTLResourceOptions o2 = priv ? ((opt & ~(MTLResourceOptions)(0xF << MTLResourceStorageModeShift)) | MTLResourceStorageModeShared) : opt;
+     gZeroSkip = bytes != NULL;
+diff --git a/plugin/NVMTLObjects.m b/plugin/NVMTLObjects.m
+index 828b34f..6bb5238 100644
+--- a/plugin/NVMTLObjects.m
++++ b/plugin/NVMTLObjects.m
+@@ -868,7 +868,7 @@ void nvmtl_vk_buffer_retire(nvk_buffer *b);
+ - (id<MTLHeap>)heap { return _heap ?: _subHeap; }
+ - (NSUInteger)heapOffset { return _heapOffset; }
+ - (NSUInteger)length { return _b.size; }
+-- (void)didModifyRange:(NSRange)r {
++- (void)didModifyRange:(NSRange)r { NVS(NVS_MODRANGE);
+     nvmtl_buf_settle(self);
+     if (_shadow.map) {
+         if (r.location >= _b.size) return;
+@@ -1335,7 +1335,7 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
+ - (id<MTLTexture>)remoteStorageTexture { return nil; }
+ - (id<MTLTexture>)newRemoteTextureViewForDevice:(id<MTLDevice>)d {
+     return nil; }
+-- (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)row fromRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level {
++- (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)row fromRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level { NVS(NVS_GETBYTES);
+     if (level >= [self mipmapLevelCount]) { nvlog("getBytes: mip level %lu — this texture has %lu", (unsigned long)level, (unsigned long)[self mipmapLevelCount]); return; }
+     [self nvmtlSurfaceIn];
+     nvmtl_census("getBytes", (uint32_t)region.size.width, (uint32_t)region.size.height, _surf != NULL);
+@@ -1358,7 +1358,7 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
+                                                     (uint32_t)region.size.width, (uint32_t)region.size.height, (uint32_t)level + _baseLevel, (uint32_t)(vol ? region.origin.z + zi : slice + _baseSlice));
+     if (rc) nvlog("texture getBytes:slice: readback FAILED");
+ }
+-- (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row {
++- (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row { NVS(NVS_REPLACE);
+     if (level >= [self mipmapLevelCount]) { nvlog("replaceRegion: mip level %lu — this texture has %lu", (unsigned long)level, (unsigned long)[self mipmapLevelCount]); return; }
+     if (region.size.depth > 1 || region.origin.z) { [self replaceRegion:region mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:row bytesPerImage:row * region.size.height]; return; }
+     { int was = nvtrace_scope([self nvi]->w, [self nvi]->h);
+@@ -2371,7 +2371,8 @@ static size_t nvmtl_fc_width(NSUInteger dataType)
+         if (error) *error = [NSError errorWithDomain:@"NVMTL" code:3 userInfo:@{NSLocalizedDescriptionKey: e ?: @"specialization failed"}];
+         return nil;
+     }
+-    nvlog("newFunctionWithName:constantValues: \"%s\" specialized with %zu constant(s)", name.UTF8String, n);
++    { char cv0[64] = ""; if (n && sz[0] <= 8) { uint64_t v0 = 0; memcpy(&v0, pay[0], sz[0]); snprintf(cv0, sizeof cv0, ", constant %u = 0x%llx", idx[0], (unsigned long long)v0); }
++      nvlog("newFunctionWithName:constantValues: \"%s\" specialized with %zu constant(s)%s", name.UTF8String, n, cv0); }
+     NVMTLFunction *f = [NVMTLFunction new]; f->_spirv = spec; f->_fc = [constants copy]; f->_fname = name; f->_stage = (_stages[name] ?: @""); f->_air = _airs[name]; f->_lib = self; f->_fcv = cv; return f;
+ }
+ - (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)cv
+@@ -2932,7 +2933,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
+     }
+ }
+ - (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count
+-         instanceCount:(NSUInteger)instances baseInstance:(NSUInteger)baseInstance {
++         instanceCount:(NSUInteger)instances baseInstance:(NSUInteger)baseInstance { NVS(NVS_DRAW); NVSN(NVS_DRAWVERTS, count);
+     if (!_begun) { nvlog("encoder: draw with no pipeline set"); return; }
+     if (![self nvmtlBindSamplerPipeline]) return;
+     nvtrace("DRAW type %u | vs %s | fs %s | blend %s", (unsigned)type, _ps ? _ps->_vname.UTF8String : "-", _ps ? _ps->_fname.UTF8String : "-", _ps ? _ps->_blend.UTF8String : "-");
+@@ -3185,7 +3186,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
+ }
+ - (void)drawIndexedPrimitives:(MTLPrimitiveType)type indexCount:(NSUInteger)count indexType:(MTLIndexType)it
+                   indexBuffer:(id<MTLBuffer>)ib indexBufferOffset:(NSUInteger)off
+-                instanceCount:(NSUInteger)instances baseVertex:(NSInteger)baseVertex baseInstance:(NSUInteger)baseInstance {
++                instanceCount:(NSUInteger)instances baseVertex:(NSInteger)baseVertex baseInstance:(NSUInteger)baseInstance { NVS(NVS_DRAWIDX); NVSN(NVS_IDXCOUNT, count); NVSN(NVS_INSTANCES, instances);
+     if (!_begun) { nvlog("drawIndexedPrimitives with no pipeline set"); return; }
+     NVMTLBuffer *b = (NVMTLBuffer *)ib;
+     if (!b) { nvlog("drawIndexedPrimitives with no index buffer"); return; }
+@@ -3604,7 +3605,7 @@ void nvmtl_heap_back(NVMTLHeap *h, NSUInteger size, int shared) {
+     NSUInteger left = _size > _used ? _size - _used : 0;
+     return (a > 1 && left % a) ? left - (left % a) : left;
+ }
+-- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)len options:(MTLResourceOptions)opt {
++- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)len options:(MTLResourceOptions)opt { NVS(NVS_NEWBUF); NVSN(NVS_NEWBUFBYTES, len);
+     NSUInteger charge = [_dev heapBufferSizeAndAlignWithLength:len options:opt].size;
+     if (charge < len) charge = len;
+     if (charge > [self maxAvailableSizeWithAlignment:0]) { nvlog("heap newBufferWithLength:%lu (charge %lu) — only %lu left of %lu", (unsigned long)len, (unsigned long)charge, (unsigned long)(_size > _used ? _size - _used : 0), (unsigned long)_size); return nil; }
+@@ -4313,7 +4314,7 @@ static void nvmtl_zprobe_drain(void) {
+     nvmtl_enc78_count(E78C_DISP, 1); nvmtl_enc78_count(E78C_FULL + kind, 1);
+     if (_e78Concurrent) nvmtl_enc78_count(E78C_CONC, 1);
+ }
+-- (void)dispatchThreadgroups:(MTLSize)grid threadsPerThreadgroup:(MTLSize)tg {
++- (void)dispatchThreadgroups:(MTLSize)grid threadsPerThreadgroup:(MTLSize)tg { NVS(NVS_DISPATCH);
+     if (_ps && _ps->_sassKernel) {
+         int ran = nvmtl_sass_dispatch(self, grid, tg, 0, !_ps->_sassOnly);
+         if (ran) { if (ran > 0 && _cb->_stTwins.count) nvmtl_storage_twins_out(_cb); return; }
+@@ -4332,7 +4333,7 @@ static void nvmtl_zprobe_drain(void) {
+     if (nvmtl_vendor_dispatch_sass(selected, &_cb->_c, t, l) != 0) nvmtl_vk_cmd_dispatch_threads(&_cb->_c, &selected->_p, t, l);
+     if (_cb->_stTwins.count) nvmtl_storage_twins_out(_cb);
+ }
+-- (void)dispatchThreads:(MTLSize)threads threadsPerThreadgroup:(MTLSize)tg {
++- (void)dispatchThreads:(MTLSize)threads threadsPerThreadgroup:(MTLSize)tg { NVS(NVS_DISPATCH);
+     if (_ps && _ps->_sassKernel) {
+         int ran = nvmtl_sass_dispatch(self, threads, tg, 1, !_ps->_sassOnly);
+         if (ran) { if (ran > 0 && _cb->_stTwins.count) nvmtl_storage_twins_out(_cb); return; }
+@@ -4726,7 +4727,7 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
+     nvlog("parallelRenderCommandEncoderWithDescriptor: -> %p (sub-encoders record, endEncoding replays into one pass)", (__bridge void *)p);
+     return p;
+ }
+-- (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
++- (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d { NVS(NVS_RENC);
+     nvmtl_g79_flush(self);
+     NVMTLRenderCommandEncoder *e = [NVMTLRenderCommandEncoder new];
+     _nEnc++;
+@@ -4860,8 +4861,8 @@ void nvmtl_mark_published(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
+     CFNumberRef num = CFNumberCreate(NULL, kCFNumberLongLongType, &cb->_pubN);
+     if (num) { IOSurfaceSetValue(t->_surf, CFSTR("NMXPublished"), num); CFRelease(num); }
+ }
+-- (void)commit { nvmtl_mark_pending(self); [self nvmtlSubmitWithEvents]; }
+-- (id<MTLComputeCommandEncoder>)computeCommandEncoder {
++- (void)commit { NVS(NVS_COMMIT); nvmtl_apistat_tick(); nvmtl_mark_pending(self); [self nvmtlSubmitWithEvents]; }
++- (id<MTLComputeCommandEncoder>)computeCommandEncoder { NVS(NVS_CENC);
+     NVMTLComputeCommandEncoder *e = [NVMTLComputeCommandEncoder new]; e->_cb = self; _nEnc++; return e;
+ }
+ - (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)t {
+@@ -4872,7 +4873,7 @@ void nvmtl_mark_published(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
+ - (id<MTLBlitCommandEncoder>)blitCommandEncoderWithDescriptor:(MTLBlitPassDescriptor *)d { return [self blitCommandEncoder]; }
+ - (id<MTLResourceStateCommandEncoder>)resourceStateCommandEncoder { return nil; }
+ - (id<MTLResourceStateCommandEncoder>)resourceStateCommandEncoderWithDescriptor:(MTLResourceStatePassDescriptor *)d { return nil; }
+-- (id<MTLBlitCommandEncoder>)blitCommandEncoder {
++- (id<MTLBlitCommandEncoder>)blitCommandEncoder { NVS(NVS_BENC);
+     nvmtl_g79_flush(self);
+     NVMTLBlitCommandEncoder *e = [NVMTLBlitCommandEncoder new]; e->_cb = self; _nEnc++; return e;
+ }
+@@ -4925,10 +4926,12 @@ void nvmtl_mark_published(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
+ - (CFTimeInterval)kernelStartTime { return _legacyKernelStart; }
+ - (CFTimeInterval)kernelEndTime { return _legacyKernelEnd; }
+ - (void)waitUntilCompleted {
++    const unsigned long long t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+     _nWait++; [_completionCondition lock];
+     while (!_completionReady) [_completionCondition wait];
+     [_completionCondition unlock];
+     dispatch_group_wait(_callbackGroup, DISPATCH_TIME_FOREVER);
++    NVS(NVS_WAIT); NVSN(NVS_WAITNS, clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0);
+ }
+ - (void)waitUntilScheduled {
+     _nWait++; [_completionCondition lock];

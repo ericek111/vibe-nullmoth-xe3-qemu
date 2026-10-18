@@ -1,0 +1,61 @@
+From 4d28dc5b6dddc273c3b7487f16c1d7af18b3ada7 Mon Sep 17 00:00:00 2001
+From: ericek111 <erik.brocko@letemsvetemapplem.eu>
+Date: Fri, 16 Oct 2026 19:52:59 +0200
+Subject: [PATCH 39/50] bsdcompat: per-thread RCU record slots and a
+ thread-exit hook for open read sections
+
+struct thread gets td_rcu_cpu/td_rcu_ra (appended last, so objects built against the old layout keep
+their offsets), and nmx_thread_leave calls nmx_rcu_thread_exit_hook before LinuxKPI frees the
+task_struct, so the linux_rcu fork can end a read section a dropped thread still holds.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DP5dwQG4pUvK6V9ftNsQRB
+---
+ bsdcompat/include/sys/proc.h | 5 +++++
+ bsdcompat/src/nmx_kernel.c   | 3 +++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/gpu-port/xkpi/bsdcompat/include/sys/proc.h b/gpu-port/xkpi/bsdcompat/include/sys/proc.h
+index 4422da9..13f3e84 100644
+--- a/gpu-port/xkpi/bsdcompat/include/sys/proc.h
++++ b/gpu-port/xkpi/bsdcompat/include/sys/proc.h
+@@ -45,6 +45,9 @@ struct thread {
+     char td_name[32];
+     void *td_wchan;
+     const char *td_wmesg;
++    /* LinuxKPI RCU, per type (linux_rcu fork; appended last, so code built before keeps its offsets) */
++    int td_rcu_cpu[2];              /* 1 + the CPU whose epoch record holds the outermost read section, 0 none */
++    void *td_rcu_ra[2];             /* where that section was entered */
+ };
+ #define TDF_KTH_SUSP 0x00000100
+ #define TDP_KTHREAD 0x00200000
+@@ -88,6 +91,8 @@ bool nmx_proc_exiting(struct proc *p);
+ struct task_struct *nmx_proc_any_task(struct proc *p, bool get);
+ void nmx_threads_release_all(void (*release)(struct thread *));
+ extern void (*nmx_thread_release_hook)(struct thread *td);
++/* ends a read section the thread still holds, before the release hook frees its task_struct (linux_rcu fork) */
++extern void (*nmx_rcu_thread_exit_hook)(struct thread *td);
+ extern struct proc *nmx_kernproc;
+ struct proc *nmx_curproc(void);
+ #define curproc nmx_curproc()
+diff --git a/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c b/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c
+index addcbee..27ab6bc 100644
+--- a/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c
++++ b/gpu-port/xkpi/bsdcompat/src/nmx_kernel.c
+@@ -217,6 +217,7 @@ static void nmx_thread_drop_current(void)
+  * frees it again (after LinuxKPI's per-thread state is released through the hook), unless the thread is one of ours.
+  */
+ void (*nmx_thread_release_hook)(struct thread *td);
++void (*nmx_rcu_thread_exit_hook)(struct thread *td);
+ int nmx_thread_enter(void)
+ {
+     int created;
+@@ -230,6 +231,8 @@ void nmx_thread_leave(int created)
+         return;
+     int c2;
+     struct thread *td = nmx_thread_get(1, &c2);
++    if (nmx_rcu_thread_exit_hook && td->td_lkpi_task)
++        nmx_rcu_thread_exit_hook(td);
+     if (nmx_thread_release_hook && td->td_lkpi_task)
+         nmx_thread_release_hook(td);
+     nmx_thread_drop_current();

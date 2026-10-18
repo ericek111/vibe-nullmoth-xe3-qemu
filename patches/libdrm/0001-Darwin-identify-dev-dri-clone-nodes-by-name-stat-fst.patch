@@ -1,0 +1,64 @@
+From 82ccca3527496c04f149faaf4413bc39342309e8 Mon Sep 17 00:00:00 2001
+From: claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 04:51:25 +0200
+Subject: [PATCH 1/5] Darwin: identify /dev/dri clone nodes by name (stat/fstat
+ report the DRM minor)
+
+---
+ xf86drm.c | 43 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 43 insertions(+)
+
+diff --git a/xf86drm.c b/xf86drm.c
+index 73e4861c..589bda8d 100644
+--- a/xf86drm.c
++++ b/xf86drm.c
+@@ -107,6 +107,49 @@ static drmServerInfoPtr drm_server_info;
+ 
+ static bool drmNodeIsDRM(int maj, int min);
+ #ifdef __APPLE__
++#include <fcntl.h>
++/*
++ * NullMoth's /dev/dri nodes are xnu devfs clone nodes: every lookup and open is given a device minor of its own (that
++ * is how each open gets its own DRM file), so st_rdev never identifies a node - two stat()s of renderD128 give two
++ * different minors, and none decodes as a DRM node type. The node's name does: cardN / renderDN carry the DRM minor,
++ * as the device number does on Linux and the BSDs. stat()/fstat() below put that minor back into st_rdev (an fd's
++ * path comes from F_GETPATH), so the rest of this file can match and classify nodes by number as it does elsewhere.
++ */
++static void drm_darwin_fix_rdev(const char *path, struct stat *st)
++{
++    const char *base;
++    int id;
++
++    if (!S_ISCHR(st->st_mode) || strncmp(path, DRM_DIR_NAME "/", sizeof(DRM_DIR_NAME)) != 0)
++        return;
++    base = path + sizeof(DRM_DIR_NAME);
++    if (sscanf(base, "renderD%d", &id) == 1 || sscanf(base, "controlD%d", &id) == 1 ||
++        sscanf(base, "card%d", &id) == 1)
++        st->st_rdev = makedev(major(st->st_rdev), id);
++}
++
++static int drm_darwin_stat(const char *path, struct stat *st)
++{
++    int ret = stat(path, st);
++
++    if (ret == 0)
++        drm_darwin_fix_rdev(path, st);
++    return ret;
++}
++
++static int drm_darwin_fstat(int fd, struct stat *st)
++{
++    char path[PATH_MAX];
++    int ret = fstat(fd, st);
++
++    if (ret == 0 && fcntl(fd, F_GETPATH, path) != -1)
++        drm_darwin_fix_rdev(path, st);
++    return ret;
++}
++#define stat(path, st) drm_darwin_stat(path, st)
++#define fstat(fd, st) drm_darwin_fstat(fd, st)
++#endif
++#ifdef __APPLE__
+ /* Darwin assigns character majors at run time and its devname_r searches only the top level of /dev, so a DRM
+  * node is recognised by finding its device number among the entries of /dev/dri. */
+ static bool drm_darwin_node_exists(int maj, int min)
